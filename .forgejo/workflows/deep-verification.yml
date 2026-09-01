@@ -1,0 +1,147 @@
+name: forgejo-deep-verification
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  schedule:
+    - cron: "17 1 * * *"
+      timezone: Europe/Stockholm
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forgejo-paper-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deep:
+    name: Forgejo / Paper required
+    runs-on: skwd-paper-ci
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      SKWD_RUNNER_IMAGE: sha256:66058d5c15a5011188ee634bb909d730c279ab0d65408581b5d70e99a6970edb
+      SKWD_VERIFY_ROOT: .ci/checkouts/skwd-verify
+    steps:
+      - name: Check out Paper
+        uses: https://code.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check out the pinned system verifier
+        uses: https://code.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: liixini/skwd-verify
+          ref: 43766a72f2d3f46072c68c4fb4735d9482bf5059
+          path: .ci/checkouts/skwd-verify
+          token: ${{ secrets.SKWD_SUITE_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Restore Cargo download cache
+        uses: https://code.forgejo.org/actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-paper-rust-1.94.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-paper-rust-1.94.1-
+
+      - name: Create result directory
+        run: mkdir -p ci-artifacts/results
+
+      - name: Verify the standalone system-test repository
+        working-directory: .ci/checkouts/skwd-verify
+        continue-on-error: true
+        run: >-
+          python3 scripts/ci-report.py wrap
+          --suite verify.repository --out ../../../ci-artifacts/results/verify-repository.json
+          -- scripts/test-all.sh
+
+      - name: Verify native linker dependencies
+        continue-on-error: true
+        run: >-
+          python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.native-deps
+          --out ci-artifacts/results/paper-native-deps.json --
+          bash -euo pipefail -c
+          'pkg-config --exists dav1d && test "$(cc -print-file-name=libyuv.so)" != libyuv.so'
+
+      - name: Format
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.format --out ci-artifacts/results/paper-format.json -- cargo fmt --check
+
+      - name: Workspace tests
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.tests --out ci-artifacts/results/paper-tests.json -- cargo test --locked --release --workspace
+
+      - name: Clippy
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.clippy --out ci-artifacts/results/paper-clippy.json -- cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Release build
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.release --out ci-artifacts/results/paper-release.json -- cargo build --locked --release --workspace
+
+      - name: Dependency inventory
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.dependencies --out ci-artifacts/results/paper-dependencies.json -- cargo machete --with-metadata crates
+
+      - name: Unsafe inventory
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.unsafe --out ci-artifacts/results/paper-unsafe.json -- "$SKWD_VERIFY_ROOT/scripts/check-unsafe-code.sh"
+
+      - name: Python tests
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.python --out ci-artifacts/results/paper-python.json -- python3 "$SKWD_VERIFY_ROOT/scripts/python_suite.py" python-general
+
+      - name: Release executable contract
+        continue-on-error: true
+        run: >-
+          python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.executables
+          --out ci-artifacts/results/paper-executables.json --
+          bash -euo pipefail -c
+          'test -x target/release/skwd-paper && test -x target/release/skwd-paper-tinier && test -x target/release/skwd-wall-vk && test -x target/release/skwd-wall-still'
+
+      - name: Real release package stage
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.package --out ci-artifacts/results/paper-package.json -- scripts/package-stage.sh build/package-stage
+
+      - name: Configure Plasma plugin
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.plasma.configure --out ci-artifacts/results/paper-plasma-configure.json -- cmake -S packaging/plasma -B build/plasma -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build Plasma plugin
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.plasma.build --out ci-artifacts/results/paper-plasma-build.json -- cmake --build build/plasma --parallel
+
+      - name: Install Plasma plugin
+        continue-on-error: true
+        run: >-
+          python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.plasma.install
+          --out ci-artifacts/results/paper-plasma-install.json --
+          bash -euo pipefail -c
+          'DESTDIR="$PWD/build/plasma-stage" cmake --install build/plasma && test -f build/plasma-stage/usr/share/licenses/skwd-paper-plasma/LICENSE'
+
+      - name: Record deliberate live-scene coverage
+        if: always()
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" skip --suite paper.native-scene --reason 'requires a staged native scene, Vulkan device, and isolated live compositor' --out ci-artifacts/results/paper-native-scene.json
+
+      - name: Record exact execution provenance
+        if: always()
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-provenance.py" --out ci-artifacts/provenance.json --runner-image "$SKWD_RUNNER_IMAGE" --toolchains --catalog scripts/ci-suites.json
+
+      - name: Aggregate required results
+        if: always()
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" aggregate --catalog scripts/ci-suites.json --results ci-artifacts/results
+
+      - name: Retain reports and provenance
+        if: always()
+        uses: https://code.forgejo.org/actions/upload-artifact@c6a3b2bd78b3985e4b2f15397fec357f0fd808de
+        with:
+          name: paper-required-${{ github.sha }}
+          path: ci-artifacts
+          if-no-files-found: error
+          retention-days: 14

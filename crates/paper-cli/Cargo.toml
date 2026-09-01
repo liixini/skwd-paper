@@ -1,0 +1,27 @@
+[package]
+name = "skwd-paper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Standalone wallpaper composition controller"
+
+[[bin]]
+name = "skwd-paper"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+paper-control = { path = "../paper-control" }
+paper-log = { path = "../paper-log" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "process", "sync", "time", "io-util", "macros"] }
+tracing = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

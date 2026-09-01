@@ -1,0 +1,54 @@
+[package]
+name = "skwd-wall-vk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Standalone Vulkan video and scene wallpaper renderer"
+
+[[bin]]
+name = "skwd-wall-vk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+paper-log = { path = "../paper-log" }
+paper-runtime = { path = "../paper-runtime" }
+tracing = { workspace = true }
+paper-control = { path = "../paper-control" }
+paper-audio = { path = "../paper-audio" }
+paper-scene = { path = "../paper-scene" }
+paper-shaders = { path = "../paper-shaders" }
+paper-geom = { path = "../paper-geom" }
+image = { workspace = true }
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+ffmpeg-the-third = { version = "6", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+libc = "0.2"
+tempfile = { workspace = true }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+
+[build-dependencies]
+cc = "1"
+paper-scene = { path = "../paper-scene" }
+paper-shaders = { path = "../paper-shaders" }
+pkg-config = "0.3"
+
+[features]
+default = ["shared-device"]
+shared-device = []
+
+[package.metadata.cargo-machete]
+ignored = ["cc", "pkg-config", "wayland-backend"]
+
+[lints.rust]
+dead_code = "allow"
+non_camel_case_types = "allow"
+
+[lints.clippy]
+too_many_arguments = "allow"
+missing_transmute_annotations = "allow"

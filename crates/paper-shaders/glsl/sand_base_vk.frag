@@ -1,0 +1,89 @@
+#version 450
+layout(location = 0) in vec2 v_uv;
+layout(push_constant) uniform PC {
+    vec2 u_res;
+    float u_progress;
+    int u_style;
+    int u_pid_base;
+    int u_fill;
+    int u_rgba_a;
+    int u_rgba_b;
+    vec4 u_uv_a;
+    vec4 u_uv_b;
+};
+layout(set = 0, binding = 0) uniform sampler2D luma_a;
+layout(set = 0, binding = 1) uniform sampler2D chroma_a;
+layout(set = 1, binding = 0) uniform sampler2D luma_b;
+layout(set = 1, binding = 1) uniform sampler2D chroma_b;
+layout(location = 0) out vec4 frag;
+const int GW = 1920;
+const int GH = 1080;
+uint uh(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+float hp(uint id, uint salt) {
+    return float(uh(id * 0x9e3779b9u + salt * 0x85ebca6bu)) / 4294967296.0;
+}
+vec3 nv12(float y, vec2 c) {
+    float yf = (y - 16.0 / 255.0) * (255.0 / 219.0);
+    float u = c.x - 0.5;
+    float v = c.y - 0.5;
+    return clamp(vec3(yf + 1.5748 * v, yf - 0.1873 * u - 0.4681 * v, yf + 1.8556 * u), 0.0, 1.0);
+}
+vec3 side_a(vec2 uv) {
+    vec2 ua = uv * u_uv_a.xy + u_uv_a.zw;
+    if (u_fill == 1 && (any(lessThan(ua, vec2(0.0))) || any(greaterThan(ua, vec2(1.0))))) {
+        return vec3(0.0);
+    }
+    if (u_fill == 2) ua = fract(ua);
+    if (u_rgba_a == 1) {
+        return texture(luma_a, ua).rgb;
+    }
+    return nv12(texture(luma_a, ua).r, texture(chroma_a, ua).rg);
+}
+vec3 side_b(vec2 uv) {
+    vec2 ub = uv * u_uv_b.xy + u_uv_b.zw;
+    if (u_fill == 1 && (any(lessThan(ub, vec2(0.0))) || any(greaterThan(ub, vec2(1.0))))) {
+        return vec3(0.0);
+    }
+    if (u_fill == 2) ub = fract(ub);
+    if (u_rgba_b == 1) {
+        return texture(luma_b, ub).rgb;
+    }
+    return nv12(texture(luma_b, ub).r, texture(chroma_b, ub).rg);
+}
+void main() {
+    vec2 uvp = clamp(v_uv, vec2(0.0), vec2(1.0));
+    vec2 dc = uvp - 0.5;
+    int gx = int(min(uvp.x * float(GW), float(GW) - 1.0));
+    int gy = int(min(uvp.y * float(GH), float(GH) - 1.0));
+    uint id = uint(gy * GW + gx);
+    float h = hp(id, 1u);
+    float nd = mix(
+        clamp(max(abs(dc.x), abs(dc.y)) * 2.0, 0.0, 1.0),
+        clamp(length(dc) * 1.4142136, 0.0, 1.0),
+        0.25
+    );
+    float rim = pow(nd, 1.5);
+    float local;
+    if (u_style == 7) {
+        float lift = (uvp.x * 0.65 + h * 0.2) * 0.2895;
+        float settle = 0.495 + 0.175 * uvp.x + 0.054 * h;
+        local = (u_progress - lift) / max(settle - lift, 0.02);
+    } else {
+        float start = (rim * 0.80 + h * 0.20) * 0.60;
+        local = (u_progress - start) / 0.40;
+    }
+    if (local <= 0.0) {
+        frag = vec4(side_a(uvp), 1.0);
+    } else if (local >= 1.0) {
+        frag = vec4(side_b(uvp), 1.0);
+    } else {
+        discard;
+    }
+}

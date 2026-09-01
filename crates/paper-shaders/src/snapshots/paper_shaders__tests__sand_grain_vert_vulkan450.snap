@@ -1,0 +1,366 @@
+---
+source: crates/paper-shaders/src/tests.rs
+assertion_line: 116
+expression: "sand_grain_vert(Dialect::Vulkan450)"
+---
+#version 450
+layout(push_constant) uniform PC {
+    vec2 u_res;
+    float u_progress;
+    int u_style;
+    int u_pid_base;
+    int u_fill;
+    vec4 u_uv_a;
+    vec4 u_uv_b;
+};
+layout(location = 0) out vec2 v_uv;
+layout(location = 1) out float v_alpha;
+layout(location = 2) out float v_bright;
+layout(location = 3) out float v_mix;
+const float TAU = 6.2831853;
+const int GW = 1920;
+const int GH = 1080;
+const float NSTR = 24.0;
+const float HELIX_LIFT_SPREAD = 0.16;
+const float HELIX_FLY = 0.18;
+const float HELIX_HOLD_END = 0.62;
+const float HELIX_LAND_SPREAD = 0.16;
+const float HELIX_FADE_BAND = 0.045;
+const float HELIX_COIL_SPAN = 0.90;
+const float HELIX_STRAND_LAG = 0.38;
+const float HELIX_HEAD_RATE = 1.30;
+const float HELIX_HEAD_LAG = 0.14;
+const float HELIX_TRAIL = 0.95;
+const float HELIX_SMEAR = 0.06;
+const float HELIX_SWIRL = 0.22;
+const float HELIX_DISPERSE = 0.10;
+const float HELIX_INTAKE = 1.15;
+uint uh(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+float hp(uint id, uint salt) {
+    return float(uh(id * 0x9e3779b9u + salt * 0x85ebca6bu)) / 4294967296.0;
+}
+void main() {
+    int pid = gl_VertexIndex / 6 + u_pid_base;
+    int corner = gl_VertexIndex % 6;
+    vec2 offs[6] = vec2[6](
+        vec2(-0.5, -0.5), vec2(0.5, -0.5), vec2(-0.5, 0.5),
+        vec2(-0.5, 0.5), vec2(0.5, -0.5), vec2(0.5, 0.5)
+    );
+    vec2 off = offs[corner];
+    bool role_b = pid >= GW * GH;
+    int gid = pid % (GW * GH);
+    vec2 uvp = (vec2(float(gid % GW), float(gid / GW)) + 0.5) / vec2(float(GW), float(GH));
+    vec2 dc = uvp - 0.5;
+    uint id = uint(gid) + (role_b ? 7919u : 0u);
+    float h = hp(id, 1u);
+    vec2 center = u_res * 0.5;
+    vec2 home = uvp * u_res;
+    float nd = mix(
+        clamp(max(abs(dc.x), abs(dc.y)) * 2.0, 0.0, 1.0),
+        clamp(length(dc) * 1.4142136, 0.0, 1.0),
+        0.25
+    );
+    float rim = pow(nd, 1.5);
+    if (u_style == 8) {
+        float start = (rim * 0.80 + h * 0.20) * 0.60;
+        float raw8 = (u_progress - start) / 0.40;
+        if (raw8 <= 0.0 || raw8 >= 1.0) {
+            v_uv = uvp;
+            v_mix = 0.0;
+            v_alpha = 0.0;
+            v_bright = 1.0;
+            gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+            return;
+        }
+        float local = clamp(raw8, 0.0, 1.0);
+        float h2 = hp(id, 2u);
+        float h3 = hp(id, 3u);
+        float ang01 = fract(atan(dc.y, dc.x) / TAU + 1.0 + (h - 0.5) * 0.02);
+        float strand = floor(clamp(uvp.y + (h - 0.5) * 0.05, 0.0, 0.999) * NSTR);
+        float sh = hp(uint(strand), 4u);
+        float sh2 = hp(uint(strand), 5u);
+        float sh3 = hp(uint(strand), 6u);
+        float ga = 0.30;
+        float so = 0.62;
+        float rr = u_res.y * (0.26 + sh3 * 0.14 + h3 * 0.06);
+        float entry = ang01 * TAU;
+        float spin = TAU * (0.55 + sh2 * 0.35);
+        float mid8;
+        vec2 p8;
+        if (local < ga) {
+            float t8 = local / ga;
+            float e8 = t8 * t8 * (3.0 - 2.0 * t8);
+            vec2 ringp = center + vec2(cos(entry), sin(entry) * 0.82) * rr;
+            vec2 w8 = mix(home, ringp, 0.55)
+                + vec2(cos(entry + 1.5707963), sin(entry + 1.5707963) * 0.82) * u_res.y * 0.10;
+            p8 = mix(mix(home, w8, e8), mix(w8, ringp, e8), e8);
+            mid8 = sin(1.5707963 * e8);
+        } else if (local < so) {
+            float t8 = (local - ga) / (so - ga);
+            float a8 = entry + spin * t8;
+            float wob = 1.0 + sin(t8 * TAU * (1.0 + sh * 2.0) + h * TAU) * 0.05;
+            p8 = center + vec2(cos(a8), sin(a8) * 0.82) * rr * wob;
+            mid8 = 1.0;
+        } else {
+            float t8 = (local - so) / (1.0 - so);
+            float e8 = t8 * t8 * (3.0 - 2.0 * t8);
+            float exa = entry + spin;
+            vec2 ringp = center + vec2(cos(exa), sin(exa) * 0.82) * rr;
+            vec2 w8 = mix(ringp, home, 0.45)
+                + vec2(cos(exa + 1.5707963), sin(exa + 1.5707963) * 0.82) * u_res.y * 0.08;
+            p8 = mix(mix(ringp, w8, e8), mix(w8, home, e8), e8);
+            mid8 = sin(1.5707963 * (1.0 - e8));
+        }
+        p8 += vec2(sin(local * 9.0 + h * TAU), cos(local * 7.0 + h2 * TAU))
+            * u_res.y * 0.035 * mid8;
+        float orb8 = local * TAU * (1.5 + sh * 1.5) + h2 * TAU;
+        p8 += vec2(cos(orb8), sin(orb8)) * (2.0 + h2 * 6.0) * mid8;
+        v_mix = smoothstep(0.34, 0.58, local + (h - 0.5) * 0.05);
+        v_alpha = 1.0;
+        v_bright = 1.0 + mid8 * 0.45;
+        vec2 size8 = u_res / vec2(float(GW), float(GH)) * 1.15;
+        vec2 world8 = p8 + off * size8;
+        v_uv = uvp + off * (1.15 / vec2(float(GW), float(GH)));
+        gl_Position = vec4(
+            world8.x / u_res.x * 2.0 - 1.0,
+            world8.y / u_res.y * 2.0 - 1.0,
+            0.0,
+            1.0
+        );
+        return;
+    }
+    if (u_style >= 10 && u_style <= 14) {
+        bool coil = u_style == 11;
+        float lift = mix(rim, h, 0.35) * HELIX_LIFT_SPREAD;
+        float land = HELIX_HOLD_END + hp(id, 2u) * HELIX_LAND_SPREAD;
+        float start = (rim * 0.80 + h * 0.20) * 0.60;
+        float rawN = coil
+            ? (u_progress - lift) / max(land + HELIX_FLY - lift, 0.02)
+            : (u_progress - start) / 0.40;
+        if (rawN <= 0.0 || rawN >= 1.0) {
+            v_uv = uvp;
+            v_mix = 0.0;
+            v_alpha = 0.0;
+            v_bright = 1.0;
+            gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+            return;
+        }
+        float local = clamp(rawN, 0.0, 1.0);
+        float hb = hp(id, 2u);
+        float hc = hp(id, 3u);
+        float ga = 0.30;
+        float so = 0.62;
+        float mid = sin(3.14159265 * local);
+        float shortest = min(u_res.x, u_res.y);
+        float gatherP = smoothstep(lift, lift + HELIX_FLY, u_progress);
+        float scatterP = smoothstep(land, land + HELIX_FLY, u_progress);
+        float form;
+        if (coil) {
+            form = gatherP * (1.0 - scatterP);
+        } else if (local < ga) {
+            float t = local / ga;
+            form = t * t * (3.0 - 2.0 * t);
+        } else if (local < so) {
+            form = 1.0;
+        } else {
+            float t = (local - so) / (1.0 - so);
+            form = 1.0 - t * t * (3.0 - 2.0 * t);
+        }
+        float spin = u_progress * TAU * 1.3;
+        vec2 sp;
+        float depth01 = 1.0;
+        float glow = 1.0;
+        float psize = 1.0;
+        float coilY = 0.0;
+        if (u_style == 10) {
+            float lon = uvp.x * TAU + spin;
+            float lat = (uvp.y - 0.5) * 3.14159265;
+            float clat = cos(lat);
+            float shell = shortest * 0.47 * (1.0 + (hb - 0.5) * 0.18);
+            sp = center + vec2(clat * sin(lon), -sin(lat)) * shell;
+            depth01 = clat * cos(lon) * 0.5 + 0.5;
+        } else if (u_style == 11) {
+            float hd = hp(id, 4u);
+            float he = hp(id, 5u);
+            float hf = hp(id, 6u);
+            float strand = step(0.5, hp(id, 7u));
+            float smear = (hp(id, 8u) - 0.5) * HELIX_SMEAR;
+            float tail = pow(0.45 * uvp.y + 0.55 * hd, 2.4);
+            float flow = (gatherP - 1.0 + scatterP) * HELIX_INTAKE;
+            float s = u_progress * HELIX_HEAD_RATE - HELIX_HEAD_LAG
+                - tail * HELIX_TRAIL + smear + flow
+                + strand * HELIX_STRAND_LAG;
+            float axis = s * 2.6 * TAU + strand * 3.14159265 + spin * 0.35;
+            float coilR = shortest * 0.19;
+            vec3 core = vec3(
+                cos(axis) * coilR,
+                (s - 0.5) * u_res.y * HELIX_COIL_SPAN,
+                sin(axis) * coilR
+            );
+            float rho = sqrt(he);
+            float phi = hf * TAU;
+            float tube = shortest * (0.014 + tail * 0.135);
+            vec3 radial = vec3(cos(axis), 0.0, sin(axis));
+            vec3 p3 = core
+                + radial * (cos(phi) * rho * tube)
+                + vec3(0.0, sin(phi) * rho * tube, 0.0);
+            float focal = shortest * 1.25;
+            float persp = focal / (focal + p3.z);
+            sp = center + vec2(p3.x, p3.y) * persp;
+            coilY = p3.y * persp / u_res.y;
+            depth01 = clamp(0.5 - p3.z / coilR * 0.5, 0.0, 1.0);
+            glow = (3.0 / (1.0 + tail * 7.0) + 0.15)
+                * (0.72 + 0.42 * persp)
+                * (1.0 - 0.45 * rho);
+            psize = persp * (1.85 - tail);
+        } else if (u_style == 12) {
+            float rad0 = clamp(length(dc) * 2.0, 0.0, 1.0);
+            float ang0 = atan(dc.y, dc.x);
+            float omega = u_progress * TAU * (0.4 + 1.3 * (1.0 - rad0));
+            float theta = ang0 + omega;
+            float diskR = shortest * 0.52;
+            float lift = (hb - 0.5) * u_res.y * 0.08;
+            sp = center + vec2(cos(theta) * rad0 * diskR, sin(theta) * rad0 * diskR * 0.42 + lift);
+            glow = 0.8 + 0.6 * (1.0 - rad0) + sin(local * 22.0 + h * TAU) * 0.25 * mid;
+            depth01 = 0.65 + 0.35 * (sin(theta) * 0.5 + 0.5);
+        } else if (u_style == 13) {
+            float mu = uvp.x * TAU + spin * 0.5;
+            float mv = (uvp.y - 0.5) * 2.0;
+            float bw = 0.5 * (1.0 + (hb - 0.5) * 0.4);
+            float rr = 1.0 + mv * bw * cos(mu * 0.5);
+            float bx = rr * cos(mu);
+            float by = rr * sin(mu);
+            float bz = mv * bw * sin(mu * 0.5);
+            float ct = cos(1.15);
+            float stt = sin(1.15);
+            sp = center + vec2(bx, -(by * ct - bz * stt)) * shortest * 0.34;
+            depth01 = clamp((by * stt + bz * ct) * 0.5 + 0.5, 0.0, 1.0);
+        } else {
+            float hgt = uvp.y;
+            float rr = shortest * 0.44 * mix(0.12, 1.0, hgt) * (1.0 + (hb - 0.5) * 0.2);
+            float omega = u_progress * TAU * (1.4 + (1.0 - hgt) * 2.2);
+            float theta = uvp.x * TAU + omega + h * 0.3;
+            float sway = sin(hgt * 3.14159265 * 1.2 + local * TAU * 0.6) * u_res.x * 0.08;
+            sp = vec2(center.x + rr * cos(theta) + sway, center.y - (hgt - 0.5) * u_res.y * 0.86);
+            depth01 = sin(theta) * 0.5 + 0.5;
+        }
+        float transit = sin(3.14159265 * form);
+        vec2 base_p = mix(home, sp, form);
+        float swirl = coil
+            ? transit * HELIX_SWIRL * (hb - 0.5)
+            : transit * (0.5 + hb * 1.1);
+        vec2 rel = base_p - center;
+        float cs = cos(swirl);
+        float sn = sin(swirl);
+        vec2 p = center + vec2(rel.x * cs - rel.y * sn, rel.x * sn + rel.y * cs);
+        p += vec2(sin(local * 7.0 + h * TAU), cos(local * 6.0 + hb * TAU))
+            * u_res.y * (0.02 + hc * 0.025) * transit;
+        float orb = local * TAU * (1.5 + hb * 1.5) + h * TAU;
+        p += vec2(cos(orb), sin(orb)) * (2.0 + hc * 6.0) * transit;
+        if (coil) {
+            float away = hp(id, 9u) * TAU;
+            p += vec2(cos(away), sin(away))
+                * u_res.y * HELIX_DISPERSE * sqrt(hc) * transit;
+        }
+        v_mix = coil
+            ? smoothstep(-HELIX_FADE_BAND, HELIX_FADE_BAND, coilY)
+            : smoothstep(0.34, 0.58, local + (h - 0.5) * 0.05);
+        v_bright = mix(1.0, mix(0.4, 1.25, depth01) * glow, form) + mid * 0.12;
+        v_alpha = 1.0;
+        vec2 sizeN = u_res / vec2(float(GW), float(GH)) * 1.15 * mix(1.0, psize, form);
+        vec2 worldN = p + off * sizeN;
+        v_uv = uvp + off * (1.15 / vec2(float(GW), float(GH)));
+        gl_Position = vec4(
+            worldN.x / u_res.x * 2.0 - 1.0,
+            worldN.y / u_res.y * 2.0 - 1.0,
+            0.0,
+            1.0
+        );
+        return;
+    }
+    float h2 = hp(id, 2u);
+    float h3 = hp(id, 3u);
+    float ang01 = fract(atan(dc.y, dc.x) / TAU + 1.0 + (h - 0.5) * 0.02);
+    float strand_base = clamp(uvp.y + (h - 0.5) * 0.05, 0.0, 0.999);
+    if (u_style == 0 || u_style == 4) {
+        strand_base = ang01;
+    }
+    float strand = floor(strand_base * NSTR);
+    float sh = hp(uint(strand), 4u);
+    float sh2 = hp(uint(strand), 5u);
+    float sh3 = hp(uint(strand), 6u);
+    float pa = (strand + 0.5) / NSTR * TAU;
+    float m = u_res.y * 0.4;
+    float dep = role_b ? rim : 1.0 - rim;
+    if (u_style == 7) {
+        dep = uvp.x;
+    }
+    float tt;
+    if (role_b) {
+        float pb = (u_progress - 0.20) / 0.62;
+        tt = clamp((pb - 0.04) * 2.3 - dep * 0.65 - h * 0.2, 0.0, 1.0);
+        v_alpha = smoothstep(0.02, 0.15, tt);
+    } else {
+        tt = clamp(u_progress / 0.55 * 1.9 - dep * 0.65 - h * 0.2, 0.0, 1.0);
+        v_alpha = 1.0 - smoothstep(0.80, 0.99, tt);
+    }
+    if (v_alpha < 0.004) {
+        gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+        return;
+    }
+    float ease = tt * tt * (3.0 - 2.0 * tt);
+    float mid = sin(3.14159265 * ease);
+    vec2 p0;
+    vec2 p2;
+    vec2 waist;
+    if (u_style == 4) {
+        float oa = (role_b ? h2 : h) * TAU;
+        float rr = u_res.y * (0.34 + h3 * 0.14);
+        vec2 ringw = center + vec2(cos(oa + 0.9), sin(oa + 0.9) * 0.85) * rr;
+        p0 = role_b ? center + vec2(cos(oa - 2.2), sin(oa - 2.2) * 0.85) * length(u_res) * 0.75
+                    : home;
+        p2 = role_b ? home
+                    : center + vec2(cos(oa + 2.2), sin(oa + 2.2) * 0.85) * length(u_res) * 0.75;
+        waist = ringw;
+    } else if (u_style == 7) {
+        p0 = role_b ? vec2(-m, center.y + (sh2 - 0.5) * u_res.y * 1.2) : home;
+        p2 = role_b ? home : vec2(u_res.x + m, center.y + (sh - 0.5) * u_res.y * 1.2);
+        waist = vec2(mix(p0.x, p2.x, 0.25 + sh2 * 0.5), center.y + (sh - 0.5) * u_res.y * 0.5);
+    } else {
+        p0 = role_b ? center + vec2(cos(pa - 2.2), sin(pa - 2.2) * 0.9) * length(u_res) * 0.8
+                    : home;
+        p2 = role_b ? home
+                    : center + vec2(cos(pa + 2.2), sin(pa + 2.2) * 0.9) * length(u_res) * 0.8;
+        waist = role_b ? center + vec2(cos(pa - 1.1), sin(pa - 1.1) * 0.9) * u_res.y * 0.5
+                       : center + vec2(cos(pa + 1.1), sin(pa + 1.1) * 0.9) * u_res.y * 0.5;
+    }
+    vec2 guide = mix(mix(p0, waist, ease), mix(waist, p2, ease), ease);
+    float turb_mul = 1.0;
+    if (u_style == 7) {
+        turb_mul = 1.5;
+    }
+    guide += vec2(
+        sin(ease * (4.0 + sh2 * 5.0) * 3.14159265 + h * TAU),
+        cos(ease * (3.0 + sh2 * 4.0) * 3.14159265 + h2 * TAU)
+    ) * u_res.y * (0.05 + h3 * 0.07) * mid * turb_mul;
+    float orb_ang = ease * TAU * (1.5 + sh * 1.8) + uvp.x * (7.0 + sh * 7.0) + h2 * 1.3;
+    vec2 p = guide + vec2(cos(orb_ang), sin(orb_ang)) * (2.0 + h2 * 8.0) * mid;
+    if (u_style == 7) {
+        float lr = u_res.y * (0.18 + sh2 * 0.18) * mid;
+        float la = ease * TAU * (1.0 + sh3 * 1.2) + h * TAU;
+        p += vec2(cos(la), sin(la)) * lr;
+    }
+    vec2 size = u_res / vec2(float(GW), float(GH)) * 1.15;
+    vec2 world = p + off * size;
+    v_uv = uvp + off * (1.15 / vec2(float(GW), float(GH)));
+    v_bright = 1.0 + mid * 0.35;
+    v_mix = smoothstep(0.34, 0.58, ease + (h - 0.5) * 0.05);
+    gl_Position = vec4(world.x / u_res.x * 2.0 - 1.0, world.y / u_res.y * 2.0 - 1.0, 0.0, 1.0);
+}

@@ -1,0 +1,33 @@
+[package]
+name = "skwd-wall-still"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Standalone Wayland shared-memory still wallpaper renderer"
+
+[[bin]]
+name = "skwd-wall-still"
+path = "src/main.rs"
+
+[dependencies]
+paper-runtime = { path = "../paper-runtime" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde_json = { workspace = true }
+paper-control = { path = "../paper-control" }
+paper-geom = { path = "../paper-geom" }
+
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+smithay-client-toolkit = { version = "0.19", default-features = false, features = [] }
+
+image = { workspace = true }
+
+libc = "0.2"
+
+[lints]
+workspace = true

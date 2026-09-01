@@ -1,0 +1,10 @@
+self-hosted-runner:
+  labels:
+    - skwd-paper-ci
+
+config-variables: null
+
+paths:
+  .forgejo/workflows/**/*.{yml,yaml}:
+    ignore:
+      - 'specifying action "https://code\.forgejo\.org/actions/[^" ]+" in invalid format'

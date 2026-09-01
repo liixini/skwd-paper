@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/paper-audio",
+    "crates/paper-cli",
+    "crates/paper-control",
+    "crates/paper-geom",
+    "crates/paper-log",
+    "crates/paper-runtime",
+    "crates/paper-scene",
+    "crates/paper-shaders",
+    "crates/paper-still",
+    "crates/paper-tinier",
+    "crates/paper-vk",
+]
+
+[workspace.package]
+version = "1.0.0-beta.1"
+edition = "2024"
+rust-version = "1.93"
+license = "GPL-3.0-or-later"
+authors = ["liixini"]
+
+[workspace.dependencies]
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif", "tiff", "pnm"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+texpresso = "2.0.2"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[workspace.lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+await_holding_lock = "deny"
+unused_async = "deny"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+must_use_candidate = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+float_cmp = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+ptr_as_ptr = "allow"
+borrow_as_ptr = "allow"
+unreadable_literal = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+items_after_test_module = "allow"
+module_name_repetitions = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+manual_let_else = "deny"
+map_unwrap_or = "deny"

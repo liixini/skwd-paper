@@ -1,0 +1,30 @@
+[package]
+name = "paper-tinier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Private resident-memory AV1 worker for skwd-paper"
+
+[[bin]]
+name = "skwd-paper-tinier"
+path = "src/main.rs"
+
+[dependencies]
+dav1d = "0.11.1"
+libc = "0.2"
+paper-control = { path = "../paper-control" }
+paper-geom = { path = "../paper-geom" }
+paper-runtime = { path = "../paper-runtime" }
+serde_json = { workspace = true }
+smithay-client-toolkit = { version = "0.19", default-features = false, features = [] }
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.12", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

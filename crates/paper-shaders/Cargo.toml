@@ -1,0 +1,17 @@
+[package]
+name = "paper-shaders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Single-source sand grain transition GLSL, composed per graphics API dialect"
+
+[dependencies]
+regex-lite = "0.1"
+
+[dev-dependencies]
+insta = "1"
+
+[lints.rust]
+dead_code = "allow"

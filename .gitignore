@@ -1,0 +1,17 @@
+/target/
+/test-results/
+/artifacts/
+*.log
+*.sqlite
+perf.data*
+massif.out.*
+__pycache__/
+.scannerwork/
+/result
+/result-*
+/build/
+/cmake-build-*/
+/competitor-sweep-latest.json
+/perf-sweep-latest.json
+experiments/*/build/
+experiments/*/target/

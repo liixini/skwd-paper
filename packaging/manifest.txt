@@ -1,0 +1,9 @@
+usr/bin/skwd-paper-v2
+usr/bin/skwd-wall-still
+usr/bin/skwd-wall-vk
+usr/lib/skwd-paper/skwd-paper-tinier
+usr/share/licenses/skwd-paper/LICENSE
+usr/share/licenses/skwd-paper/third-party/OpenH264-BSD-2-Clause.txt
+usr/share/licenses/skwd-paper/third-party/dav1d-BSD-2-Clause.txt
+usr/share/licenses/skwd-paper/third-party/ffmpeg-sys-the-third-LICENSE
+usr/share/licenses/skwd-paper/third-party/libyuv-BSD-3-Clause.txt

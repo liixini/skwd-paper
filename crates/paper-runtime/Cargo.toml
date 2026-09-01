@@ -1,0 +1,16 @@
+[package]
+name = "paper-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Process and observability support shared by standalone wallpaper renderers"
+
+[dependencies]
+libc = "0.2"
+tracing = { workspace = true }
+paper-log = { path = "../paper-log" }
+
+[lints]
+workspace = true
