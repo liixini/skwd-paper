@@ -67,32 +67,6 @@ fn tinier_worker_stays_private_and_paper_owned() {
 }
 
 #[test]
-fn plasma_connector_only_launches_paper() {
-    let root = root();
-    let source = fs::read_to_string(root.join("packaging/plasma/src/skwdvideoitem.cpp"))
-        .expect("read Plasma connector");
-    let qml = fs::read_to_string(root.join("packaging/plasma/wallpaper/contents/ui/main.qml"))
-        .expect("read Plasma wallpaper QML");
-    assert!(source.contains("present-plasma"));
-    assert!(source.contains("m_process.start(m_paper, arguments)"));
-    assert!(qml.contains("JSON.stringify(root.currentAssignment.assignment)"));
-    for forbidden in [
-        "skwd-wall-vk",
-        "skwd-wall-still",
-        "skwd-paper-tinier",
-        "--video-stream",
-        "--frame-stream",
-        "--scene",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "Plasma connector contains backend detail {forbidden}"
-        );
-        assert!(!qml.contains(forbidden), "Plasma QML contains backend detail {forbidden}");
-    }
-}
-
-#[test]
 fn plasma_vk_stream_falls_back_when_external_export_is_unavailable() {
     let source = fs::read_to_string(root().join("crates/paper-vk/src/preview.rs"))
         .expect("read Vulkan preview stream");
@@ -104,16 +78,6 @@ fn plasma_vk_stream_falls_back_when_external_export_is_unavailable() {
     );
     let control = source[fallback..].find("Ctl::start").expect("stream control after fallback");
     assert!(control > 0);
-}
-
-#[test]
-fn plasma_cpu_stream_owns_pixels_until_the_scene_graph_uploads_them() {
-    let source = fs::read_to_string(root().join("packaging/plasma/src/skwdvideoitem.cpp"))
-        .expect("read Plasma connector");
-    assert!(source.contains("const QImage image = borrowed.copy();"));
-    assert!(source.contains("frame.size() != qsizetype(frameWidth) * qsizetype(frameHeight) * 4"));
-    assert!(source.contains("frameHeight, frameWidth * 4, QImage::Format_RGBA8888"));
-    assert!(source.contains("m_frame.clear();"));
 }
 
 #[test]

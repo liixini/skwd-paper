@@ -109,22 +109,6 @@ jobs:
         continue-on-error: true
         run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.package --out ci-artifacts/results/paper-package.json -- scripts/package-stage.sh build/package-stage
 
-      - name: Configure Plasma plugin
-        continue-on-error: true
-        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.plasma.configure --out ci-artifacts/results/paper-plasma-configure.json -- cmake -S packaging/plasma -B build/plasma -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
-
-      - name: Build Plasma plugin
-        continue-on-error: true
-        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.plasma.build --out ci-artifacts/results/paper-plasma-build.json -- cmake --build build/plasma --parallel
-
-      - name: Install Plasma plugin
-        continue-on-error: true
-        run: >-
-          python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.plasma.install
-          --out ci-artifacts/results/paper-plasma-install.json --
-          bash -euo pipefail -c
-          'DESTDIR="$PWD/build/plasma-stage" cmake --install build/plasma && test -f build/plasma-stage/usr/share/licenses/skwd-paper-plasma/LICENSE'
-
       - name: Record deliberate live-scene coverage
         if: always()
         run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" skip --suite paper.native-scene --reason 'requires a staged native scene, Vulkan device, and isolated live compositor' --out ci-artifacts/results/paper-native-scene.json

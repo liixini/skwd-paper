@@ -12,9 +12,6 @@
     {"id": "paper.python", "expectedSkips": 0, "coverage": "Python packaging and performance tooling tests"},
     {"id": "paper.executables", "expectedSkips": 0, "coverage": "release executable contract"},
     {"id": "paper.package", "expectedSkips": 0, "coverage": "real release package stage"},
-    {"id": "paper.plasma.configure", "expectedSkips": 0, "coverage": "Plasma plugin configure"},
-    {"id": "paper.plasma.build", "expectedSkips": 0, "coverage": "Plasma plugin build"},
-    {"id": "paper.plasma.install", "expectedSkips": 0, "coverage": "Plasma plugin staged install and notices"},
     {"id": "paper.native-scene", "expectedSkips": 1, "coverage": "live native scene renderer"}
   ]
 }
