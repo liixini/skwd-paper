@@ -322,6 +322,43 @@ pub struct FrameImages {
 }
 
 impl Renderer {
+    fn drm_format_modifier_properties(
+        &self,
+        format: vk::Format,
+    ) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
+        unsafe {
+            let count = {
+                let mut modifiers = vk::DrmFormatModifierPropertiesListEXT::default();
+                let mut properties = vk::FormatProperties2::default().push_next(&mut modifiers);
+                self.instance.get_physical_device_format_properties2(
+                    self.phys,
+                    format,
+                    &mut properties,
+                );
+                modifiers.drm_format_modifier_count as usize
+            };
+            let mut available = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+            let returned = {
+                let mut modifiers = vk::DrmFormatModifierPropertiesListEXT::default()
+                    .drm_format_modifier_properties(&mut available);
+                let mut properties = vk::FormatProperties2::default().push_next(&mut modifiers);
+                self.instance.get_physical_device_format_properties2(
+                    self.phys,
+                    format,
+                    &mut properties,
+                );
+                modifiers.drm_format_modifier_count as usize
+            };
+            available.truncate(returned.min(available.len()));
+            available
+        }
+    }
+
+    fn single_plane_xr24_modifiers(&self, modifiers: &[u64]) -> Vec<u64> {
+        let available = self.drm_format_modifier_properties(vk::Format::B8G8R8A8_UNORM);
+        single_plane_modifiers(modifiers, &available)
+    }
+
     #[cfg(feature = "shared-device")]
     pub fn create_external_semaphore(&self) -> Result<ExternalSemaphore> {
         unsafe {
@@ -691,12 +728,19 @@ impl Renderer {
         modifiers: &[u64],
         linear_modifier: Option<u64>,
     ) -> Result<ExportImage> {
-        if !modifiers.is_empty() {
+        let single_plane_modifiers = self.single_plane_xr24_modifiers(modifiers);
+        if single_plane_modifiers.len() != modifiers.len() {
+            tracing::info!(
+                skipped = modifiers.len() - single_plane_modifiers.len(),
+                "skwd-wall-vk: skipping multi-plane XR24 modifiers"
+            );
+        }
+        if !single_plane_modifiers.is_empty() {
             match self.create_xr24_export_tiling(
                 width,
                 height,
                 vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
-                modifiers,
+                &single_plane_modifiers,
                 true,
                 true,
                 vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
@@ -835,7 +879,7 @@ impl Renderer {
             let layout = self.device.get_image_subresource_layout(
                 output.image,
                 vk::ImageSubresource {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    aspect_mask: xr24_layout_aspect(tiling),
                     mip_level: 0,
                     array_layer: 0,
                 },
@@ -856,6 +900,30 @@ impl Renderer {
             output.direct_render = direct_render;
             Ok(output)
         }
+    }
+}
+
+fn single_plane_modifiers(
+    candidates: &[u64],
+    available: &[vk::DrmFormatModifierPropertiesEXT],
+) -> Vec<u64> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            available.iter().any(|properties| {
+                properties.drm_format_modifier == *candidate
+                    && properties.drm_format_modifier_plane_count == 1
+            })
+        })
+        .collect()
+}
+
+fn xr24_layout_aspect(tiling: vk::ImageTiling) -> vk::ImageAspectFlags {
+    if tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT {
+        vk::ImageAspectFlags::MEMORY_PLANE_0_EXT
+    } else {
+        vk::ImageAspectFlags::COLOR
     }
 }
 

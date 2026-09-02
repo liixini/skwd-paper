@@ -184,6 +184,20 @@ unsafe extern "C" fn pick_vaapi(
     ff::ffi::AVPixelFormat(-1)
 }
 
+fn open_hardware_video(ctx: ff::codec::context::Context) -> Result<ff::decoder::Video> {
+    if ctx.id() == ff::codec::Id::AV1 {
+        let decoder =
+            ff::codec::decoder::find_by_name("av1").ok_or_else(|| anyhow!("no native av1"))?;
+        return ctx
+            .decoder()
+            .open_as(decoder)
+            .context("open native av1")?
+            .video()
+            .context("av1 video");
+    }
+    ctx.decoder().video().context("open decoder")
+}
+
 impl VulkanDecoder {
     #[cfg(feature = "shared-device")]
     pub fn open_with(path: &str, hwdev: *mut ff::ffi::AVBufferRef) -> Result<Self> {
@@ -247,14 +261,7 @@ impl VulkanDecoder {
             (*raw).thread_count = HW_THREAD_COUNT;
             (*raw).thread_type = 0;
         }
-        let is_av1 = unsafe { (*ctx.as_mut_ptr()).codec_id == ff::ffi::AVCodecID::AV1 };
-        let decoder = if is_av1 {
-            let named =
-                ff::codec::decoder::find_by_name("av1").ok_or_else(|| anyhow!("no native av1"))?;
-            ctx.decoder().open_as(named).context("open native av1")?.video().context("av1 video")?
-        } else {
-            ctx.decoder().video().context("open decoder")?
-        };
+        let decoder = open_hardware_video(ctx)?;
         let (width, height) = (decoder.width(), decoder.height());
         let Container { ictx, stream_index, time_base_secs, .. } = container;
         let mut decoder = Self {
@@ -356,7 +363,7 @@ impl VaapiDecoder {
             (*raw).thread_count = HW_THREAD_COUNT;
             (*raw).thread_type = 0;
         }
-        let decoder = match ctx.decoder().video().context("open VAAPI decoder") {
+        let decoder = match open_hardware_video(ctx).context("open VAAPI decoder") {
             Ok(decoder) => decoder,
             Err(error) => {
                 forget_vaapi_device(&hw);

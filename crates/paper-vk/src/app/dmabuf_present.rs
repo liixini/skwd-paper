@@ -1554,11 +1554,9 @@ fn run_shared_dmabuf_with_readiness(
             continue;
         }
         let fading = fade.is_some();
-        if fading
-            && fade_cap > 0
-            && let Some(last) = last_fade_render
-        {
-            let due = last + std::time::Duration::from_secs_f32(1.0 / fade_cap as f32);
+        if fading && let Some(last) = last_fade_render {
+            let surface = &target.app.surfaces[anchor];
+            let due = last + fade_frame_interval(fade_cap, surface.fps_limit, surface.refresh_ns);
             if Instant::now() < due {
                 target.dispatch_until(due)?;
                 continue;

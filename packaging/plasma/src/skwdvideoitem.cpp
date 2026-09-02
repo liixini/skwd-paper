@@ -616,6 +616,7 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
                 acknowledge(node->currentSlot);
             }
             node->setTexture(node->textures[pending].texture);
+            node->setOwnsTexture(false);
             node->currentSlot = pending;
             node->generation = generation;
             return node;
@@ -647,8 +648,8 @@ QSGNode *SkwdVideoItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
         return node;
     }
     QSGTexture *texture = window()->createTextureFromImage(image, QQuickWindow::TextureIsOpaque);
-    node->setOwnsTexture(true);
     node->setTexture(texture);
+    node->setOwnsTexture(true);
     node->generation = generation;
     return node;
 }

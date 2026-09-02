@@ -146,6 +146,18 @@ pub(super) fn fade_fps_cap() -> u32 {
     std::env::var("SKWD_PAPER_SAND_FPS").ok().and_then(|val| val.parse().ok()).unwrap_or(0)
 }
 
+pub(super) fn fade_frame_interval(
+    configured_fps: u32,
+    output_fps: u32,
+    refresh_ns: u32,
+) -> Duration {
+    let fps = if configured_fps > 0 { configured_fps } else { output_fps };
+    if fps > 0 {
+        return Duration::from_nanos((1_000_000_000 / u64::from(fps)).max(1));
+    }
+    Duration::from_nanos(if refresh_ns > 0 { u64::from(refresh_ns) } else { 6_944_444 })
+}
+
 pub(super) fn env_speed() -> f64 {
     std::env::var("SKWD_VK_SPEED")
         .ok()
@@ -492,5 +504,13 @@ mod transition_tests {
         assert!(fade.t0.elapsed() < Duration::from_millis(100));
         assert!(fade.progress() < 0.2);
         assert_eq!(fade.cur.1, 0.0);
+    }
+
+    #[test]
+    fn transition_interval_uses_config_then_output_then_refresh() {
+        assert_eq!(fade_frame_interval(30, 60, 16_666_667), Duration::from_nanos(33_333_333));
+        assert_eq!(fade_frame_interval(0, 60, 16_666_667), Duration::from_nanos(16_666_666));
+        assert_eq!(fade_frame_interval(0, 0, 16_666_667), Duration::from_nanos(16_666_667));
+        assert_eq!(fade_frame_interval(0, 0, 0), Duration::from_nanos(6_944_444));
     }
 }

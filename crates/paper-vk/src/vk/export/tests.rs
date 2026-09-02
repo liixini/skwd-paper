@@ -1,6 +1,9 @@
 #![cfg(feature = "shared-device")]
 
-use super::{ExportImage, ExportOwner, Nv12Export, ReadbackBuf, RenderTarget};
+use super::{
+    ExportImage, ExportOwner, Nv12Export, ReadbackBuf, RenderTarget, single_plane_modifiers,
+    xr24_layout_aspect,
+};
 use ash::vk;
 
 #[test]
@@ -41,4 +44,29 @@ fn first_use_local() {
     assert_eq!(ExportOwner::External.acquire(false, local), ignored);
     assert_eq!(ExportOwner::None.acquire(true, local), ignored);
     assert_eq!(ExportOwner::None.release(local), ignored);
+}
+
+#[test]
+fn xr24_modifier_selection_excludes_auxiliary_planes() {
+    let available = [
+        vk::DrmFormatModifierPropertiesEXT::default()
+            .drm_format_modifier(8)
+            .drm_format_modifier_plane_count(3),
+        vk::DrmFormatModifierPropertiesEXT::default()
+            .drm_format_modifier(9)
+            .drm_format_modifier_plane_count(1),
+        vk::DrmFormatModifierPropertiesEXT::default()
+            .drm_format_modifier(2)
+            .drm_format_modifier_plane_count(1),
+    ];
+    assert_eq!(single_plane_modifiers(&[8, 9, 2, 7], &available), [9, 2]);
+}
+
+#[test]
+fn xr24_modifier_layout_uses_memory_plane_aspect() {
+    assert!(
+        xr24_layout_aspect(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            == vk::ImageAspectFlags::MEMORY_PLANE_0_EXT
+    );
+    assert!(xr24_layout_aspect(vk::ImageTiling::LINEAR) == vk::ImageAspectFlags::COLOR);
 }
