@@ -1127,7 +1127,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "paper-audio"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "cpal",
@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "paper-control"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "libc",
  "paper-geom",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "paper-geom"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "paper-log"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "tracing-appender",
  "tracing-subscriber",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "paper-runtime"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "libc",
  "paper-log",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "paper-scene"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "image",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "paper-shaders"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "insta",
  "regex-lite",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "paper-tinier"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "dav1d",
  "libc",
@@ -1551,7 +1551,7 @@ checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "skwd-paper"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "skwd-wall-still"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "skwd-wall-vk"
-version = "1.0.0-beta.1"
+version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
  "ash",
