@@ -1176,6 +1176,7 @@ name = "paper-scene"
 version = "1.0.0-beta.4"
 dependencies = [
  "anyhow",
+ "bitflags 2.13.0",
  "image",
  "libc",
  "lz4_flex",

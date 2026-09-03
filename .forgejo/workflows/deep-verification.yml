@@ -19,10 +19,12 @@ concurrency:
 jobs:
   deep:
     name: Forgejo / Paper required
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '(#')
     runs-on: skwd-paper-ci
-    timeout-minutes: 90
+    timeout-minutes: 15
     env:
       CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_PANIC: unwind
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: "1"
       SKWD_RUNNER_IMAGE: sha256:66058d5c15a5011188ee634bb909d730c279ab0d65408581b5d70e99a6970edb
@@ -73,18 +75,6 @@ jobs:
         continue-on-error: true
         run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.format --out ci-artifacts/results/paper-format.json -- cargo fmt --check
 
-      - name: Workspace tests
-        continue-on-error: true
-        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.tests --out ci-artifacts/results/paper-tests.json -- cargo test --locked --release --workspace
-
-      - name: Clippy
-        continue-on-error: true
-        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.clippy --out ci-artifacts/results/paper-clippy.json -- cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      - name: Release build
-        continue-on-error: true
-        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.release --out ci-artifacts/results/paper-release.json -- cargo build --locked --release --workspace
-
       - name: Dependency inventory
         continue-on-error: true
         run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.dependencies --out ci-artifacts/results/paper-dependencies.json -- cargo machete --with-metadata crates
@@ -97,7 +87,25 @@ jobs:
         continue-on-error: true
         run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.python --out ci-artifacts/results/paper-python.json -- python3 "$SKWD_VERIFY_ROOT/scripts/python_suite.py" python-general
 
+      - name: Clippy
+        id: clippy
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.clippy --out ci-artifacts/results/paper-clippy.json -- cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Release build
+        id: release
+        if: steps.clippy.outcome == 'success'
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.release --out ci-artifacts/results/paper-release.json -- cargo build --locked --release --workspace
+
+      - name: Workspace tests
+        id: tests
+        if: steps.release.outcome == 'success'
+        continue-on-error: true
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.tests --out ci-artifacts/results/paper-tests.json -- cargo test --locked --release --workspace
+
       - name: Release executable contract
+        if: steps.release.outcome == 'success'
         continue-on-error: true
         run: >-
           python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.executables
@@ -106,12 +114,26 @@ jobs:
           'test -x target/release/skwd-paper && test -x target/release/skwd-paper-tinier && test -x target/release/skwd-wall-vk && test -x target/release/skwd-wall-still'
 
       - name: Real release package stage
+        if: steps.release.outcome == 'success'
         continue-on-error: true
         run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.package --out ci-artifacts/results/paper-package.json -- scripts/package-stage.sh build/package-stage
 
       - name: Record deliberate live-scene coverage
         if: always()
         run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" skip --suite paper.native-scene --reason 'requires a staged native scene, Vulkan device, and isolated live compositor' --out ci-artifacts/results/paper-native-scene.json
+
+      - name: Record blocked suites
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          present=$(jq -r .suite ci-artifacts/results/*.json)
+          jq -r '.suites[].id' scripts/ci-suites.json | while read -r suite; do
+            if ! printf '%s\n' "$present" | grep -qx -- "$suite"; then
+              python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" emit --suite "$suite" --ok false --detail 'BLOCKED: an earlier required gate failed' --out "ci-artifacts/results/$(printf '%s' "$suite" | tr . -).json"
+            fi
+          done
 
       - name: Record exact execution provenance
         if: always()

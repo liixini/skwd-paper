@@ -9,6 +9,7 @@ description = "Wallpaper Engine scene format parsing and library audit"
 
 [dependencies]
 anyhow = { workspace = true }
+bitflags = { version = "2", features = ["std"] }
 image = { workspace = true }
 libc = "0.2"
 shaderc = { version = "0.9", default-features = false }
@@ -18,6 +19,9 @@ texpresso = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["bitflags"]
 
 [lints]
 workspace = true
