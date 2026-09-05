@@ -186,6 +186,57 @@ fn every_output_owns_an_independent_scene_presenter() {
 }
 
 #[test]
+fn shared_scene_slot_waits_for_every_borrower() {
+    let mut free = [vec![], vec![], vec![]];
+    let available = |free: &[Vec<usize>]| shared_scene_slot(free.iter().map(Vec::as_slice), 2);
+    free[0].push(0);
+    free[1].push(0);
+    assert_eq!(available(&free), None);
+    free[2].push(1);
+    assert_eq!(available(&free), None);
+    free[2].push(0);
+    assert_eq!(available(&free), Some(0));
+}
+
+#[test]
+fn shared_scene_pool_growth_unblocks_fragmented_outputs() {
+    let mut free = [vec![0], vec![1], vec![0]];
+    assert_eq!(shared_scene_slot(free.iter().map(Vec::as_slice), 2), None);
+    for output in &mut free {
+        output.push(2);
+    }
+    assert_eq!(shared_scene_slot(free.iter().map(Vec::as_slice), 3), Some(2));
+    free[0].retain(|&bi| bi != 2);
+    assert_eq!(shared_scene_slot(free.iter().map(Vec::as_slice), 3), None);
+    free[0].push(2);
+    assert_eq!(shared_scene_slot(free.iter().map(Vec::as_slice), 3), Some(2));
+}
+
+#[test]
+fn shared_scene_pool_keeps_fast_outputs_independent_of_retained_frames() {
+    let count = 6;
+    let mut free = [vec![1, 2, 3, 4, 5], vec![0, 3, 4, 5], vec![0, 1, 2, 5]];
+    let mut current = 0;
+    for _ in 0..100 {
+        let next = shared_scene_slot(free.iter().map(Vec::as_slice), count).unwrap();
+        assert!(next == 0 || next == 5);
+        free[0].retain(|&bi| bi != next);
+        assert_eq!(count - free[0].len(), 2);
+        free[0].push(current);
+        current = next;
+    }
+    assert_eq!(free[1], [0, 3, 4, 5]);
+    assert_eq!(free[2], [0, 1, 2, 5]);
+}
+
+#[test]
+fn shared_scene_pool_does_not_reuse_closed_outputs_unreleased_storage() {
+    let live = [1, 2];
+    let closed = [0, 2];
+    assert_eq!(shared_scene_slot([live.as_slice(), closed.as_slice()].into_iter(), 3), Some(2));
+}
+
+#[test]
 fn effect_target_accounting_retains_only_the_selected_output() {
     let ping_output = classify_effect_target_bytes(&[64, 64, 16, 8], FxTargetId::Ping).unwrap();
     assert_eq!(ping_output, EffectTargetBytes { retained: 64, transient: 88 });

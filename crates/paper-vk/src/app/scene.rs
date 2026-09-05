@@ -1,6 +1,7 @@
-use super::dmabuf_helpers::{init_free_buffers, monotonic_ns};
+use super::dmabuf_helpers::{create_buffers, init_free_buffers, monotonic_ns};
 use super::model::StartFade;
 use super::readiness::signal_ready;
+use crate::dmabuf::{DRM_MOD_INVALID, DRM_MOD_LINEAR, xr24_export_modifiers};
 use crate::fill::{fill_mode, mode_uv};
 use crate::{ctl, decode, shared, vk, wayland};
 use anyhow::{Context, Result, anyhow};
@@ -473,11 +474,68 @@ struct Presenter {
 }
 
 impl Presenter {
+    fn grow_scene_pool(
+        &mut self,
+        target: &mut wayland::Target,
+        buffers: &mut [Vec<wayland_client::protocol::wl_buffer::WlBuffer>],
+    ) -> Result<usize> {
+        let selected = self.exports[0]
+            .modifier
+            .filter(|modifier| *modifier != DRM_MOD_LINEAR && *modifier != DRM_MOD_INVALID);
+        let export = self.renderer.create_xr24_export(
+            self.width,
+            self.height,
+            selected.as_slice(),
+            selected.is_none().then_some(self.exports[0].modifier).flatten(),
+        )?;
+        if !target.probe_dmabuf_import(
+            export.fd,
+            self.width,
+            self.height,
+            export.offset,
+            export.stride,
+            export.modifier,
+        )? {
+            return Err(anyhow!("compositor rejected additional scene pool buffer"));
+        }
+        let rt = if export.direct_render && !self.rts.is_empty() {
+            Some(self.renderer.create_export_rt(&export)?)
+        } else {
+            None
+        };
+        let bi = self.exports.len();
+        for (si, ring) in buffers.iter_mut().enumerate() {
+            ring.push(target.create_dmabuf_buffer(
+                export.fd,
+                self.width,
+                self.height,
+                export.offset,
+                export.stride,
+                export.modifier,
+                si,
+                bi,
+            )?);
+            target.app.surfaces[si].free_buffers.push(bi);
+        }
+        self.exports.push(export);
+        if let Some(rt) = rt {
+            self.rts.push(rt);
+        }
+        tracing::info!(
+            buffers = self.exports.len(),
+            export_mib = self.exports.iter().map(|export| export.allocation_size).sum::<u64>()
+                as f64
+                / 1_048_576.0,
+            "skwd-wall-vk: expanded shared scene presentation pool"
+        );
+        Ok(bi)
+    }
+
     fn ensure_render_targets(&mut self) -> Result<()> {
         if !self.rts.is_empty() {
             return Ok(());
         }
-        self.rts = if self.renderer.direct_render() {
+        self.rts = if self.exports[0].direct_render {
             self.exports
                 .iter()
                 .map(|export| self.renderer.create_export_rt(export))
@@ -503,7 +561,7 @@ impl Presenter {
             return self.renderer.blit_scene_to_export(target, export);
         }
         self.ensure_render_targets()?;
-        let rt_index = if self.renderer.direct_render() { buffer_index } else { 0 };
+        let rt_index = if self.exports[buffer_index].direct_render { buffer_index } else { 0 };
         let export = &mut self.exports[buffer_index];
         self.renderer.render_to(&self.rts[rt_index], export, &vk::Src::Rgba(target.view), uv)
     }
@@ -523,7 +581,8 @@ impl Presenter {
                 FadeFrom::Scene(target) => self.present(target, buffer_index),
                 FadeFrom::Nv12(up) => {
                     self.ensure_render_targets()?;
-                    let rt_index = if self.renderer.direct_render() { buffer_index } else { 0 };
+                    let rt_index =
+                        if self.exports[buffer_index].direct_render { buffer_index } else { 0 };
                     let export = &mut self.exports[buffer_index];
                     let from = vk::Src::Views(up.luma_view, up.chroma_view);
                     let from_uv = mode_uv(source.width, source.height, self.width, self.height);
@@ -535,7 +594,7 @@ impl Presenter {
             return self.present(&group.target, buffer_index);
         }
         self.ensure_render_targets()?;
-        let rt_index = if self.renderer.direct_render() { buffer_index } else { 0 };
+        let rt_index = if self.exports[buffer_index].direct_render { buffer_index } else { 0 };
         let export = &mut self.exports[buffer_index];
         let from = match &source.source {
             FadeFrom::Nv12(up) => vk::Src::Views(up.luma_view, up.chroma_view),
@@ -2125,17 +2184,35 @@ fn build_presenter(
     width: u32,
     height: u32,
     n_exports: usize,
+    modifiers: Option<(&[u64], Option<u64>)>,
 ) -> Result<Presenter> {
     let renderer = shared_renderer(sd, width, height).context("shared scene presenter")?;
-    let exports: Vec<vk::ExportImage> = (0..n_exports)
-        .map(|_| renderer.create_export_image_opts(width, height, false))
-        .collect::<Result<_>>()?;
-    let direct_scene_copy = !renderer.direct_render()
+    let exports = if let Some((tiled, linear)) = modifiers {
+        let mut exports = Vec::with_capacity(n_exports);
+        exports.push(renderer.create_xr24_export(width, height, tiled, linear)?);
+        let selected = exports[0]
+            .modifier
+            .filter(|modifier| *modifier != DRM_MOD_LINEAR && *modifier != DRM_MOD_INVALID);
+        for _ in 1..n_exports {
+            exports.push(renderer.create_xr24_export(
+                width,
+                height,
+                selected.as_slice(),
+                selected.is_none().then_some(exports[0].modifier).flatten(),
+            )?);
+        }
+        exports
+    } else {
+        (0..n_exports)
+            .map(|_| renderer.create_export_image_opts(width, height, false))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let direct_scene_copy = !exports[0].direct_render
         && renderer.scene_export_blit_supported()
         && std::env::var("SKWD_VK_SCENE_DIRECT_COPY").as_deref() != Ok("0");
     let rts = if direct_scene_copy {
         Vec::new()
-    } else if renderer.direct_render() {
+    } else if exports[0].direct_render {
         exports.iter().map(|exp| renderer.create_export_rt(exp)).collect::<Result<_>>()?
     } else {
         vec![renderer.create_render_target(width, height)?]
@@ -2155,11 +2232,76 @@ fn build_presenters(
     sd: &shared::SharedDevice,
     dimensions: &[(u32, u32)],
     n_exports: usize,
+    modifiers: Option<(&[u64], Option<u64>)>,
 ) -> Result<Vec<Presenter>> {
     dimensions
         .iter()
-        .map(|&(width, height)| build_presenter(sd, width, height, n_exports))
+        .map(|&(width, height)| build_presenter(sd, width, height, n_exports, modifiers))
         .collect()
+}
+
+fn build_wayland_presenters(
+    target: &mut wayland::Target,
+    sd: &shared::SharedDevice,
+    dimensions: &[(u32, u32)],
+    n_exports: usize,
+    share_exports: bool,
+) -> Result<(Vec<Presenter>, bool)> {
+    let force_shm = std::env::var("SKWD_VK_SCENE_SHM").as_deref() == Ok("1");
+    let force_linear = std::env::var("SKWD_VK_XR24_LINEAR").as_deref() == Ok("1");
+    let (tiled, linear) = xr24_export_modifiers(&target.app.dmabuf_formats, force_linear);
+    if !force_shm {
+        for modifiers in [(!tiled.is_empty()).then_some(tiled.as_slice()), linear.map(|_| &[][..])]
+            .into_iter()
+            .flatten()
+        {
+            let presenters = match build_presenters(
+                sd,
+                if share_exports { &dimensions[..1] } else { dimensions },
+                n_exports,
+                Some((modifiers, linear)),
+            ) {
+                Ok(presenters) => presenters,
+                Err(error) => {
+                    tracing::info!(
+                        "skwd-wall-vk: scene DMA-BUF allocation unavailable ({error:#})"
+                    );
+                    continue;
+                }
+            };
+            let mut accepted = true;
+            for presenter in &presenters {
+                for export in &presenter.exports {
+                    if !target.probe_dmabuf_import(
+                        export.fd,
+                        presenter.width,
+                        presenter.height,
+                        export.offset,
+                        export.stride,
+                        export.modifier,
+                    )? {
+                        accepted = false;
+                        break;
+                    }
+                }
+                if !accepted {
+                    break;
+                }
+            }
+            if accepted {
+                return Ok((presenters, true));
+            }
+            tracing::info!("skwd-wall-vk: compositor rejected scene DMA-BUF import");
+        }
+    }
+    Ok((build_presenters(sd, dimensions, n_exports, None)?, false))
+}
+
+fn shared_scene_slot<'a>(
+    free: impl Iterator<Item = &'a [usize]> + Clone,
+    count: usize,
+) -> Option<usize> {
+    (0..count).find(|bi| free.clone().all(|output| output.contains(bi)))
 }
 
 fn scene_presenter_layout(
@@ -2422,7 +2564,7 @@ pub(super) fn run_scene(
     drop(model);
     let shared_composition = target.supports_viewporter()
         && matches!(mode, FillMode::Fill | FillMode::Stretch | FillMode::Span);
-    let (presenter_dims, ridx) = scene_presenter_layout(
+    let (presenter_dims, mut ridx) = scene_presenter_layout(
         &dims,
         (group.target.extent.width, group.target.extent.height),
         shared_composition,
@@ -2432,14 +2574,24 @@ pub(super) fn run_scene(
         output_dimensions = ?dims,
         presenter_dimensions = ?presenter_dims,
         shared_composition,
-        isolated_presentation = true,
         canvas_w = group.target.extent.width,
         canvas_h = group.target.extent.height,
         "skwd-wall-vk: one shared scene composition"
     );
-    let mut presenters = build_presenters(&sd, &presenter_dims, n_exports)?;
+    let share_exports = shared_composition
+        && n_surf > 1
+        && std::env::var("SKWD_VK_SCENE_POOL").as_deref() != Ok("0");
+    let (mut presenters, dmabuf_present) =
+        build_wayland_presenters(target, &sd, &presenter_dims, n_exports, share_exports)?;
+    let shared_pool = share_exports && dmabuf_present;
+    if shared_pool {
+        ridx.fill(0);
+    }
     tracing::info!(
         direct_scene_copy = presenters.first().is_some_and(|presenter| presenter.direct_scene_copy),
+        shared_pool,
+        presentation_buffers =
+            presenters.iter().map(|presenter| presenter.exports.len()).sum::<usize>(),
         "skwd-wall-vk: scene presentation path"
     );
     if let Ok(frames) = std::env::var("SKWD_VK_SCENE_BENCH")
@@ -2491,20 +2643,35 @@ pub(super) fn run_scene(
     let rbs: Vec<vk::ReadbackBuf> = presenters
         .iter()
         .zip(&presenter_dims)
+        .filter(|_| !dmabuf_present)
         .map(|(presenter, &(w, h))| {
             presenter.renderer.create_readback_buf(u64::from(w) * u64::from(h) * 4)
         })
         .collect::<Result<_>>()?;
-    let mut shm_buffers = Vec::with_capacity(n_surf);
+    let mut buffers = if dmabuf_present {
+        let exports: Vec<_> =
+            presenters.iter().map(|presenter| presenter.exports.as_slice()).collect();
+        create_buffers(target, &presenter_dims, &exports, &ridx)?
+    } else {
+        Vec::with_capacity(n_surf)
+    };
     let mut rings = Vec::with_capacity(n_surf);
     for (si, &presenter_index) in ridx.iter().enumerate() {
         let (w, h) = presenter_dims[presenter_index];
-        let (ring, ptrs, stride) = target.create_shm_ring(si, w, h, n_exports)?;
-        shm_buffers.push(ring);
-        rings.push((ptrs, stride));
+        if !dmabuf_present {
+            let (ring, ptrs, stride) = target.create_shm_ring(si, w, h, n_exports)?;
+            buffers.push(ring);
+            rings.push((ptrs, stride));
+        }
     }
-    let buffers = shm_buffers;
-    tracing::info!("skwd-wall-vk: scene path = vk render + shm readback floor");
+    tracing::info!(
+        "skwd-wall-vk: scene path = {}",
+        if dmabuf_present {
+            "Vulkan DMA-BUF (no CPU readback)"
+        } else {
+            "Vulkan SHM readback fallback"
+        }
+    );
     init_free_buffers(target, n_exports);
     for si in 0..n_surf {
         if !target.app.surfaces[si].closed {
@@ -2741,33 +2908,65 @@ pub(super) fn run_scene(
 
         let mut committed = false;
         let now_ns = monotonic_ns();
-        for gi in 0..presenters.len() {
-            let si = gi;
+        let mut shared_frame = None;
+        for (si, &gi) in ridx.iter().enumerate() {
             if target.app.surfaces[si].closed || !target.commit_due_at(si, now_ns) {
                 continue;
             }
-            let Some(bi) = target.take_free_buffer_at(si) else {
-                continue;
-            };
-            if fade_step.render_transition {
-                presenters[gi].fade(&group, bi, fade_step.mix, trans_style)?;
+            let bi = if shared_pool {
+                let count = presenters[0].exports.len();
+                if count.saturating_sub(target.app.surfaces[si].free_buffers.len()) >= n_exports {
+                    continue;
+                }
+                let bi = if let Some(bi) = shared_frame {
+                    bi
+                } else {
+                    match shared_scene_slot(
+                        target.app.surfaces.iter().map(|surface| surface.free_buffers.as_slice()),
+                        count,
+                    ) {
+                        Some(bi) => bi,
+                        None if count < n_surf * n_exports => {
+                            presenters[0].grow_scene_pool(target, &mut buffers)?
+                        }
+                        None => continue,
+                    }
+                };
+                target.app.surfaces[si].free_buffers.retain(|&free| free != bi);
+                bi
             } else {
-                presenters[gi].present(&group.target, bi)?;
+                let Some(bi) = target.take_free_buffer_at(si) else {
+                    continue;
+                };
+                bi
+            };
+            if !shared_pool || shared_frame.is_none() {
+                if fade_step.render_transition {
+                    presenters[gi].fade(&group, bi, fade_step.mix, trans_style)?;
+                } else {
+                    presenters[gi].present(&group.target, bi)?;
+                }
+                if dmabuf_present {
+                    presenters[gi].wait_render()?;
+                }
+                shared_frame = shared_pool.then_some(bi);
             }
-            let (w, h) = presenter_dims[gi];
-            presenters[gi].read_export_to(bi, &rbs[gi])?;
-            let src_stride = (w * 4) as usize;
-            let (ptrs, dst_stride) = &rings[si];
-            let dst_stride = *dst_stride as usize;
-            unsafe {
-                let src = rbs[gi].ptr;
-                let dst = ptrs[bi];
-                for y in 0..h as usize {
-                    std::ptr::copy_nonoverlapping(
-                        src.add(y * src_stride),
-                        dst.add(y * dst_stride),
-                        src_stride,
-                    );
+            if !dmabuf_present {
+                let (w, h) = presenter_dims[gi];
+                presenters[gi].read_export_to(bi, &rbs[gi])?;
+                let src_stride = (w * 4) as usize;
+                let (ptrs, dst_stride) = &rings[si];
+                let dst_stride = *dst_stride as usize;
+                unsafe {
+                    let src = rbs[gi].ptr;
+                    let dst = ptrs[bi];
+                    for y in 0..h as usize {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(y * src_stride),
+                            dst.add(y * dst_stride),
+                            src_stride,
+                        );
+                    }
                 }
             }
             target.attach_at(si, &buffers[si][bi]);

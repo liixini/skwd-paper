@@ -429,12 +429,13 @@ fn aspect_ratio_matches(a: (u32, u32), b: (u32, u32)) -> bool {
 pub(super) fn create_buffers(
     target: &mut wayland::Target,
     dims: &[(u32, u32)],
-    exports: &[Vec<vk::ExportImage>],
+    exports: &[impl AsRef<[vk::ExportImage]>],
     ridx: &[usize],
 ) -> Result<Vec<Vec<wayland_client::protocol::wl_buffer::WlBuffer>>> {
     let mut buffers = Vec::with_capacity(dims.len());
     for (si, &(w, h)) in dims.iter().enumerate() {
         let ring = exports[ridx[si]]
+            .as_ref()
             .iter()
             .enumerate()
             .map(|(bi, exp)| {
