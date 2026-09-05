@@ -185,7 +185,10 @@ unsafe extern "C" fn pick_vaapi(
 }
 
 fn open_hardware_video(ctx: ff::codec::context::Context) -> Result<ff::decoder::Video> {
-    if ctx.id() == ff::codec::Id::AV1 {
+    // Cargo does not know when a system FFmpeg upgrade makes cached bindgen enum values stale.
+    // Ask the loaded libavcodec for the name instead of comparing its numeric ID to a generated
+    // constant, otherwise AV1 can silently miss the native hardware-capable decoder.
+    if ctx.id().name() == "av1" {
         let decoder =
             ff::codec::decoder::find_by_name("av1").ok_or_else(|| anyhow!("no native av1"))?;
         return ctx

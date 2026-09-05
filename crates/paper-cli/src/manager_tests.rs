@@ -89,10 +89,15 @@ fn apply(assignments: Vec<Assignment>, replace_all: bool) -> ApplyRequest {
 }
 
 fn ready(transaction: &mut ApplyTransaction) {
-    for readiness in transaction.candidate_readiness() {
-        assert!(transaction.note_ready(&readiness));
+    loop {
+        for readiness in transaction.candidate_readiness() {
+            assert!(transaction.note_ready(&readiness));
+        }
+        assert!(transaction.all_ready());
+        if !transaction.prepare_next().unwrap() {
+            break;
+        }
     }
-    assert!(transaction.all_ready());
 }
 
 struct Fixture {
@@ -570,5 +575,86 @@ fn transition_from_incumbent() {
         assert!(args.contains("--persist\n"));
         assert!(args.contains("/wall/one.png"));
         assert!(args.contains("--duration-ms\n800"));
+    });
+}
+
+#[test]
+fn static_transition_waits_for_overlay_then_steady_presentation() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let initial = fixture
+            .commit(&apply(vec![assignment("DP-1", Source::static_file("/wall/one.png"))], false))
+            .await;
+        let mut next = assignment("DP-1", Source::static_file("/wall/two.png"));
+        next.transition = Some(TransitionPolicy::default());
+        let mut transaction =
+            fixture.manager.begin_apply(&apply(vec![next], false), &fixture.socket).await.unwrap();
+        assert!(transaction.next.is_some());
+        let overlay = transaction.candidates[0].pid();
+        let args = wait_log(fixture.directory.path(), "args", overlay, "--transition-hold");
+        assert!(args.contains("--transition-from\n/wall/one.png"));
+        assert!(args.contains("--layer\nbottom"));
+        assert!(!args.contains("--persist"));
+        assert_eq!(fixture.manager.status()[0].pid, initial[0].pid);
+        for notification in transaction.candidate_readiness() {
+            transaction.note_ready(&notification);
+        }
+        assert!(transaction.prepare_next().unwrap());
+        assert!(!transaction.all_ready());
+        let steady = transaction.candidates[0].pid();
+        let args = wait_log(fixture.directory.path(), "args", steady, "--persist");
+        assert!(args.contains("/wall/two.png"));
+        assert!(!fixture.directory.path().join(format!("stdin-{overlay}")).exists());
+        ready(&mut transaction);
+        let status = fixture.manager.commit(transaction).await.unwrap();
+        assert_eq!(status[0].pid, steady);
+        assert!(status[0].assignment.transition.is_none());
+        wait_log(fixture.directory.path(), "stdin", overlay, "\"pause\":false");
+        assert_eq!(fixture.manager.overlays.len(), 1);
+        fixture.manager.stop(&StopRequest::default()).await.unwrap();
+        assert!(fixture.manager.is_empty());
+    });
+}
+
+#[test]
+fn static_transition_rollback_preserves_prior_composition() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let initial = fixture
+            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/one.mp4", None))], false))
+            .await;
+        let mut next = assignment("DP-1", Source::static_file("/wall/two.png"));
+        next.transition = Some(TransitionPolicy::default());
+        let mut transaction =
+            fixture.manager.begin_apply(&apply(vec![next], false), &fixture.socket).await.unwrap();
+        for notification in transaction.candidate_readiness() {
+            transaction.note_ready(&notification);
+        }
+        transaction.prepare_next().unwrap();
+        transaction.rollback().await;
+        assert_eq!(fixture.manager.status()[0].pid, initial[0].pid);
+        assert!(fixture.manager.overlays.is_empty());
+    });
+}
+
+#[test]
+fn failed_steady_spawn_retires_the_held_overlay_on_rollback() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let initial = fixture
+            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/one.mp4", None))], false))
+            .await;
+        let mut next = assignment("DP-1", Source::static_file("/wall/two.png"));
+        next.transition = Some(TransitionPolicy::default());
+        let mut transaction =
+            fixture.manager.begin_apply(&apply(vec![next], false), &fixture.socket).await.unwrap();
+        for notification in transaction.candidate_readiness() {
+            transaction.note_ready(&notification);
+        }
+        let worker = fixture.directory.path().join("worker");
+        std::fs::remove_file(&worker).unwrap();
+        assert!(transaction.prepare_next().is_err());
+        transaction.rollback().await;
+        assert_eq!(fixture.manager.status()[0].pid, initial[0].pid);
     });
 }

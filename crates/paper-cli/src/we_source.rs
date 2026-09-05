@@ -34,6 +34,22 @@ pub(crate) fn transition_media(path: &str) -> Result<PathBuf> {
     match resolve(path)? {
         WeTarget::Video(path) => Ok(path),
         WeTarget::Scene(root) => {
+            let project: Value =
+                serde_json::from_slice(&std::fs::read(root.join("project.json"))?)?;
+            if let Some(relative) = project.get("preview").and_then(Value::as_str)
+                && !Path::new(relative).components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+                && let Ok(preview) = std::fs::canonicalize(root.join(relative))
+                && preview.starts_with(&root)
+                && preview.is_file()
+                && preview_extension(&preview)
+            {
+                return Ok(preview);
+            }
             let mut previews = std::fs::read_dir(&root)
                 .with_context(|| format!("read Wallpaper Engine item {}", root.display()))?
                 .filter_map(Result::ok)

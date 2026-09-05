@@ -35,12 +35,20 @@ pub(crate) struct WorkerStatus {
 
 pub(crate) struct ApplyTransaction {
     candidates: Vec<Worker>,
+    overlays: Vec<Worker>,
+    next: Option<ApplyStage>,
     ready: BTreeSet<u32>,
     touched: BTreeSet<String>,
     replace_all: bool,
     generation: u64,
     policy: Option<RendererPolicy>,
     reported_failure: Option<String>,
+}
+
+struct ApplyStage {
+    assignments: Vec<(Assignment, String)>,
+    backends: BackendPaths,
+    socket: PathBuf,
 }
 
 impl ApplyTransaction {
@@ -64,9 +72,29 @@ impl ApplyTransaction {
         self.ready.len() == self.candidates.len()
     }
 
+    pub(crate) fn prepare_next(&mut self) -> Result<bool> {
+        let Some(stage) = self.next.take() else { return Ok(false) };
+        self.overlays = std::mem::take(&mut self.candidates);
+        self.ready.clear();
+        for (assignment, output) in stage.assignments {
+            self.candidates.push(stage.backends.spawn(
+                assignment,
+                output,
+                &stage.socket,
+                self.generation,
+                self.policy.as_ref(),
+            )?);
+        }
+        Ok(true)
+    }
+
     pub(crate) fn note_failed(&mut self, failed: &RendererFailed) -> bool {
         if failed.generation != self.generation
-            || !self.candidates.iter().any(|worker| worker.pid() == failed.pid)
+            || !self
+                .candidates
+                .iter()
+                .chain(&self.overlays)
+                .any(|worker| worker.pid() == failed.pid)
         {
             return false;
         }
@@ -78,7 +106,7 @@ impl ApplyTransaction {
         if self.reported_failure.is_some() {
             return Ok(self.reported_failure.take());
         }
-        for worker in &mut self.candidates {
+        for worker in self.candidates.iter_mut().chain(&mut self.overlays) {
             if let Some(status) = worker.exited()? {
                 return Ok(Some(format!(
                     "Paper worker {} for {} exited before readiness: {status}",
@@ -91,13 +119,16 @@ impl ApplyTransaction {
     }
 
     pub(crate) async fn rollback(self) {
-        for worker in self.candidates {
+        for worker in self.candidates.into_iter().chain(self.overlays) {
             worker.stop().await;
         }
     }
 
     pub(crate) async fn candidate_exit(&mut self) {
-        any_worker_exit(&mut self.candidates).await;
+        tokio::select! {
+            () = any_worker_exit(&mut self.candidates) => {},
+            () = any_worker_exit(&mut self.overlays) => {},
+        }
     }
 
     #[cfg(test)]
@@ -112,6 +143,7 @@ impl ApplyTransaction {
 pub(crate) struct Manager {
     backends: Option<BackendPaths>,
     workers: Vec<Worker>,
+    overlays: Vec<Worker>,
     next_generation: u64,
     paused: bool,
     policy: Option<RendererPolicy>,
@@ -125,6 +157,7 @@ impl Manager {
         Self {
             backends: None,
             workers: Vec::new(),
+            overlays: Vec::new(),
             next_generation: 1,
             paused: false,
             policy: None,
@@ -139,6 +172,7 @@ impl Manager {
         Self {
             backends: Some(backends),
             workers: Vec::new(),
+            overlays: Vec::new(),
             next_generation: 1,
             paused: false,
             policy: None,
@@ -153,7 +187,7 @@ impl Manager {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.workers.is_empty()
+        self.workers.is_empty() && self.overlays.is_empty()
     }
 
     pub(crate) fn paused(&self) -> bool {
@@ -165,6 +199,13 @@ impl Manager {
     }
 
     pub(crate) fn refresh(&mut self) -> Result<()> {
+        let mut overlays = Vec::new();
+        for mut worker in self.overlays.drain(..) {
+            if worker.exited()?.is_none() {
+                overlays.push(worker);
+            }
+        }
+        self.overlays = overlays;
         #[cfg(test)]
         self.refresh_sweeps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut live = Vec::with_capacity(self.workers.len());
@@ -186,7 +227,10 @@ impl Manager {
     }
 
     pub(crate) async fn worker_exit(&mut self) {
-        any_worker_exit(&mut self.workers).await;
+        tokio::select! {
+            () = any_worker_exit(&mut self.workers) => {},
+            () = any_worker_exit(&mut self.overlays) => {},
+        }
     }
 
     pub(crate) async fn begin_apply(
@@ -231,9 +275,32 @@ impl Manager {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         let backends = self.backend_paths();
+        let overlays = expanded
+            .iter()
+            .filter(|(assignment, _)| {
+                assignment.source.kind == paper_control::SourceKind::Static
+                    && assignment
+                        .transition
+                        .as_ref()
+                        .and_then(|transition| transition.from.as_ref())
+                        .is_some_and(|from| from != &assignment.source.path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let next = (!overlays.is_empty()).then(|| ApplyStage {
+            assignments: expanded.clone(),
+            backends: backends.clone(),
+            socket: socket.to_path_buf(),
+        });
+        let staged = next.is_some();
         let mut candidates = Vec::with_capacity(expanded.len());
-        for (assignment, output) in expanded {
-            match backends.spawn(assignment, output, socket, generation, policy.as_ref()) {
+        for (assignment, output) in if staged { overlays } else { expanded } {
+            let spawned = if staged {
+                backends.spawn_overlay(assignment, output, socket, generation, policy.as_ref())
+            } else {
+                backends.spawn(assignment, output, socket, generation, policy.as_ref())
+            };
+            match spawned {
                 Ok(worker) => candidates.push(worker),
                 Err(error) => {
                     for worker in candidates {
@@ -245,6 +312,8 @@ impl Manager {
         }
         Ok(ApplyTransaction {
             candidates,
+            overlays: Vec::new(),
+            next,
             ready: BTreeSet::new(),
             touched,
             replace_all: request.replace_all,
@@ -258,14 +327,16 @@ impl Manager {
         &mut self,
         mut transaction: ApplyTransaction,
     ) -> Result<Vec<WorkerStatus>> {
+        if !transaction.all_ready() || transaction.next.is_some() {
+            transaction.rollback().await;
+            return Err(anyhow!("Paper composition has not completed presentation readiness"));
+        }
         if self.paused {
             for candidate in &mut transaction.candidates {
                 if candidate.dynamic()
                     && let Err(error) = candidate.send(&PaperCommand::pause(true)).await
                 {
-                    for worker in transaction.candidates {
-                        worker.stop().await;
-                    }
+                    transaction.rollback().await;
                     return Err(error.context("pause ready Paper candidate"));
                 }
             }
@@ -273,12 +344,30 @@ impl Manager {
         for candidate in &mut transaction.candidates {
             candidate.assignment.transition = None;
         }
-        if let Err(error) = self.retain_untouched(&transaction).await {
-            for worker in transaction.candidates {
-                worker.stop().await;
+        for overlay in &mut transaction.overlays {
+            if let Err(error) = overlay.send(&PaperCommand::pause(false)).await {
+                transaction.rollback().await;
+                return Err(error.context("release Paper static transition"));
             }
+        }
+        if let Err(error) = self.retain_untouched(&transaction).await {
+            transaction.rollback().await;
             return Err(error);
         }
+        let mut overlays = Vec::new();
+        for overlay in self.overlays.drain(..) {
+            if transaction.replace_all
+                || transaction.touched.contains("*")
+                || overlay.output == "*"
+                || transaction.touched.contains(&overlay.output)
+            {
+                overlay.stop().await;
+            } else {
+                overlays.push(overlay);
+            }
+        }
+        overlays.extend(transaction.overlays);
+        self.overlays = overlays;
         let mut retained = Vec::new();
         let mut retired = Vec::new();
         let touches_all = transaction.touched.contains("*");
@@ -382,6 +471,8 @@ impl Manager {
         let touched = worker_outputs(&candidates);
         Ok(Some(ApplyTransaction {
             candidates,
+            overlays: Vec::new(),
+            next: None,
             ready: BTreeSet::new(),
             touched,
             replace_all: false,
@@ -452,6 +543,8 @@ impl Manager {
         let touched = worker_outputs(&candidates);
         Ok(Some(ApplyTransaction {
             candidates,
+            overlays: Vec::new(),
+            next: None,
             ready: BTreeSet::new(),
             touched,
             replace_all: false,
@@ -593,6 +686,15 @@ impl Manager {
         for worker in stopped {
             worker.stop().await;
         }
+        let mut overlays = Vec::new();
+        for overlay in self.overlays.drain(..) {
+            if all || overlay.output == "*" || wanted.contains(overlay.output.as_str()) {
+                overlay.stop().await;
+            } else {
+                overlays.push(overlay);
+            }
+        }
+        self.overlays = overlays;
         Ok(count)
     }
 
@@ -768,7 +870,7 @@ async fn wait_snapshots(
 
 impl Drop for Manager {
     fn drop(&mut self) {
-        for worker in self.workers.drain(..) {
+        for worker in self.workers.drain(..).chain(self.overlays.drain(..)) {
             worker.stop_blocking();
         }
     }

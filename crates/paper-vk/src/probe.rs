@@ -121,6 +121,10 @@ fn probe_video(shared: &crate::shared::SharedDevice, path: &str) -> Vec<Attempt>
         });
     }
 
+    let (accepted, detail, samples) =
+        time_it(|| crate::decode::VulkanDecoder::open(path).map(|_| ()));
+    attempts.push(Attempt { backend: "vulkan-standalone", accepted, detail, samples });
+
     let (accepted, detail, samples) = time_it(|| {
         crate::decode::VaapiDecoder::open(path, shared.render_node.as_deref()).map(|_| ())
     });
@@ -179,6 +183,9 @@ fn json_line(path: &str, fingerprint: &str, attempts: &[Attempt]) -> String {
 }
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
+    if std::env::var_os("SKWD_FFMPEG_LOG").is_some() {
+        ff::util::log::set_level(ff::util::log::Level::Verbose);
+    }
     let workers = args
         .iter()
         .position(|arg| arg == "--concurrent")

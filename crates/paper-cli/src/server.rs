@@ -329,7 +329,10 @@ async fn wait_ready(listener: &UnixListener, transaction: &mut ApplyTransaction)
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(DEFAULT_READY_TIMEOUT, Duration::from_millis);
     let deadline = Instant::now() + timeout;
-    while !transaction.all_ready() {
+    loop {
+        if transaction.all_ready() && !transaction.prepare_next()? {
+            break;
+        }
         if let Some(message) = transaction.failed()? {
             return Err(anyhow!(message));
         }

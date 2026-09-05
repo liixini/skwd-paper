@@ -3,6 +3,7 @@ mod backend;
 mod cli;
 mod client;
 mod manager;
+mod outputs;
 mod server;
 mod we_source;
 

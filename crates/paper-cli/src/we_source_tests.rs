@@ -61,3 +61,19 @@ fn scene_preview_media() {
         scene.join("preview.png").canonicalize().unwrap()
     );
 }
+
+#[test]
+fn scene_transition_respects_safe_preview_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let scene = temp.path().join("scene");
+    fs::create_dir(&scene).unwrap();
+    fs::write(scene.join("scene.pkg"), []).unwrap();
+    fs::write(scene.join("thumbnail.png"), []).unwrap();
+    fs::write(scene.join("preview.png"), []).unwrap();
+    fs::write(scene.join("project.json"), r#"{"type":"scene","preview":"thumbnail.png"}"#).unwrap();
+    assert_eq!(transition_media(scene.to_str().unwrap()).unwrap(), scene.join("thumbnail.png"));
+    fs::write(temp.path().join("outside.png"), []).unwrap();
+    fs::write(scene.join("project.json"), r#"{"type":"scene","preview":"../outside.png"}"#)
+        .unwrap();
+    assert_eq!(transition_media(scene.to_str().unwrap()).unwrap(), scene.join("preview.png"));
+}

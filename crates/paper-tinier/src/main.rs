@@ -241,6 +241,7 @@ fn play_stream(
     )? {
         return Ok(());
     }
+    paper_runtime::plasma::frame_ready().map_err(|error| error.to_string())?;
     if let Err(error) = paper_control::signal_paper_ready() {
         eprintln!("skwd-paper-tinier: readiness signal failed: {error}");
     }

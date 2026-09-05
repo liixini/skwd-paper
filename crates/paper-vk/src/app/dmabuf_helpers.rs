@@ -1,7 +1,7 @@
 use super::shared_support::{FadeState, FrameSlot, SendFrame, decode_thread, env_speed, src_of};
 use crate::decode::open_decoder;
 use crate::fill::mode_uv;
-use crate::timing::{frame_target, pace_stalled};
+use crate::timing::{frame_target, loop_frame_target, pace_stalled};
 use crate::{ctl, decode, vk, wayland};
 use anyhow::{Context, Result};
 use std::time::Instant;
@@ -603,6 +603,24 @@ pub(super) fn promote_transition_target(
     true
 }
 
+pub(super) fn prepare_transition_pipelines(
+    renderers: &mut [vk::Renderer],
+    fade: &FadeState,
+    rgba: bool,
+) -> Result<()> {
+    for renderer in renderers {
+        if let Some(effect) = fade.effect {
+            renderer.effect_pipeline(effect)?;
+        } else {
+            renderer.ensure_transition_pipelines()?;
+        }
+        if rgba {
+            renderer.ensure_rgba_pipelines()?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn content_hash(frame: &ffmpeg_the_third::frame::Video) -> Option<u64> {
     if !super::shared_support::is_cpu_frame(frame) {
         return None;
@@ -756,7 +774,7 @@ pub(super) fn commit_at(
         return target.max(now as i64) as u64;
     };
     if pts < prev_pts {
-        *bf = s0.last_flip_ns.max(*bf) + refresh * 2;
+        *bf = loop_frame_target(prev_commit_ns, prev_step_ns, now, refresh);
         *bp = pts;
     }
     let mut tf = frame_target(*bf, *bp, pts, speed, refresh);

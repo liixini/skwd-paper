@@ -2,8 +2,8 @@ use crate::cli::{Command, EngineArg, FillModeArg, KindArg, LayerArg};
 use anyhow::{Context, Result, anyhow};
 use paper_control::{
     ApplyRequest, Assignment, AudioSetRequest, CapabilitiesRequest, FillMode, Layer, PauseRequest,
-    Request, RequestParams, Source, SourceKind, StatusRequest, StopRequest, TransitionPolicy,
-    VideoEngine, is_video_path,
+    RendererPolicy, Request, RequestParams, Source, SourceKind, StatusRequest, StopRequest,
+    TransitionPolicy, VideoEngine, is_video_path,
 };
 use std::io::Read;
 use std::path::Path;
@@ -14,15 +14,21 @@ pub(crate) fn run() -> Result<()> {
     match crate::cli::Cli::read().command {
         Command::Serve => crate::server::run(),
         Command::Apply(args) => send(RequestParams::Apply(apply_request(args)?)),
-        Command::Stop(args) => send(RequestParams::Stop(StopRequest { outputs: args.outputs })),
+        Command::Stop(args) => {
+            send(RequestParams::Stop(StopRequest { outputs: normalize_outputs(args.outputs) }))
+        }
         Command::Pause => send(RequestParams::Pause(PauseRequest { paused: true })),
         Command::Resume => send(RequestParams::Pause(PauseRequest { paused: false })),
         Command::Audio(args) => send(RequestParams::AudioSet(AudioSetRequest {
-            outputs: args.outputs,
+            outputs: normalize_outputs(args.outputs),
             mute: args.mute,
             volume: args.volume,
         })),
         Command::Status => send(RequestParams::Status(StatusRequest {})),
+        Command::Outputs => {
+            println!("{}", serde_json::to_string_pretty(&crate::outputs::query()?)?);
+            Ok(())
+        }
         Command::Capabilities(args) => send(RequestParams::Capabilities(CapabilitiesRequest {
             reset_decode_cache: args.reset_decode_cache,
         })),
@@ -56,6 +62,7 @@ fn apply_request(args: crate::cli::ApplyArgs) -> Result<ApplyRequest> {
         if args.replace_all {
             request.replace_all = true;
         }
+        resolve_paths(&mut request)?;
         request.validate().map_err(|error| anyhow!(error.to_string()))?;
         return Ok(request);
     }
@@ -66,7 +73,8 @@ fn apply_request(args: crate::cli::ApplyArgs) -> Result<ApplyRequest> {
     let engine = args.engine.map(video_engine);
     let properties = args.properties.as_deref().map(parse_properties).transpose()?;
     let source = Source { kind, path, engine, frame_rate: args.frame_rate, properties };
-    let mut assignment = Assignment::new(vec![output], source);
+    let outputs = normalize_outputs(output.split(',').map(str::to_string).collect());
+    let mut assignment = Assignment::new(outputs, source);
     if let Some(fill_mode) = args.fill_mode {
         assignment.fill_mode = protocol_fill(fill_mode);
     }
@@ -90,10 +98,34 @@ fn apply_request(args: crate::cli::ApplyArgs) -> Result<ApplyRequest> {
             duration_ms: args.duration_ms,
         });
     }
-    let request =
-        ApplyRequest { assignments: vec![assignment], replace_all: args.replace_all, policy: None };
+    let policy = args
+        .idle_seconds
+        .map(|seconds| RendererPolicy { idle_seconds: Some(seconds), ..Default::default() });
+    let mut request =
+        ApplyRequest { assignments: vec![assignment], replace_all: args.replace_all, policy };
+    resolve_paths(&mut request)?;
     request.validate().map_err(|error| anyhow!(error.to_string()))?;
     Ok(request)
+}
+
+fn normalize_outputs(outputs: Vec<String>) -> Vec<String> {
+    outputs.into_iter().map(|output| if output == "ALL" { "*".into() } else { output }).collect()
+}
+
+fn resolve_paths(request: &mut ApplyRequest) -> Result<()> {
+    for assignment in &mut request.assignments {
+        let paths = std::iter::once(&mut assignment.source.path)
+            .chain(assignment.transition.as_mut().and_then(|transition| transition.from.as_mut()));
+        for path in paths {
+            if !path.trim().is_empty() && !path.starts_with('-') {
+                *path = std::path::absolute(&*path)?
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| anyhow!("media path is not valid UTF-8"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_properties(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>> {

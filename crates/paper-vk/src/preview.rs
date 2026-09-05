@@ -258,6 +258,7 @@ pub(crate) fn video_stream(
         output.write_all(&height.to_le_bytes())?;
     }
     output.flush()?;
+    let mut first_frame = true;
     let mut first_pts = None;
     let mut last_pts = None;
     let mut next_emit = 0.0;
@@ -305,6 +306,10 @@ pub(crate) fn video_stream(
         }
         if output.write_all(&rgba).is_err() || output.flush().is_err() {
             return Ok(());
+        }
+        if first_frame {
+            paper_runtime::plasma::frame_ready()?;
+            first_frame = false;
         }
         if unsafe { libc::getppid() } <= 1 {
             return Ok(());
@@ -499,7 +504,8 @@ pub(crate) fn dmabuf_video_stream(
                           deadline: Instant,
                           emitted: &mut bool|
      -> Result<bool> {
-        let suspended = wait_stream_control(&mut ctl)?;
+        let suspended =
+            if *emitted { wait_stream_control(&mut ctl)? } else { std::time::Duration::ZERO };
         timeline_shift += suspended;
         if let Some((_, _, Some(started), _)) = &mut transition {
             *started += suspended;
@@ -600,6 +606,9 @@ pub(crate) fn dmabuf_video_stream(
         send_packet(socket, &packet(2, slot as u8, 0, 0, 0, 0, 0), None)
             .context("send dmabuf frame")?;
         free[slot] = false;
+        if !*emitted {
+            paper_runtime::plasma::frame_ready()?;
+        }
         *emitted = true;
         if finish_transition {
             if let Some((_, _, Some(started), frames)) = &transition {

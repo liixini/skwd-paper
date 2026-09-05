@@ -274,7 +274,7 @@ fn rejects_unsafe_controls() {
     assert_eq!(
         ApplyRequest { assignments: vec![static_assignment], replace_all: false, policy: None }
             .validate(),
-        Err(ValidationError::TransitionNotAllowed(SourceKind::Static))
+        Ok(())
     );
 
     for transition in [
@@ -446,7 +446,7 @@ fn response_goldens() {
             r#""layers":["background","bottom","top"],"#,
             r#""controls":{"pause":true,"audio":true},"#,
             r#""transitions":{"startup_source_kinds":["video","we"],"#,
-            r#""static_overlay":false,"default_effect":"fade","default_duration_ms":600,"#,
+            r#""static_overlay":true,"default_effect":"fade","default_duration_ms":600,"#,
             r#""min_duration_ms":50,"max_duration_ms":10000},"#,
             r#""renderer_policy":{"idle":true,"sand":true,"scene":true,"output_fps":true},"#,
             r#""wallpaper_engine":{"project_types":["scene","video"],"#,

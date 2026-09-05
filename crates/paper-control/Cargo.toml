@@ -12,6 +12,10 @@ paper-geom = { path = "../paper-geom" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = "0.2"
+gif = "0.14"
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

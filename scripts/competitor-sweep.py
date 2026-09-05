@@ -19,16 +19,20 @@ ROOT = Path(__file__).resolve().parent.parent
 PERF_PATH = ROOT / "scripts" / "perf-sweep.py"
 VK = ROOT / "target" / "release" / "skwd-wall-vk"
 STILL = ROOT / "target" / "release" / "skwd-wall-still"
-MATRIX_VERSION = 10
+MATRIX_VERSION = 14
 PHONTO = "phonto"
 WPAPERD = "wpaperd"
 HYPRPAPER = "hyprpaper"
-LIVE_PAPER = "live-paper"
 KACAU = "kacau-wall"
-TINIER = ROOT / "target" / "release" / "skwd-paper-tinier"
-TINIER_CACHE = Path.home() / ".cache/skwd-paper-v2/engine-sweep"
+WALLR = "wallr"
 KACAU_REVISION = "f84e70c48238efd9e9cd3b23dfe8f565b873f1e9"
+WALLR_VERSION = "0.3.4"
+WALLR_REVISION = "5c28d775a79ca7d4bf7e4768b53a4e59e1a29a7c"
 VALIDATE_MOTION = False
+MIN_VIDEO_MEAN_SIGNAL = 0.08
+MIN_VIDEO_SIGNAL_DEVIATION = 0.03
+VIDEO_VALIDATION_SAMPLES = 4
+VIDEO_VALIDATION_INTERVAL = 0.75
 YIN = "yin"
 YINCTL = "yinctl"
 YIN_HOME = None
@@ -49,7 +53,17 @@ P = load_perf_module()
 
 
 class Scenario:
-    def __init__(self, name, engine, workload, topology, source, fps=None, tuned=False):
+    def __init__(
+        self,
+        name,
+        engine,
+        workload,
+        topology,
+        source,
+        fps=None,
+        tuned=False,
+        extra=None,
+    ):
         self.name = name
         self.engine = engine
         self.workload = workload
@@ -57,6 +71,7 @@ class Scenario:
         self.source = str(source)
         self.fps = fps
         self.tuned = tuned
+        self.extra = extra or {}
 
     def metadata(self, single_output):
         source = (
@@ -73,6 +88,7 @@ class Scenario:
             "source": source,
             "fps_cap": self.fps,
             "tuned": self.tuned,
+            **self.extra,
         }
         if self.engine == "kacau-wall":
             metadata["revision"] = KACAU_REVISION
@@ -82,25 +98,16 @@ class Scenario:
                 if self.workload == "video"
                 else "cached image"
             )
-        if self.engine == "live-paper":
-            metadata["output_targeting"] = "compositor default after niri focus-monitor"
+        if self.engine == "wallr":
+            metadata["version"] = WALLR_VERSION
+            metadata["revision"] = WALLR_REVISION
+            if self.workload == "video":
+                metadata["video_path"] = "FFmpeg hardware decode auto"
         return metadata
 
 
-def tinier_fixtures():
-    entries = {
-        "floor": (TINIER_CACHE / "matrix-floor-1366x768-tokyo-qp20.ivf", 30),
-        "mid": (TINIER_CACHE / "matrix-mid-2560x1440-5mGuCdlCcNM-qp20.ivf", 60),
-        "max": (TINIER_CACHE / "matrix-max-3840x2160-tokyo-qp20.ivf", 30),
-    }
-    return {k: (str(v), fps) for k, (v, fps) in entries.items() if v.exists()}
-
-
-def build_matrix(
-    floor_video, mid_video, max_video, still, scene, yin_floor_video=None, tinier=None
-):
+def build_matrix(floor_video, mid_video, max_video, still, scene, yin_floor_video=None):
     yin_floor_video = yin_floor_video or floor_video
-    tinier = tinier or {}
     matrix = []
     for topology in ("single", "all"):
         matrix.extend(
@@ -122,6 +129,13 @@ def build_matrix(
                 Scenario(
                     f"static {topology} hyprpaper",
                     "hyprpaper",
+                    "static",
+                    topology,
+                    still,
+                ),
+                Scenario(
+                    f"static {topology} wallr",
+                    "wallr",
                     "static",
                     topology,
                     still,
@@ -190,6 +204,15 @@ def build_matrix(
                         source,
                     ),
                     Scenario(
+                        f"video {label} {topology} wallr auto",
+                        "wallr",
+                        "video",
+                        topology,
+                        source,
+                        fps={"floor": 30, "mid": 60, "max": 30}[label],
+                        tuned=True,
+                    ),
+                    Scenario(
                         f"video {label} {topology} kacau cached 30fps",
                         "kacau-wall",
                         "video",
@@ -207,28 +230,6 @@ def build_matrix(
                     ),
                 ]
             )
-            if topology == "single":
-                matrix.append(
-                    Scenario(
-                        f"video {label} single live-paper default",
-                        "live-paper",
-                        "video",
-                        topology,
-                        source,
-                        tuned=True,
-                    )
-                )
-            if label in tinier:
-                matrix.append(
-                    Scenario(
-                        f"video {label} {topology} skwd-tinier",
-                        "skwd-paper-tinier",
-                        "video",
-                        topology,
-                        tinier[label][0],
-                        fps=tinier[label][1],
-                    )
-                )
             if label == "max":
                 matrix.append(
                     Scenario(
@@ -265,16 +266,73 @@ def build_matrix(
     return matrix
 
 
+def build_resolution_matrix(label, video, fps=30):
+    extra = {"comparison": "matched-resolution", "resolution_label": label}
+    return [
+        Scenario(
+            f"video {label} Skwd-paper-vk",
+            "skwd-wall-vk",
+            "video",
+            "single",
+            video,
+            fps=fps,
+            extra=extra,
+        ),
+        Scenario(
+            f"video {label} mpvpaper",
+            "mpvpaper",
+            "video",
+            "single",
+            video,
+            fps=fps,
+            tuned=True,
+            extra=extra,
+        ),
+        Scenario(
+            f"video {label} Phonto",
+            "phonto",
+            "video",
+            "single",
+            video,
+            fps=fps,
+            extra=extra,
+        ),
+        Scenario(
+            f"video {label} Wallr auto",
+            "wallr",
+            "video",
+            "single",
+            video,
+            fps=fps,
+            tuned=True,
+            extra=extra,
+        ),
+        Scenario(
+            f"video {label} Kacau cached {fps}fps",
+            "kacau-wall",
+            "video",
+            "single",
+            video,
+            fps=fps,
+            extra=extra,
+        ),
+        Scenario(
+            f"video {label} Yin cuda-copy",
+            "yin",
+            "video",
+            "single",
+            video,
+            fps=fps,
+            tuned=True,
+            extra=extra,
+        ),
+    ]
+
+
 def scenario_command(scenario, single_output, outputs):
     output = single_output if scenario.topology == "single" else "*"
     if scenario.engine == "skwd-wall-still":
         return [str(STILL), output, scenario.source, "--persist"]
-    if scenario.engine == "skwd-paper-tinier":
-        command = [str(TINIER)]
-        if scenario.topology == "single":
-            command.extend(["--output", single_output])
-        command.extend([scenario.source, str(scenario.fps)])
-        return command
     if scenario.engine == "skwd-wall-vk":
         command = [str(VK), output, scenario.source, "--mute"]
         if scenario.workload == "we":
@@ -285,8 +343,6 @@ def scenario_command(scenario, single_output, outputs):
         if scenario.tuned:
             options.append("hwdec=auto")
         return ["mpvpaper", "-o", " ".join(options), output, scenario.source]
-    if scenario.engine == "live-paper":
-        return [LIVE_PAPER, scenario.source]
     if scenario.engine == "phonto":
         selected = [single_output] if scenario.topology == "single" else outputs
         command = [PHONTO, "--layer", "background", "--scale", "fill"]
@@ -299,6 +355,8 @@ def scenario_command(scenario, single_output, outputs):
         return [WPAPERD]
     if scenario.engine == "hyprpaper":
         return [HYPRPAPER]
+    if scenario.engine == "wallr":
+        return [WALLR]
     if scenario.engine == "kacau-wall":
         return [KACAU]
     if scenario.engine == "yin":
@@ -484,15 +542,52 @@ def wait_for_stable_file(path, timeout=10.0):
             stable = 0
         previous = size
         time.sleep(0.1)
-    raise RuntimeError(f"Kacau did not write validation frame {path.name}")
+    raise RuntimeError(f"engine did not write validation frame {path.name}")
 
 
-def validate_kacau_motion(outputs, workdir):
-    output_hashes = {}
+def frame_content_signature(path):
+    crop = ["-gravity", "center", "-crop", "75%x75%+0+0", "+repage"]
+    measured = subprocess.run(
+        [
+            "magick",
+            str(path),
+            *crop,
+            "-format",
+            "%[fx:mean] %[fx:standard_deviation]",
+            "info:",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=20,
+    )
+    if measured.returncode != 0:
+        raise RuntimeError(measured.stderr.strip() or "frame signal check failed")
+    try:
+        mean, deviation = (float(value) for value in measured.stdout.split())
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"invalid frame signal result: {measured.stdout!r}") from error
+    pixels = subprocess.run(
+        ["magick", str(path), *crop, "-depth", "8", "rgb:-"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+    )
+    if pixels.returncode != 0:
+        raise RuntimeError(
+            pixels.stderr.decode(errors="replace").strip() or "frame crop failed"
+        )
+    return hashlib.sha256(pixels.stdout).hexdigest(), mean, deviation
+
+
+def validate_video_motion(outputs, workdir):
+    output_checks = {}
     for output in outputs:
         hashes = []
+        means = []
+        deviations = []
         safe_output = output.replace("/", "_")
-        for index in range(2):
+        for index in range(VIDEO_VALIDATION_SAMPLES):
             frame = workdir / f"motion-{safe_output}-{index}.ppm"
             captured = subprocess.run(
                 ["grim", "-o", output, "-t", "ppm", str(frame)],
@@ -502,16 +597,66 @@ def validate_kacau_motion(outputs, workdir):
                 timeout=20,
             )
             if captured.returncode != 0:
-                raise RuntimeError(captured.stderr.strip() or "Kacau screenshot failed")
+                raise RuntimeError(captured.stderr.strip() or "video screenshot failed")
             wait_for_stable_file(frame)
-            hashes.append(hashlib.sha256(frame.read_bytes()).hexdigest())
-            time.sleep(0.5)
-        if hashes[0] == hashes[1]:
+            digest, mean, deviation = frame_content_signature(frame)
+            hashes.append(digest)
+            means.append(mean)
+            deviations.append(deviation)
+            if index + 1 < VIDEO_VALIDATION_SAMPLES:
+                time.sleep(VIDEO_VALIDATION_INTERVAL)
+        unique_frames = len(set(hashes))
+        if (
+            max(means) < MIN_VIDEO_MEAN_SIGNAL
+            or max(deviations) < MIN_VIDEO_SIGNAL_DEVIATION
+        ):
             raise RuntimeError(
-                f"Kacau video validation captured two identical frames on {output}"
+                f"video validation captured blank or near-black content on {output} "
+                f"(mean={max(means):.4f}, deviation={max(deviations):.4f})"
             )
-        output_hashes[output] = [value[:16] for value in hashes]
-    return output_hashes
+        if unique_frames < 2:
+            raise RuntimeError(
+                f"video validation captured no motion on {output} "
+                f"({unique_frames}/{len(hashes)} unique central crops, "
+                f"mean={max(means):.4f}, deviation={max(deviations):.4f})"
+            )
+        output_checks[output] = {
+            "hashes": [value[:16] for value in hashes],
+            "unique_frames": unique_frames,
+            "mean_signal": [round(value, 6) for value in means],
+            "signal_deviation": [round(value, 6) for value in deviations],
+        }
+    return output_checks
+
+
+def require_empty_active_workspace(output):
+    queried = subprocess.run(
+        ["niri", "msg", "-j", "workspaces"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+    )
+    if queried.returncode != 0:
+        raise RuntimeError(queried.stderr.strip() or "could not inspect Niri workspaces")
+    try:
+        workspaces = json.loads(queried.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Niri returned invalid workspace data") from error
+    active = next(
+        (
+            workspace
+            for workspace in workspaces
+            if workspace.get("output") == output and workspace.get("is_active")
+        ),
+        None,
+    )
+    if active is None:
+        raise RuntimeError(f"{output} has no active Niri workspace")
+    if active.get("active_window_id") is not None:
+        raise RuntimeError(
+            f"video validation requires an empty active workspace on {output}"
+        )
 
 
 def fatal_engine_log(error_log):
@@ -569,37 +714,54 @@ def write_hyprpaper_config(scenario, single_output, outputs, workdir):
     return config
 
 
-def write_live_paper_config(workdir):
-    config = workdir / "live-paper.toml"
+def write_wallr_config(workdir):
+    config = workdir / "wallr.yaml"
+    socket = workdir / "wallr.sock"
+    cache = workdir / "cache" / "wallr"
     config.write_text(
-        'backend = "mpv"\n'
-        "\n[player]\n"
-        "mute = true\n"
-        'hwdec = "auto"\n'
-        "fill = true\n"
-        "\n[player.mpv_options]\n"
-        'ao = "null"\n'
-        "\n[layer]\n"
-        'layer = "background"\n'
-        "exclusive_zone = -1\n"
-        "\n[pause]\n"
-        "on_fullscreen = false\n"
-        "on_maximized = false\n"
-        "on_gamemode = false\n"
-        "on_screen_off = false\n"
+        "wallpaper:\n"
+        "  mode: fill\n"
+        "  loop_video: true\n"
+        "  mute: true\n"
+        "animation:\n"
+        "  duration: 1ms\n"
+        "theme:\n"
+        "  provider: none\n"
+        "matugen:\n"
+        "  enabled: false\n"
+        "video:\n"
+        "  hw_decode: auto\n"
+        "  preferred_gpu: auto\n"
+        "  preload_frames: 2\n"
+        "daemon:\n"
+        "  auto_start: false\n"
+        f"  socket: {json.dumps(str(socket))}\n"
+        "  max_fps: 60\n"
+        "cache:\n"
+        f"  dir: {json.dumps(str(cache))}\n"
+        "  max_size: 512MB\n"
     )
     return config
 
 
-def focus_niri_output(output):
-    result = subprocess.run(
-        ["niri", "msg", "action", "focus-monitor", output],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"could not focus {output}")
+def wallr_apply_command(scenario, single_output, config):
+    command = [
+        WALLR,
+        "--config",
+        str(config),
+        "set",
+        scenario.source,
+        "--no-theme",
+        "--mode",
+        "fill",
+        "--effect",
+        "simple",
+        "--duration",
+        "1ms",
+    ]
+    if scenario.topology == "single":
+        command.extend(["--monitor", single_output])
+    return command
 
 
 def launch_scenario(scenario, single_output, outputs, workdir):
@@ -616,12 +778,15 @@ def launch_scenario(scenario, single_output, outputs, workdir):
         env["HOME"] = str(home)
         env["XDG_CONFIG_HOME"] = str(workdir / "config")
         remove_stale_kacau_socket(kacau_socket(env))
+    elif scenario.engine == "wallr":
+        home = workdir / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(home)
+        env["XDG_CONFIG_HOME"] = str(workdir / "config")
     elif scenario.engine == "wpaperd":
         env["XDG_STATE_HOME"] = str(workdir / "state")
     if scenario.workload == "we" and scenario.engine == "skwd-wall-vk":
         env["SKWD_PAPER_WE_FPS"] = str(scenario.fps)
-    if scenario.engine == "live-paper":
-        focus_niri_output(single_output)
     error_log = open(workdir / "stderr.log", "w+b")
     command = scenario_command(scenario, single_output, outputs)
     if scenario.engine == "wpaperd":
@@ -633,8 +798,16 @@ def launch_scenario(scenario, single_output, outputs, workdir):
                 str(write_hyprpaper_config(scenario, single_output, outputs, workdir)),
             ]
         )
-    elif scenario.engine == "live-paper":
-        command.extend(["--config-path", str(write_live_paper_config(workdir))])
+    elif scenario.engine == "wallr":
+        wallr_config = write_wallr_config(workdir)
+        command = [
+            WALLR,
+            "--config",
+            str(wallr_config),
+            "daemon",
+            "--max-fps",
+            str(scenario.fps or 60),
+        ]
     proc = subprocess.Popen(
         command,
         env=env,
@@ -678,8 +851,12 @@ def launch_scenario(scenario, single_output, outputs, workdir):
             time.sleep(0.05)
         if proc.poll() is not None or not socket.exists():
             stop_process(proc)
+            detail = error_tail(error_log)
             error_log.close()
-            raise RuntimeError("Yin daemon did not create /tmp/yin")
+            raise RuntimeError(
+                "Yin daemon did not create /tmp/yin"
+                + (f": {detail}" if detail else "")
+            )
         selected = [single_output] if scenario.topology == "single" else outputs
         prepare_start = time.monotonic()
         for name in selected:
@@ -713,8 +890,12 @@ def launch_scenario(scenario, single_output, outputs, workdir):
             time.sleep(0.05)
         if proc.poll() is not None or not socket.exists():
             stop_process(proc)
+            detail = error_tail(error_log)
             error_log.close()
-            raise RuntimeError("Kacau daemon did not create its IPC socket")
+            raise RuntimeError(
+                "Kacau daemon did not create its IPC socket"
+                + (f": {detail}" if detail else "")
+            )
 
         command = kacau_apply_command(scenario, single_output)
         prepare_start = time.monotonic()
@@ -749,23 +930,46 @@ def launch_scenario(scenario, single_output, outputs, workdir):
             stop_process(proc)
             error_log.close()
             raise RuntimeError(f"engine log contains: {fatal_log}")
-        if scenario.workload == "video" and VALIDATE_MOTION:
-            try:
-                # Use the configured single-output monitor as the stable probe for
-                # both topologies. The caller must leave its wallpaper unobstructed.
-                extra["motion_validation_output"] = single_output
-                extra["motion_frame_hashes"] = validate_kacau_motion(
-                    [single_output], workdir
-                )
-            except RuntimeError as error:
-                fatal_log = fatal_engine_log(error_log)
-                stop_process(proc)
-                error_log.close()
-                if fatal_log:
-                    raise RuntimeError(
-                        f"{error}; engine log contains: {fatal_log}"
-                    ) from error
-                raise
+    elif scenario.engine == "wallr":
+        socket = workdir / "wallr.sock"
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and not socket.exists():
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        if proc.poll() is not None or not socket.exists():
+            stop_process(proc)
+            detail = error_tail(error_log)
+            error_log.close()
+            raise RuntimeError(
+                "Wallr daemon did not create its IPC socket"
+                + (f": {detail}" if detail else "")
+            )
+        selected = [single_output] if scenario.topology == "single" else outputs
+        applied = subprocess.run(
+            wallr_apply_command(scenario, single_output, wallr_config),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+        )
+        if applied.returncode != 0:
+            stop_process(proc)
+            error_log.close()
+            raise RuntimeError(applied.stderr.strip() or "wallr set failed")
+        info = subprocess.run(
+            [WALLR, "--config", str(wallr_config), "ipc", "info"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+        )
+        extra = {
+            "active_wallpaper_outputs": sorted(selected),
+            "decoder_info": info.stdout.strip() if info.returncode == 0 else None,
+        }
     return proc, error_log, extra
 
 
@@ -779,9 +983,9 @@ def rendered_outputs(engine):
     namespace = {
         "skwd-wall-vk": "skwd-wall-vk",
         "mpvpaper": "mpvpaper",
-        "live-paper": "live-paper",
         "phonto": "phonto",
         "hyprpaper": "hyprpaper",
+        "wallr": "wallr",
         "yin": "yin-wallpaper",
     }.get(engine)
     namespace_prefix = {
@@ -845,7 +1049,7 @@ def run_scenario(scenario, floor, profile, single_output, outputs, compositor_pi
             visible_outputs = rendered_outputs(scenario.engine)
             expected_outputs = (
                 sorted(outputs)
-                if scenario.engine in ("yin", "kacau-wall")
+                if scenario.engine in ("yin", "kacau-wall", "wallr")
                 else [single_output]
                 if scenario.topology == "single"
                 else sorted(outputs)
@@ -858,6 +1062,19 @@ def run_scenario(scenario, floor, profile, single_output, outputs, compositor_pi
                         f"{sorted(expected_outputs)}"
                     ),
                 }
+            if scenario.workload == "video" and VALIDATE_MOTION:
+                metadata["motion_validation_output"] = single_output
+                try:
+                    require_empty_active_workspace(single_output)
+                    metadata["motion_frame_hashes"] = validate_video_motion(
+                        [single_output], workdir
+                    )
+                except (RuntimeError, subprocess.TimeoutExpired) as error:
+                    fatal_log = fatal_engine_log(error_log)
+                    detail = f"{error}"
+                    if fatal_log:
+                        detail += f"; engine log contains: {fatal_log}"
+                    return {**metadata, "error": detail}
             start_pids = process_tree(proc.pid)
             cpu_start = cpu_total(start_pids)
             compositor_cpu_start = P.proc_cpu(compositor_pid)
@@ -932,22 +1149,22 @@ def ensure_available(matrix):
         required.update(("awww", "awww-daemon"))
     if "mpvpaper" in engines:
         required.add("mpvpaper")
-    if "live-paper" in engines:
-        required.add(LIVE_PAPER)
-    if "skwd-paper-tinier" in engines and not Path(TINIER).is_file():
-        sys.exit(f"missing skwd-paper-tinier build at {TINIER}")
     if "wpaperd" in engines:
         required.add(WPAPERD)
     if "hyprpaper" in engines:
         required.add(HYPRPAPER)
+    if "wallr" in engines:
+        required.add(WALLR)
     if "linux-wallpaperengine" in engines:
         required.add("linux-wallpaperengine")
     if "phonto" in engines:
         required.add(PHONTO)
     if "kacau-wall" in engines:
         required.add(KACAU)
-        if VALIDATE_MOTION:
-            required.add("grim")
+    if VALIDATE_MOTION and any(
+        scenario.workload == "video" for scenario in matrix
+    ):
+        required.update(("grim", "magick"))
     if "yin" in engines:
         required.update((YIN, YINCTL))
     missing = [command for command in sorted(required) if not executable_available(command)]
@@ -964,9 +1181,9 @@ def ensure_quiet():
         "awww-daemon",
         "wpaperd",
         "hyprpaper",
+        "wallr",
         "phonto",
         "mpvpaper",
-        "live-paper",
         "linux-wallpaper",
         "yin",
         "kacau-wall",
@@ -986,7 +1203,7 @@ def matrix_id(matrix, single_output):
 
 
 def main():
-    global PHONTO, WPAPERD, HYPRPAPER, LIVE_PAPER, KACAU, VALIDATE_MOTION
+    global PHONTO, WPAPERD, HYPRPAPER, KACAU, WALLR, VALIDATE_MOTION
     global YIN, YINCTL, YIN_HOME
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true")
@@ -996,6 +1213,15 @@ def main():
     parser.add_argument("--floor-video")
     parser.add_argument("--scene")
     parser.add_argument(
+        "--resolution-label",
+        choices=("1080p", "4K"),
+        help="run only the matched-resolution video matrix",
+    )
+    parser.add_argument(
+        "--resolution-video",
+        help="30 fps video fixture at the selected resolution",
+    )
+    parser.add_argument(
         "--phonto",
         default=PHONTO,
         help="Phonto executable (default: resolve phonto from PATH)",
@@ -1004,14 +1230,12 @@ def main():
     parser.add_argument(
         "--hyprpaper", default=HYPRPAPER, help="hyprpaper executable"
     )
-    parser.add_argument(
-        "--live-paper", default=LIVE_PAPER, help="live-paper executable"
-    )
     parser.add_argument("--kacau", default=KACAU, help="Kacau Wall executable")
+    parser.add_argument("--wallr", default=WALLR, help="Wallr executable")
     parser.add_argument(
         "--validate-motion",
         action="store_true",
-        help="Capture the Kacau probe output twice and require changing video frames",
+        help="Capture each video output over a short window and require visible motion",
     )
     parser.add_argument("--yin", default=YIN, help="Yin daemon executable")
     parser.add_argument("--yinctl", default=YINCTL, help="Yin client executable")
@@ -1036,8 +1260,8 @@ def main():
     PHONTO = args.phonto
     WPAPERD = args.wpaperd
     HYPRPAPER = args.hyprpaper
-    LIVE_PAPER = args.live_paper
     KACAU = args.kacau
+    WALLR = args.wallr
     VALIDATE_MOTION = args.validate_motion
     YIN = args.yin
     YINCTL = args.yinctl
@@ -1050,28 +1274,60 @@ def main():
     single_output = args.single_output or ranked[0]["name"]
     if single_output not in output_names:
         sys.exit(f"unknown single output {single_output}; available: {', '.join(output_names)}")
-    videos = sorted(P.VIDEO_DIR.glob("*.mp4"))
-    stills = sorted(list(P.STILL_DIR.glob("*.webp")) + list(P.STILL_DIR.glob("*.png")))
-    if len(videos) < 2 or len(stills) < 2:
-        sys.exit("need >=2 videos and >=2 stills")
-    mid_video, max_video, _ = P.choose_sources(videos)
-    floor_videos = P.ensure_floor_videos(max_video, P.FLOOR_SIZE, args.floor_video)
-    still, _ = P.choose_stills(stills)
-    scene = args.scene or str(
-        Path.home()
-        / ".local/share/Steam/steamapps/workshop/content/431960/2165290843"
-    )
-    if not (Path(scene) / "scene.pkg").is_file():
-        sys.exit(f"Wallpaper Engine scene is unavailable: {scene}")
-    matrix = build_matrix(
-        floor_videos["vp9"],
-        mid_video,
-        max_video,
-        still,
-        scene,
-        yin_floor_video=floor_videos["h264"],
-        tinier=tinier_fixtures(),
-    )
+    if args.resolution_label:
+        if not args.resolution_video:
+            sys.exit("--resolution-label requires --resolution-video")
+        expected_size = {
+            "1080p": (1920, 1080),
+            "4K": (3840, 2160),
+        }[args.resolution_label]
+        selected_output = next(
+            output for output in outputs_info if output["name"] == single_output
+        )
+        output_size = (selected_output["width"], selected_output["height"])
+        if output_size != expected_size:
+            sys.exit(
+                f"{args.resolution_label} matrix requires a {expected_size[0]}x"
+                f"{expected_size[1]} output; {single_output} is "
+                f"{output_size[0]}x{output_size[1]}"
+            )
+        source = str(Path(args.resolution_video).resolve())
+        info = P.media_info(source)
+        if (info["width"], info["height"]) != expected_size:
+            sys.exit(
+                f"--resolution-video must be {expected_size[0]}x{expected_size[1]}, "
+                f"got {info['width']}x{info['height']}"
+            )
+        if abs(P.frame_rate(info) - 30.0) > 0.01:
+            sys.exit(
+                f"--resolution-video must be 30 fps, got "
+                f"{P.frame_rate(info):.2f} fps"
+            )
+        matrix = build_resolution_matrix(args.resolution_label, source)
+    else:
+        videos = sorted(P.VIDEO_DIR.glob("*.mp4"))
+        stills = sorted(
+            list(P.STILL_DIR.glob("*.webp")) + list(P.STILL_DIR.glob("*.png"))
+        )
+        if len(videos) < 2 or len(stills) < 2:
+            sys.exit("need >=2 videos and >=2 stills")
+        mid_video, max_video, _ = P.choose_sources(videos)
+        floor_videos = P.ensure_floor_videos(max_video, P.FLOOR_SIZE, args.floor_video)
+        still, _ = P.choose_stills(stills)
+        scene = args.scene or str(
+            Path.home()
+            / ".local/share/Steam/steamapps/workshop/content/431960/2165290843"
+        )
+        if not (Path(scene) / "scene.pkg").is_file():
+            sys.exit(f"Wallpaper Engine scene is unavailable: {scene}")
+        matrix = build_matrix(
+            floor_videos["vp9"],
+            mid_video,
+            max_video,
+            still,
+            scene,
+            yin_floor_video=floor_videos["h264"],
+        )
     if args.only:
         terms = [term.casefold() for term in args.only]
         matrix = [
@@ -1103,6 +1359,20 @@ def main():
         "scenario_count": len(matrix),
         "profile": profile_name,
         "single_output": single_output,
+        "resolution_label": args.resolution_label,
+        "baseline": {
+            "preexisting_wallpaper_engines": "none (enforced before sampling)",
+            "scenario_cleanup": "each engine is stopped before the next launch",
+        },
+        "visual_validation": {
+            "enabled": VALIDATE_MOTION,
+            "samples": VIDEO_VALIDATION_SAMPLES if VALIDATE_MOTION else 0,
+            "interval_seconds": VIDEO_VALIDATION_INTERVAL if VALIDATE_MOTION else None,
+            "crop": "center 75%",
+            "minimum_mean_signal": MIN_VIDEO_MEAN_SIGNAL,
+            "minimum_signal_deviation": MIN_VIDEO_SIGNAL_DEVIATION,
+            "requires_empty_active_workspace": VALIDATE_MOTION,
+        },
         "active_outputs": outputs_info,
         "compositor": {"name": P.COMPOSITOR_NAME},
         "scenarios": [scenario.metadata(single_output) for scenario in matrix],

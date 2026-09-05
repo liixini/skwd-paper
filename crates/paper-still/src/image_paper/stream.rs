@@ -23,6 +23,7 @@ pub fn stream(
     }
     output.write_all(&frame)?;
     output.flush()?;
+    paper_runtime::plasma::frame_ready()?;
     let mut input = std::io::BufReader::new(std::io::stdin().lock());
     let mut line = String::new();
     while input.read_line(&mut line)? != 0 {

@@ -3,6 +3,7 @@
 3	crates/paper-cli/src/manager.rs
 3	crates/paper-cli/src/server.rs
 2	crates/paper-control/src/stdin_reader.rs
+2	crates/paper-runtime/src/plasma.rs
 2	crates/paper-runtime/src/process.rs
 5	crates/paper-runtime/src/seccomp.rs
 4	crates/paper-runtime/src/wake.rs

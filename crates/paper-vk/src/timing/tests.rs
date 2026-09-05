@@ -3,6 +3,24 @@
 use super::*;
 
 #[test]
+fn loop_preserves_slow_frame_duration_with_pending_feedback() {
+    let refresh = 10_000_000;
+    let previous_commit = 1_000_000_000;
+    let now = previous_commit + 2_000_000;
+    let anchor = loop_frame_target(previous_commit, 350_000_000, now, refresh);
+    let first_commit = frame_target(anchor, 0.0, 0.0, 1.0, refresh) - refresh + 1_500_000;
+    let second_commit = frame_target(anchor, 0.0, 0.35, 1.0, refresh) - refresh + 1_500_000;
+    assert_eq!(first_commit - previous_commit, 350_000_000);
+    assert_eq!(second_commit - first_commit, 350_000_000);
+}
+
+#[test]
+fn stalled_loop_reanchors_to_now() {
+    let anchor = loop_frame_target(1_000_000_000, 350_000_000, 2_000_000_000, 10_000_000);
+    assert_eq!(anchor - 10_000_000 + 1_500_000, 2_000_000_000);
+}
+
+#[test]
 fn clock_video_cadence() {
     let mut clock = VideoClock::new(0.0);
     let period = 1.0 / 144.0;

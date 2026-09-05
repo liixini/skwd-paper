@@ -2,6 +2,64 @@ use super::*;
 use clap::Parser;
 
 #[test]
+fn named_outputs_share_one_transaction_and_expose_idle_policy() {
+    let cli = crate::cli::Cli::try_parse_from([
+        "skwd-paper",
+        "apply",
+        "DP-1,DP-2",
+        "/wall/a.png",
+        "--transition",
+        "--idle-seconds",
+        "30",
+        "--replace-all",
+    ])
+    .unwrap();
+    let crate::cli::Command::Apply(args) = cli.command else { panic!("expected apply") };
+    let request = apply_request(args).unwrap();
+    assert_eq!(request.assignments.len(), 1);
+    assert_eq!(request.assignments[0].outputs, ["DP-1", "DP-2"]);
+    assert_eq!(request.policy.unwrap().idle_seconds, Some(30));
+    assert!(request.replace_all);
+}
+
+#[test]
+fn output_shorthand_preserves_protocol_validation() {
+    for (output, valid) in
+        [("ALL", true), ("*", true), ("DP-1,DP-1", false), ("DP-1,", false), ("DP-1,ALL", false)]
+    {
+        let cli = crate::cli::Cli::try_parse_from(["skwd-paper", "apply", output, "/wall/a.png"])
+            .unwrap();
+        let crate::cli::Command::Apply(args) = cli.command else { panic!("expected apply") };
+        let request = apply_request(args);
+        assert_eq!(request.is_ok(), valid, "{output}");
+        if valid {
+            assert_eq!(request.unwrap().assignments[0].outputs, ["*"]);
+        }
+    }
+}
+
+#[test]
+fn relative_paths_are_resolved_before_contacting_the_controller() {
+    let cli = crate::cli::Cli::try_parse_from([
+        "skwd-paper",
+        "apply",
+        "DP-1",
+        "next.png",
+        "--transition-from",
+        "old.png",
+    ])
+    .unwrap();
+    let crate::cli::Command::Apply(args) = cli.command else { panic!("expected apply") };
+    let request = apply_request(args).unwrap();
+    let current = std::env::current_dir().unwrap();
+    assert_eq!(Path::new(&request.assignments[0].source.path), current.join("next.png"));
+    assert_eq!(
+        Path::new(request.assignments[0].transition.as_ref().unwrap().from.as_ref().unwrap()),
+        current.join("old.png")
+    );
+}
+
+#[test]
 fn manifest_literal_and_file() {
     let json =
         r#"{"assignments":[{"outputs":["DP-1"],"source":{"kind":"video","path":"/wall/a.mp4"}}]}"#;

@@ -3180,7 +3180,7 @@ pub(super) fn stream_scene(
             next_frame = now;
             presented = false;
         }
-        if ctl.paused {
+        if ctl.paused && presented {
             suspended_at.get_or_insert_with(Instant::now);
             if let Some(fd) = ctl.wake_fd() {
                 let mut event = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
@@ -3261,6 +3261,9 @@ pub(super) fn stream_scene(
         )
         .context("send scene stream frame")?;
         free[slot] = false;
+        if !presented {
+            paper_runtime::plasma::frame_ready()?;
+        }
         presented = true;
         if fade_first_frame {
             fade_first_frame = false;

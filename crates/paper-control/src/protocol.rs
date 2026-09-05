@@ -400,9 +400,6 @@ impl ApplyRequest {
                 return Err(ValidationError::LayerNotAllowed(assignment.layer));
             }
             if let Some(transition) = &assignment.transition {
-                if assignment.source.kind == SourceKind::Static {
-                    return Err(ValidationError::TransitionNotAllowed(SourceKind::Static));
-                }
                 transition.validate()?;
             }
             for output in &assignment.outputs {
@@ -779,7 +776,7 @@ impl CapabilitiesResult {
             controls: ControlCapabilities { pause: true, audio: true },
             transitions: TransitionCapabilities {
                 startup_source_kinds: vec![SourceKind::Video, SourceKind::WallpaperEngine],
-                static_overlay: false,
+                static_overlay: true,
                 default_effect: "fade".to_string(),
                 default_duration_ms: 600,
                 min_duration_ms: 50,

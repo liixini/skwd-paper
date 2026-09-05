@@ -85,4 +85,8 @@ pub(crate) fn pace_stalled(target: i64, now: u64, refresh: u64) -> bool {
     now as i64 > target + (refresh * 8) as i64
 }
 
+pub(crate) fn loop_frame_target(previous_commit: u64, step: u64, now: u64, refresh: u64) -> u64 {
+    (previous_commit + step).max(now) + refresh.saturating_sub(1_500_000)
+}
+
 mod tests;

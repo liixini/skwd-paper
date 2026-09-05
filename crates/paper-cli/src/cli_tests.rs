@@ -134,3 +134,29 @@ fn capabilities_reset_cache() {
     let Command::Capabilities(args) = cli.command else { panic!("expected capabilities") };
     assert!(args.reset_decode_cache);
 }
+
+#[test]
+fn output_discovery_and_comma_separated_controls() {
+    assert!(matches!(
+        Cli::try_parse_from(["skwd-paper", "outputs"]).unwrap().command,
+        Command::Outputs
+    ));
+    let Command::Stop(stop) =
+        Cli::try_parse_from(["skwd-paper", "stop", "DP-1,DP-2"]).unwrap().command
+    else {
+        panic!("expected stop")
+    };
+    assert_eq!(stop.outputs, ["DP-1", "DP-2"]);
+    let Command::Audio(audio) =
+        Cli::try_parse_from(["skwd-paper", "audio", "DP-1,DP-2", "--mute", "true"])
+            .unwrap()
+            .command
+    else {
+        panic!("expected audio")
+    };
+    assert_eq!(audio.outputs, ["DP-1", "DP-2"]);
+    assert!(
+        Cli::try_parse_from(["skwd-paper", "apply", "--manifest", "{}", "--idle-seconds", "30"])
+            .is_err()
+    );
+}

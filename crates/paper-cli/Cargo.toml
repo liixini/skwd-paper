@@ -22,6 +22,8 @@ serde_json = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "process", "sync", "time", "io-util", "macros"] }
 tracing = { workspace = true }
 tempfile = { workspace = true }
+wayland-client = "0.31"
+smithay-client-toolkit = { version = "0.19", default-features = false }
 
 [lints]
 workspace = true

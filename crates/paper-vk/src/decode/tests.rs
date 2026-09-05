@@ -64,6 +64,39 @@ fn png_decoder_linked() {
 }
 
 #[test]
+fn animated_gif_loops_all_frames() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("animated.gif");
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = image::codecs::gif::GifEncoder::new(file);
+        encoder.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
+        for color in [[220, 25, 25, 255], [20, 30, 220, 255]] {
+            encoder
+                .encode_frame(image::Frame::from_parts(
+                    image::RgbaImage::from_pixel(4, 4, image::Rgba(color)),
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(350, 1),
+                ))
+                .unwrap();
+        }
+    }
+    let mut decoder = super::SwDecoder::open(path.to_str().unwrap()).unwrap();
+    assert!(!decoder.still);
+    let frames: Vec<_> = (0..6)
+        .map(|_| {
+            let (frame, pts) = decoder.next_raw().unwrap();
+            (frame.data(0)[..4].to_vec(), pts)
+        })
+        .collect();
+    assert_ne!(frames[0].0, frames[1].0);
+    for index in 2..frames.len() {
+        assert_eq!(frames[index].0, frames[index % 2].0, "{frames:?}");
+    }
+}
+
+#[test]
 fn retain_frame_keeps_hw_ctx() {
     let mut frame = ff::frame::Video::new(ff::format::Pixel::NV12, 4, 4);
     unsafe {

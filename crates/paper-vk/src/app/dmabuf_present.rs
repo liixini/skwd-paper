@@ -1398,6 +1398,11 @@ fn run_shared_dmabuf_with_readiness(
     });
     let mut steady_rgba: Option<RgbaStillSource> = None;
     if let Some(fade) = &mut fade {
+        prepare_transition_pipelines(
+            &mut renderers,
+            fade,
+            fade_rgba_a.is_some() || fade_rgba_b.is_some(),
+        )?;
         // Image decoding/upload is setup work, not part of the authored transition duration.
         fade.t0 = Instant::now();
     }
@@ -1499,6 +1504,11 @@ fn run_shared_dmabuf_with_readiness(
                 })
                 .and_then(Result::ok);
             fade = Some(state);
+            prepare_transition_pipelines(
+                &mut renderers,
+                fade.as_ref().unwrap(),
+                fade_rgba_a.is_some() || fade_rgba_b.is_some(),
+            )?;
             fade.as_mut().unwrap().t0 = Instant::now();
             readiness.arm_swap();
         }

@@ -29,7 +29,7 @@ class CompetitorSweepTests(unittest.TestCase):
 
     def test_matrix_has_matched_workloads_and_topologies(self):
         matrix = self.matrix()
-        self.assertEqual(len(matrix), 60)
+        self.assertEqual(len(matrix), 65)
         self.assertEqual({scenario.topology for scenario in matrix}, {"single", "all"})
         for workload, engines in {
             "static": {
@@ -38,14 +38,15 @@ class CompetitorSweepTests(unittest.TestCase):
                 "hyprpaper",
                 "wpaperd",
                 "kacau-wall",
+                "wallr",
                 "yin",
             },
             "video": {
                 "skwd-wall-vk",
-                "live-paper",
                 "mpvpaper",
                 "phonto",
                 "kacau-wall",
+                "wallr",
                 "yin",
             },
             "we": {"skwd-wall-vk", "linux-wallpaperengine"},
@@ -66,31 +67,48 @@ class CompetitorSweepTests(unittest.TestCase):
         )
         self.assertIn("hwdec=auto", command[2])
 
-    def test_live_paper_matrix_is_single_output_with_isolated_defaults(self):
-        scenarios = [
-            scenario for scenario in self.matrix() if scenario.engine == "live-paper"
-        ]
-        self.assertEqual(len(scenarios), 3)
-        self.assertEqual({scenario.topology for scenario in scenarios}, {"single"})
-        scenario = scenarios[0]
-        self.assertEqual(
-            self.module.scenario_command(scenario, "DP-3", ["DP-3"]),
-            [self.module.LIVE_PAPER, scenario.source],
+    def test_resolution_matrix_has_current_video_products_once(self):
+        matrix = self.module.build_resolution_matrix(
+            "1080p", "/video/matched-1080p.av1.mp4"
         )
+        self.assertEqual(len(matrix), 6)
+        self.assertEqual({scenario.topology for scenario in matrix}, {"single"})
+        self.assertEqual(
+            {scenario.engine for scenario in matrix},
+            {
+                "skwd-wall-vk",
+                "mpvpaper",
+                "phonto",
+                "wallr",
+                "kacau-wall",
+                "yin",
+            },
+        )
+        self.assertEqual(sum(scenario.engine == "mpvpaper" for scenario in matrix), 1)
+        mpvpaper = next(
+            scenario for scenario in matrix if scenario.engine == "mpvpaper"
+        )
+        self.assertTrue(mpvpaper.tuned)
+        for scenario in matrix:
+            self.assertEqual(scenario.source, "/video/matched-1080p.av1.mp4")
+            self.assertEqual(scenario.fps, 30)
+            self.assertEqual(scenario.extra["comparison"], "matched-resolution")
+            self.assertEqual(scenario.extra["resolution_label"], "1080p")
+
+    def test_wallr_uses_isolated_config_and_explicit_targeting(self):
+        scenario = self.module.build_resolution_matrix(
+            "1080p", "/video/matched-1080p.av1.mp4"
+        )[3]
         with tempfile.TemporaryDirectory() as directory:
-            config = self.module.write_live_paper_config(
-                pathlib.Path(directory)
-            ).read_text()
-        self.assertIn('hwdec = "auto"', config)
-        self.assertIn('ao = "null"', config)
-        self.assertIn("on_fullscreen = false", config)
-        with mock.patch.object(self.module.subprocess, "run") as run:
-            run.return_value = mock.Mock(returncode=0)
-            self.module.focus_niri_output("DP-3")
-        self.assertEqual(
-            run.call_args.args[0],
-            ["niri", "msg", "action", "focus-monitor", "DP-3"],
-        )
+            workdir = pathlib.Path(directory)
+            config_path = self.module.write_wallr_config(workdir)
+            config = config_path.read_text()
+            command = self.module.wallr_apply_command(scenario, "DP-3", config_path)
+        self.assertIn("hw_decode: auto", config)
+        self.assertIn("provider: none", config)
+        self.assertIn(str(workdir / "wallr.sock"), config)
+        self.assertEqual(command[-2:], ["--monitor", "DP-3"])
+        self.assertIn("--no-theme", command)
 
     def test_wpaperd_uses_isolated_matched_static_config(self):
         scenarios = [
@@ -274,6 +292,127 @@ class CompetitorSweepTests(unittest.TestCase):
                     "panicked at",
                 )
 
+    def test_frame_content_signature_measures_and_hashes_central_crop(self):
+        measured = mock.Mock(returncode=0, stdout="0.31 0.14", stderr="")
+        pixels = mock.Mock(returncode=0, stdout=b"cropped pixels", stderr=b"")
+        with mock.patch.object(
+            self.module.subprocess, "run", side_effect=[measured, pixels]
+        ) as run:
+            digest, mean, deviation = self.module.frame_content_signature(
+                pathlib.Path("/tmp/frame.ppm")
+            )
+        self.assertEqual(mean, 0.31)
+        self.assertEqual(deviation, 0.14)
+        self.assertEqual(len(digest), 64)
+        for call in run.call_args_list:
+            self.assertIn("-crop", call.args[0])
+            self.assertIn("75%x75%+0+0", call.args[0])
+
+    def test_video_validation_rejects_changing_black_frames(self):
+        captured = mock.Mock(returncode=0, stdout="", stderr="")
+        signatures = [
+            ("first", 0.002, 0.001),
+            ("second", 0.003, 0.002),
+            ("third", 0.002, 0.002),
+            ("fourth", 0.003, 0.001),
+        ]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            self.module.subprocess, "run", return_value=captured
+        ), mock.patch.object(
+            self.module, "wait_for_stable_file"
+        ), mock.patch.object(
+            self.module, "frame_content_signature", side_effect=signatures
+        ), mock.patch.object(
+            self.module.time, "sleep"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "blank or near-black"):
+                self.module.validate_video_motion(
+                    ["DP-3"], pathlib.Path(directory)
+                )
+
+    def test_video_validation_accepts_motion_after_initial_duplicate(self):
+        captured = mock.Mock(returncode=0, stdout="", stderr="")
+        signatures = [
+            ("first", 0.30, 0.14),
+            ("first", 0.30, 0.14),
+            ("second", 0.31, 0.15),
+            ("third", 0.29, 0.13),
+        ]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            self.module.subprocess, "run", return_value=captured
+        ), mock.patch.object(
+            self.module, "wait_for_stable_file"
+        ), mock.patch.object(
+            self.module, "frame_content_signature", side_effect=signatures
+        ), mock.patch.object(
+            self.module.time, "sleep"
+        ):
+            result = self.module.validate_video_motion(
+                ["DP-3"], pathlib.Path(directory)
+            )
+        self.assertEqual(result["DP-3"]["unique_frames"], 3)
+        self.assertEqual(len(result["DP-3"]["hashes"]), 4)
+
+    def test_visual_validation_requires_empty_active_workspace(self):
+        workspaces = [
+            {
+                "output": "DP-3",
+                "is_active": True,
+                "active_window_id": 42,
+            }
+        ]
+        queried = mock.Mock(
+            returncode=0,
+            stdout=self.module.json.dumps(workspaces),
+            stderr="",
+        )
+        with mock.patch.object(self.module.subprocess, "run", return_value=queried):
+            with self.assertRaisesRegex(RuntimeError, "empty active workspace"):
+                self.module.require_empty_active_workspace("DP-3")
+
+    def test_scenario_returns_visual_validation_failure_as_result(self):
+        scenario = self.module.build_resolution_matrix(
+            "1080p", "/video/matched-1080p.av1.mp4"
+        )[0]
+        process = mock.Mock(pid=123)
+        process.poll.return_value = None
+        error_log = mock.Mock()
+        error_log.name = "/tmp/unused-stderr.log"
+        floor = (1.0, 40.0)
+        profile = {"settle": 0.0, "window": 1.0, "hz": 1.0}
+        with mock.patch.object(
+            self.module.P,
+            "media_info",
+            return_value={"path": "/video/matched-1080p.av1.mp4"},
+        ), mock.patch.object(
+            self.module.P, "process_snapshot", return_value={}
+        ), mock.patch.object(
+            self.module, "launch_scenario", return_value=(process, error_log, {})
+        ), mock.patch.object(
+            self.module, "rendered_outputs", return_value=["DP-3"]
+        ), mock.patch.object(
+            self.module, "fatal_engine_log", return_value=None
+        ), mock.patch.object(
+            self.module, "require_empty_active_workspace"
+        ), mock.patch.object(
+            self.module,
+            "validate_video_motion",
+            side_effect=RuntimeError("video validation failed"),
+        ), mock.patch.object(
+            self.module, "stop_process"
+        ), mock.patch.object(
+            self.module.time, "sleep"
+        ):
+            previous = self.module.VALIDATE_MOTION
+            self.module.VALIDATE_MOTION = True
+            try:
+                result = self.module.run_scenario(
+                    scenario, floor, profile, "DP-3", ["DP-3"], 456
+                )
+            finally:
+                self.module.VALIDATE_MOTION = previous
+        self.assertEqual(result["error"], "video validation failed")
+
     def test_pmon_vram_includes_graphics_and_compute_processes(self):
         output = """# gpu pid type fb ccpm command
     0 120 G 529 0 linux-wallpaper
@@ -288,7 +427,7 @@ class CompetitorSweepTests(unittest.TestCase):
             {"namespace": "skwd-wall-vk", "output": "DP-1"},
             {"namespace": "phonto", "output": "DP-1"},
             {"namespace": "hyprpaper", "output": "DP-3"},
-            {"namespace": "live-paper", "output": "DP-2"},
+            {"namespace": "wallr", "output": "DP-3"},
             {"namespace": "yin-wallpaper", "output": "DP-3"},
             {"namespace": "wpaperd-DP-2", "output": "DP-2"},
             {"namespace": "wpaperd-DP-1", "output": "DP-1"},
@@ -303,7 +442,7 @@ class CompetitorSweepTests(unittest.TestCase):
             )
             self.assertIsNone(self.module.rendered_outputs("awww"))
             self.assertEqual(self.module.rendered_outputs("hyprpaper"), ["DP-3"])
-            self.assertEqual(self.module.rendered_outputs("live-paper"), ["DP-2"])
+            self.assertEqual(self.module.rendered_outputs("wallr"), ["DP-3"])
             self.assertEqual(
                 self.module.rendered_outputs("wpaperd"), ["DP-1", "DP-2"]
             )

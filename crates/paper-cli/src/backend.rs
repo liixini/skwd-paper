@@ -201,7 +201,22 @@ impl BackendPaths {
         policy: Option<&RendererPolicy>,
     ) -> Result<Worker> {
         let physical = assignment.clone();
-        self.spawn_as(&physical, assignment, output, socket, generation, policy, None)
+        self.spawn_as(&physical, assignment, output, socket, generation, policy, None, false)
+    }
+
+    pub(crate) fn spawn_overlay(
+        &self,
+        assignment: Assignment,
+        output: String,
+        socket: &Path,
+        generation: u64,
+        policy: Option<&RendererPolicy>,
+    ) -> Result<Worker> {
+        let mut physical = assignment.clone();
+        physical.source = Source::video(transition_source(&assignment.source)?, None);
+        physical.layer = Layer::Bottom;
+        physical.mute = true;
+        self.spawn_as(&physical, assignment, output, socket, generation, policy, None, true)
     }
 
     pub(crate) fn spawn_frozen(
@@ -225,6 +240,7 @@ impl BackendPaths {
             generation,
             policy,
             Some(freeze_directory),
+            false,
         )
     }
 
@@ -237,6 +253,7 @@ impl BackendPaths {
         generation: u64,
         policy: Option<&RendererPolicy>,
         freeze_directory: Option<Arc<tempfile::TempDir>>,
+        overlay: bool,
     ) -> Result<Worker> {
         let source = &assignment.source;
         let physical_dynamic = source.kind != SourceKind::Static;
@@ -301,7 +318,7 @@ impl BackendPaths {
             && source.effective_video_engine() != Some(VideoEngine::Tinier)
         {
             command
-                .arg("--persist")
+                .arg(if overlay { "--transition-hold" } else { "--persist" })
                 .arg("--fill-mode")
                 .arg(assignment.fill_mode.as_str())
                 .arg("--mute")
@@ -348,7 +365,7 @@ impl BackendPaths {
             child,
             pid,
             physical_dynamic,
-            freeze_capable,
+            freeze_capable: freeze_capable && !overlay,
             retain_capable,
             stdin: Some(stdin),
             _freeze_directory: freeze_directory,
@@ -388,6 +405,7 @@ pub(crate) fn present_plasma(
         paused,
         !prefaced,
     )?;
+    command.env("SKWD_PAPER_PLASMA_FD", stream_fd.to_string());
     let executable = command.get_program().to_string_lossy().into_owned();
     let error = command.exec();
     Err(error).with_context(|| format!("start Plasma presenter {executable}"))

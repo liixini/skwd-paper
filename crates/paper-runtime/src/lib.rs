@@ -5,3 +5,5 @@ pub mod wake;
 pub mod watchdog;
 
 pub use process::init_process;
+
+pub mod plasma;
