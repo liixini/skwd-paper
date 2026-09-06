@@ -354,6 +354,15 @@ impl Renderer {
         }
     }
 
+    pub(super) fn single_plane_import_modifiers(&self, format: vk::Format) -> Vec<u64> {
+        let available = self.drm_format_modifier_properties(format);
+        available
+            .iter()
+            .filter(|properties| properties.drm_format_modifier_plane_count == 1)
+            .map(|properties| properties.drm_format_modifier)
+            .collect()
+    }
+
     fn single_plane_xr24_modifiers(&self, modifiers: &[u64]) -> Vec<u64> {
         let available = self.drm_format_modifier_properties(vk::Format::B8G8R8A8_UNORM);
         single_plane_modifiers(modifiers, &available)
@@ -713,7 +722,7 @@ impl Renderer {
             vk::ImageTiling::OPTIMAL,
             &[],
             true,
-            false,
+            true,
             vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,
         )?;
         output.owner = ExportOwner::External;
@@ -781,6 +790,15 @@ impl Renderer {
             let mut modifier_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
                 .drm_format_modifiers(modifiers);
             let mut image_info = vk::ImageCreateInfo::default();
+            let gl_interop = handle_type == vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
+            let gl_usage = if gl_interop {
+                let properties = self
+                    .instance
+                    .get_physical_device_format_properties(self.phys, vk::Format::B8G8R8A8_UNORM);
+                gl_interop_image_usage(properties.optimal_tiling_features)
+            } else {
+                vk::ImageUsageFlags::empty()
+            };
             if export {
                 image_info = image_info.push_next(&mut ext_info);
             }
@@ -791,6 +809,11 @@ impl Renderer {
                 .device
                 .create_image(
                     &image_info
+                        .flags(if gl_interop {
+                            vk::ImageCreateFlags::MUTABLE_FORMAT
+                        } else {
+                            vk::ImageCreateFlags::empty()
+                        })
                         .image_type(vk::ImageType::TYPE_2D)
                         .format(vk::Format::B8G8R8A8_UNORM)
                         .extent(vk::Extent3D { width, height, depth: 1 })
@@ -799,7 +822,8 @@ impl Renderer {
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(tiling)
                         .usage(
-                            vk::ImageUsageFlags::TRANSFER_DST
+                            gl_usage
+                                | vk::ImageUsageFlags::TRANSFER_DST
                                 | if direct_render {
                                     vk::ImageUsageFlags::COLOR_ATTACHMENT
                                 } else {
@@ -876,14 +900,18 @@ impl Renderer {
             } else {
                 None
             };
-            let layout = self.device.get_image_subresource_layout(
-                output.image,
-                vk::ImageSubresource {
-                    aspect_mask: xr24_layout_aspect(tiling),
-                    mip_level: 0,
-                    array_layer: 0,
-                },
-            );
+            let layout = if tiling == vk::ImageTiling::OPTIMAL {
+                vk::SubresourceLayout::default()
+            } else {
+                self.device.get_image_subresource_layout(
+                    output.image,
+                    vk::ImageSubresource {
+                        aspect_mask: xr24_layout_aspect(tiling),
+                        mip_level: 0,
+                        array_layer: 0,
+                    },
+                )
+            };
             output.fd = if export {
                 self.ext_mem_fd
                     .get_memory_fd(
@@ -901,6 +929,20 @@ impl Renderer {
             Ok(output)
         }
     }
+}
+
+fn gl_interop_image_usage(features: vk::FormatFeatureFlags) -> vk::ImageUsageFlags {
+    let mut usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+    if features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
+        usage |= vk::ImageUsageFlags::SAMPLED;
+    }
+    if features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE) {
+        usage |= vk::ImageUsageFlags::STORAGE;
+    }
+    if features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT) {
+        usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::INPUT_ATTACHMENT;
+    }
+    usage
 }
 
 fn single_plane_modifiers(

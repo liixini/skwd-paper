@@ -136,6 +136,21 @@ pub(crate) fn run() -> Result<()> {
             .unwrap_or_default();
         set_fill_mode(fill);
         let (width, height) = crate::preview::parse_size(parse_flag(&args[3..], "--preview-size"));
+        if let Some(socket) =
+            parse_flag(&args[3..], "--stream-fd").and_then(|value| value.parse().ok())
+        {
+            anyhow::ensure!(once, "GPU transition streams must be one-shot");
+            return crate::preview::gpu::stream(
+                from,
+                &args[2],
+                shader,
+                width,
+                height,
+                duration_ms,
+                frame_ms,
+                socket,
+            );
+        }
         return crate::preview::stream(
             from,
             &args[2],

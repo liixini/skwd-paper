@@ -3,7 +3,7 @@ where
     F: FnMut(&str) + Send + 'static,
 {
     std::thread::spawn(move || {
-        use std::io::BufRead;
+        use std::io::{BufRead, Write};
 
         let stdin = std::io::stdin();
         let mut handle = stdin.lock();
@@ -12,7 +12,7 @@ where
             line.clear();
             match handle.read_line(&mut line) {
                 Ok(0) => {
-                    eprintln!("{tag}: stdin closed, exiting");
+                    let _ = writeln!(std::io::stderr(), "{tag}: stdin closed, exiting");
                     unsafe { libc::_exit(0) };
                 }
                 Ok(_) => {
@@ -22,7 +22,7 @@ where
                     }
                 }
                 Err(error) => {
-                    eprintln!("{tag}: stdin read error: {error}");
+                    let _ = writeln!(std::io::stderr(), "{tag}: stdin read error: {error}");
                     unsafe { libc::_exit(0) };
                 }
             }

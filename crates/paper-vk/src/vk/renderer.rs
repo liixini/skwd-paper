@@ -16,6 +16,9 @@ pub struct Renderer {
     pub(super) queue: vk::Queue,
     pub(super) queue_family: u32,
     pub(super) foreign_queue: bool,
+    pub(super) drm_modifier_ext: bool,
+    pub(super) import_modifiers: [Vec<u64>; 2],
+    pub(super) import_modifier_warned: std::sync::atomic::AtomicBool,
     pub(super) surface: vk::SurfaceKHR,
     pub(super) swapchain: vk::SwapchainKHR,
     pub(super) format: vk::Format,
@@ -278,10 +281,12 @@ impl Renderer {
     ) -> Result<Self> {
         unsafe {
             let headless = surface == vk::SurfaceKHR::null();
-            let foreign_queue =
-                instance.enumerate_device_extension_properties(phys)?.iter().any(|ext| {
-                    ext.extension_name_as_c_str() == Ok(ash::ext::queue_family_foreign::NAME)
-                });
+            let device_exts = instance.enumerate_device_extension_properties(phys)?;
+            let has_ext = |name: &std::ffi::CStr| {
+                device_exts.iter().any(|ext| ext.extension_name_as_c_str() == Ok(name))
+            };
+            let foreign_queue = has_ext(ash::ext::queue_family_foreign::NAME);
+            let drm_modifier_ext = has_ext(ash::ext::image_drm_format_modifier::NAME);
             let direct_render = instance
                 .get_physical_device_format_properties(phys, vk::Format::B8G8R8A8_UNORM)
                 .linear_tiling_features
@@ -409,7 +414,7 @@ impl Renderer {
             let scene_timestamp_period =
                 f64::from(instance.get_physical_device_properties(phys).limits.timestamp_period);
 
-            Ok(Self {
+            let mut renderer = Self {
                 owns_device,
                 plane_views: std::collections::HashMap::new(),
                 _entry: entry,
@@ -422,6 +427,9 @@ impl Renderer {
                 queue,
                 queue_family,
                 foreign_queue,
+                drm_modifier_ext,
+                import_modifiers: [Vec::new(), Vec::new()],
+                import_modifier_warned: std::sync::atomic::AtomicBool::new(false),
                 surface,
                 swapchain,
                 format: sf.format,
@@ -466,7 +474,14 @@ impl Renderer {
                 scene_timestamp_valid_bits,
                 scene_timestamp_active,
                 scene_gpu_time_ns: None,
-            })
+            };
+            if drm_modifier_ext {
+                renderer.import_modifiers = [
+                    renderer.single_plane_import_modifiers(vk::Format::R8_UNORM),
+                    renderer.single_plane_import_modifiers(vk::Format::R8G8_UNORM),
+                ];
+            }
+            Ok(renderer)
         }
     }
 }

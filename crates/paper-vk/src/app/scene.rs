@@ -1,6 +1,6 @@
 use super::dmabuf_helpers::{create_buffers, init_free_buffers, monotonic_ns};
 use super::model::StartFade;
-use super::readiness::signal_ready;
+use super::readiness::{signal_ready, signal_swap_failure};
 use crate::dmabuf::{DRM_MOD_INVALID, DRM_MOD_LINEAR, xr24_export_modifiers};
 use crate::fill::{fill_mode, mode_uv};
 use crate::{ctl, decode, shared, vk, wayland};
@@ -2756,7 +2756,7 @@ pub(super) fn run_scene(
                 .as_ref()
                 .map(paper_scene::effects::parse_property_overrides)
                 .unwrap_or_default();
-            let Ok((mut next, next_audio)) = locate_pkg(&req.to)
+            let loaded = locate_pkg(&req.to)
                 .and_then(|path| paper_scene::pkg::Package::open(&path))
                 .and_then(|pkg| {
                     let model = paper_scene::model::load_from_dir_with(
@@ -2765,28 +2765,29 @@ pub(super) fn run_scene(
                         &next_properties,
                     )?;
                     Ok((model, extract_scene_audio(&pkg, &next_properties)))
-                })
-            else {
-                tracing::warn!("skwd-wall-vk: scene swap target unreadable, keeping current");
-                continue;
+                });
+            let (mut next, next_audio) = match loaded {
+                Ok(next) => next,
+                Err(error) => {
+                    signal_swap_failure(&req.to, &format!("{error:#}"));
+                    continue;
+                }
             };
             if particles_disabled {
                 next.particles.clear();
             }
             if next.layers.is_empty() && next.particles.is_empty() {
-                tracing::warn!("skwd-wall-vk: scene swap target has no layers, keeping current");
+                signal_swap_failure(&req.to, "Scene has no layers or particles");
                 continue;
             }
             if let Err(error) = validate_scene_skips(strict, &next.skipped) {
-                tracing::warn!("skwd-wall-vk: scene swap rejected, keeping current: {error:#}");
+                signal_swap_failure(&req.to, &format!("{error:#}"));
                 continue;
             }
             let next_group = match build_group(&sd, &mut next, strict, &dims, mode) {
                 Ok(built) => built,
                 Err(error) => {
-                    tracing::warn!(
-                        "skwd-wall-vk: scene swap build failed, keeping current: {error:#}"
-                    );
+                    signal_swap_failure(&req.to, &format!("{error:#}"));
                     continue;
                 }
             };
@@ -3123,32 +3124,29 @@ pub(super) fn stream_scene(
                     )?;
                     Ok((model, extract_scene_audio(&pkg, &next_properties)))
                 });
-            let Ok((mut next, next_audio)) = loaded else {
-                tracing::warn!(target = req.to, "skwd-wall-vk: scene stream swap rejected");
-                continue;
+            let (mut next, next_audio) = match loaded {
+                Ok(next) => next,
+                Err(error) => {
+                    signal_swap_failure(&req.to, &format!("{error:#}"));
+                    continue;
+                }
             };
             if particles_disabled {
                 next.particles.clear();
             }
             if next.layers.is_empty() && next.particles.is_empty() {
-                tracing::warn!(target = req.to, "skwd-wall-vk: empty scene stream swap rejected");
+                signal_swap_failure(&req.to, "Scene has no layers or particles");
                 continue;
             }
             if let Err(error) = validate_scene_skips(strict, &next.skipped) {
-                tracing::warn!(
-                    target = req.to,
-                    "skwd-wall-vk: scene stream swap rejected: {error:#}"
-                );
+                signal_swap_failure(&req.to, &format!("{error:#}"));
                 continue;
             }
             let next_group =
                 match build_group(&sd, &mut next, strict, &[(width, height)], fill_mode()) {
                     Ok(group) => group,
                     Err(error) => {
-                        tracing::warn!(
-                            target = req.to,
-                            "skwd-wall-vk: scene stream swap failed: {error:#}"
-                        );
+                        signal_swap_failure(&req.to, &format!("{error:#}"));
                         continue;
                     }
                 };

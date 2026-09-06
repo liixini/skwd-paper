@@ -3,6 +3,32 @@ use ash::vk;
 
 use super::{FrameImages, FrameViews, Renderer};
 use crate::decode::PlaneDesc;
+use crate::dmabuf::DRM_MOD_INVALID;
+
+pub(crate) fn import_modifier_gate(modifier_ext: bool, luma: u64, chroma: u64) -> Result<()> {
+    if !modifier_ext {
+        return Err(anyhow!("Vulkan device has no DRM format modifier support"));
+    }
+    for (plane, modifier) in [("luma", luma), ("chroma", chroma)] {
+        if modifier == DRM_MOD_INVALID {
+            return Err(anyhow!("{plane} plane has no explicit DRM format modifier"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn unlisted_import_modifiers(
+    listed: &[Vec<u64>; 2],
+    luma: u64,
+    chroma: u64,
+) -> Vec<(&'static str, u64)> {
+    [("luma", luma), ("chroma", chroma)]
+        .into_iter()
+        .zip(listed)
+        .filter(|((_, modifier), listed)| !listed.contains(modifier))
+        .map(|(entry, _)| entry)
+        .collect()
+}
 
 pub struct UploadPath {
     staging: vk::Buffer,
@@ -296,6 +322,21 @@ impl Renderer {
         if !self.supports_foreign_import() {
             return Err(anyhow!("Vulkan device has no foreign queue-family support"));
         }
+        import_modifier_gate(self.drm_modifier_ext, luma.modifier, chroma.modifier)?;
+        let unlisted =
+            unlisted_import_modifiers(&self.import_modifiers, luma.modifier, chroma.modifier);
+        if !unlisted.is_empty()
+            && !self.import_modifier_warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "skwd-wall-vk: VAAPI frame modifiers not listed by Vulkan for single-plane import: {}",
+                unlisted
+                    .iter()
+                    .map(|(plane, modifier)| format!("{plane}={modifier:#018x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
         let (luma_img, luma_mem, luma_view) =
             self.import_plane(vk::Format::R8_UNORM, video_w, video_h, luma)?;
         let (chroma_img, chroma_mem, chroma_view) = match self.import_plane(
@@ -452,3 +493,6 @@ impl Renderer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

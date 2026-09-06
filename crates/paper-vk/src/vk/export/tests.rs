@@ -7,6 +7,29 @@ use super::{
 use ash::vk;
 
 #[test]
+fn gl_shared_images_declare_texture_usages() {
+    let features = vk::FormatFeatureFlags::SAMPLED_IMAGE
+        | vk::FormatFeatureFlags::STORAGE_IMAGE
+        | vk::FormatFeatureFlags::COLOR_ATTACHMENT;
+    let usage = super::gl_interop_image_usage(features);
+    assert_eq!(
+        usage.as_raw(),
+        (vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::INPUT_ATTACHMENT)
+            .as_raw()
+    );
+    let without_storage = super::gl_interop_image_usage(
+        vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+    );
+    assert!(!without_storage.contains(vk::ImageUsageFlags::STORAGE));
+    assert!(without_storage.contains(vk::ImageUsageFlags::SAMPLED));
+}
+
+#[test]
 fn export_types_drop() {
     assert!(std::mem::needs_drop::<ExportImage>());
     assert!(std::mem::needs_drop::<Nv12Export>());

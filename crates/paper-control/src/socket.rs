@@ -46,12 +46,10 @@ pub fn signal_paper_ready_generation_to(path: &Path, generation: u64) -> std::io
 }
 
 pub fn signal_paper_failed(code: &str, message: &str) -> std::io::Result<()> {
-    let Some(path) = env::var_os("SKWD_PAPER_READY_SOCKET") else {
-        return Ok(());
-    };
+    let path = env::var_os("SKWD_PAPER_READY_SOCKET").map_or_else(socket_path, PathBuf::from);
     let generation =
         env::var("SKWD_PAPER_GENERATION").ok().and_then(|value| value.parse().ok()).unwrap_or(0);
-    signal_paper_failed_generation_to(&PathBuf::from(path), generation, code, message)
+    signal_paper_failed_generation_to(&path, generation, code, message)
 }
 
 pub fn signal_paper_failed_generation_to(

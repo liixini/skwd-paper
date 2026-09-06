@@ -381,12 +381,19 @@ pub(crate) fn present_plasma(
     paused: bool,
 ) -> Result<()> {
     let backends = BackendPaths::discover();
+    let gpu_stream = std::env::var("SKWD_PAPER_PLASMA_GPU_STREAM").as_deref() == Ok("1");
     let transition = plasma_transition_command(&backends, assignment, stream_size, stream_fps)
         .inspect_err(|error| tracing::warn!(%error, "Plasma transition prelude unavailable"))
         .ok()
         .flatten();
     let prefaced = if let Some(mut transition) = transition {
-        write_stream_header(stream_size)?;
+        if gpu_stream {
+            paper_runtime::plasma::begin_stream(stream_fd, 1)?;
+            transition.arg("--stream-fd").arg(stream_fd.to_string());
+            transition.env("SKWD_PAPER_STREAM_EPOCH", "1");
+        } else {
+            write_stream_header(stream_size)?;
+        }
         match transition.status() {
             Ok(status) if status.success() => {}
             Ok(status) => tracing::warn!(%status, "Plasma transition prelude exited early"),
@@ -403,8 +410,12 @@ pub(crate) fn present_plasma(
         stream_fps,
         stream_fd,
         paused,
-        !prefaced,
+        !prefaced || gpu_stream,
     )?;
+    if gpu_stream {
+        paper_runtime::plasma::begin_stream(stream_fd, 2)?;
+        command.env("SKWD_PAPER_STREAM_EPOCH", "2");
+    }
     command.env("SKWD_PAPER_PLASMA_FD", stream_fd.to_string());
     let executable = command.get_program().to_string_lossy().into_owned();
     let error = command.exec();
@@ -486,14 +497,17 @@ fn plasma_command(
             .arg(stream_size)
             .arg("--stream-fps")
             .arg(stream_fps.clamp(1, 240).to_string())
-            .arg("--stream-fd")
-            .arg(stream_fd.to_string())
             .arg("--fill-mode")
             .arg(assignment.fill_mode.as_str())
             .arg("--mute")
             .arg(assignment.mute.to_string())
             .arg("--volume")
             .arg(assignment.volume.min(100).to_string());
+        if std::env::var("SKWD_PAPER_PLASMA_GPU_STREAM").as_deref() != Ok("0") {
+            command.arg("--stream-fd").arg(stream_fd.to_string());
+        } else if command.get_args().any(|arg| arg == "--scene") {
+            anyhow::bail!("Plasma graphics backend cannot import GPU scene frames");
+        }
         if paused {
             command.arg("--paused");
         }

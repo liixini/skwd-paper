@@ -19,6 +19,14 @@ pub(crate) fn signal_startup_failure(message: &str) {
     }
 }
 
+pub(super) fn signal_swap_failure(target: &str, message: &str) {
+    let message = format!("Scene switch to {target} failed: {message}");
+    tracing::warn!("skwd-wall-vk: {message}; keeping current scene");
+    if let Err(error) = paper_control::signal_paper_failed("scene_swap", &message) {
+        tracing::info!("skwd-wall-vk: paper.failed send failed: {error}");
+    }
+}
+
 pub(super) struct PresentationReadiness {
     pending: bool,
 }

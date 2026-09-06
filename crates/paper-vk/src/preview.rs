@@ -1,3 +1,5 @@
+pub(crate) mod gpu;
+
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::time::Instant;
@@ -134,6 +136,9 @@ pub(crate) fn stream(
     let shader = selected_shader(shader);
     let sand = paper_shaders::sand_style_index(shader);
     let effect = sand.is_none().then(|| paper_shaders::effect_index(shader)).flatten();
+    unsafe {
+        libc::fcntl(libc::STDOUT_FILENO, libc::F_SETPIPE_SZ, 1024 * 1024);
+    }
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
     let mut output = std::io::BufWriter::new(std::io::stdout().lock());
     if write_header {
@@ -145,7 +150,10 @@ pub(crate) fn stream(
     let duration_ms = duration_ms.max(100);
     let span = duration_ms + 600;
     let started = Instant::now();
+    let frame_interval = std::time::Duration::from_millis(frame_ms.clamp(4, 200));
+    let mut frames = 0u64;
     loop {
+        let frame_deadline = Instant::now() + frame_interval;
         let elapsed = started.elapsed().as_millis() as u64;
         let reverse = (elapsed / span) % 2 == 1;
         let progress = ((elapsed % span) as f32 / duration_ms as f32).clamp(0.0, 1.0);
@@ -195,13 +203,21 @@ pub(crate) fn stream(
         if output.write_all(&rgba).is_err() || output.flush().is_err() {
             return Ok(());
         }
+        frames += 1;
         if once && progress >= 1.0 {
+            tracing::debug!(
+                frames,
+                fps = frames as f64 / started.elapsed().as_secs_f64().max(0.001),
+                "skwd-wall-vk: preview transition complete"
+            );
             return Ok(());
         }
         if unsafe { libc::getppid() } <= 1 {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(frame_ms.clamp(4, 200)));
+        if let Some(delay) = frame_deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(delay);
+        }
     }
 }
 
@@ -326,10 +342,8 @@ pub(crate) fn packet(
     offset: u32,
     modifier: u64,
 ) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[..4].copy_from_slice(b"SKDG");
-    bytes[4] = kind;
-    bytes[5] = slot;
+    let mut bytes =
+        paper_runtime::plasma::packet(kind, slot, paper_runtime::plasma::stream_epoch());
     bytes[8..12].copy_from_slice(&width.to_le_bytes());
     bytes[12..16].copy_from_slice(&height.to_le_bytes());
     bytes[16..20].copy_from_slice(&stride.to_le_bytes());
@@ -371,20 +385,30 @@ pub(crate) fn send_packet(
 }
 
 pub(crate) fn receive_ack(socket: RawFd, block: bool) -> std::io::Result<Option<usize>> {
-    let mut bytes = [0u8; 32];
-    let flags = if block { 0 } else { libc::MSG_DONTWAIT };
-    let len = unsafe { libc::recv(socket, bytes.as_mut_ptr().cast(), bytes.len(), flags) };
-    if len == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "frame socket closed"));
-    }
-    if len < 0 {
-        let error = std::io::Error::last_os_error();
-        if !block && error.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(None);
+    loop {
+        let mut bytes = [0u8; 32];
+        let flags = if block { 0 } else { libc::MSG_DONTWAIT };
+        let len = unsafe { libc::recv(socket, bytes.as_mut_ptr().cast(), bytes.len(), flags) };
+        if len == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "frame socket closed"));
         }
-        return Err(error);
+        if len < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if !block && error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        if let Some(slot) = paper_runtime::plasma::acknowledged_slot(
+            &bytes[..len as usize],
+            paper_runtime::plasma::stream_epoch(),
+        ) {
+            return Ok(Some(slot));
+        }
     }
-    Ok((len >= 6 && bytes[..4] == *b"SKDG" && bytes[4] == 3).then_some(bytes[5] as usize))
 }
 
 pub(crate) fn dmabuf_video_stream(
@@ -502,20 +526,22 @@ pub(crate) fn dmabuf_video_stream(
     let mut emit_frame = |frame: &ffmpeg_the_third::frame::Video,
                           upload_frame: bool,
                           deadline: Instant,
-                          emitted: &mut bool|
+                          emitted: &mut bool,
+                          timeline_shift: &mut std::time::Duration|
      -> Result<bool> {
         let suspended =
             if *emitted { wait_stream_control(&mut ctl)? } else { std::time::Duration::ZERO };
-        timeline_shift += suspended;
+        *timeline_shift += suspended;
         if let Some((_, _, Some(started), _)) = &mut transition {
             *started += suspended;
         }
-        let deadline = deadline + timeline_shift;
+        let mut deadline = deadline + *timeline_shift;
         while let Some(slot) = receive_ack(socket, false)? {
             if let Some(value) = free.get_mut(slot) {
                 *value = true;
             }
         }
+        let wait_started = Instant::now();
         while !free.iter().any(|value| *value) {
             if let Some(slot) = receive_ack(socket, true)?
                 && let Some(value) = free.get_mut(slot)
@@ -524,6 +550,17 @@ pub(crate) fn dmabuf_video_stream(
             }
         }
         let now = Instant::now();
+        let shift = crate::timing::stream_resume_shift(
+            deadline,
+            now,
+            now.duration_since(wait_started),
+            frame_duration,
+        );
+        *timeline_shift += shift;
+        deadline += shift;
+        if let Some((_, _, Some(started), _)) = &mut transition {
+            *started += shift;
+        }
         if *emitted
             && now
                 .checked_duration_since(deadline)
@@ -631,6 +668,7 @@ pub(crate) fn dmabuf_video_stream(
             emitted = false;
             previous_frame = None;
             last_deadline = None;
+            timeline_shift = std::time::Duration::ZERO;
         }
         last_pts = Some(pts);
         let origin = *first_pts.get_or_insert(pts);
@@ -645,11 +683,12 @@ pub(crate) fn dmabuf_video_stream(
         {
             let mut fill_deadline = previous_deadline + frame_duration;
             while transition_active && fill_deadline < deadline {
-                transition_active = emit_frame(previous, false, fill_deadline, &mut emitted)?;
+                transition_active =
+                    emit_frame(previous, false, fill_deadline, &mut emitted, &mut timeline_shift)?;
                 fill_deadline += frame_duration;
             }
         }
-        transition_active = emit_frame(&frame, true, deadline, &mut emitted)?;
+        transition_active = emit_frame(&frame, true, deadline, &mut emitted, &mut timeline_shift)?;
         last_deadline = Some(deadline);
         previous_frame = Some(frame);
     }

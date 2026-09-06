@@ -89,4 +89,17 @@ pub(crate) fn loop_frame_target(previous_commit: u64, step: u64, now: u64, refre
     (previous_commit + step).max(now) + refresh.saturating_sub(1_500_000)
 }
 
+pub(crate) fn stream_resume_shift(
+    deadline: Instant,
+    resumed: Instant,
+    blocked: Duration,
+    frame_interval: Duration,
+) -> Duration {
+    if blocked > frame_interval + frame_interval / 2 {
+        resumed.saturating_duration_since(deadline)
+    } else {
+        Duration::ZERO
+    }
+}
+
 mod tests;

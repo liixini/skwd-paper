@@ -55,6 +55,30 @@ fn integrated_low_power_fallback() {
 }
 
 #[test]
+fn plasma_shared_images_require_the_consumers_device_and_driver() {
+    let candidates = [
+        super::DeviceCandidate {
+            physical_device: vk::PhysicalDevice::null(),
+            choice: choice(0, "Intel", vk::PhysicalDeviceType::INTEGRATED_GPU, false),
+            drm_nodes: None,
+            uuid: [1; 16],
+            driver_uuid: [3; 16],
+        },
+        super::DeviceCandidate {
+            physical_device: vk::PhysicalDevice::null(),
+            choice: choice(1, "NVIDIA", vk::PhysicalDeviceType::DISCRETE_GPU, false),
+            drm_nodes: None,
+            uuid: [2; 16],
+            driver_uuid: [4; 16],
+        },
+    ];
+    assert_eq!(super::shared_image_device(&candidates, [2; 16], Some([4; 16])), Some(1));
+    assert_eq!(super::shared_image_device(&candidates, [1; 16], Some([3; 16])), Some(0));
+    assert_eq!(super::shared_image_device(&candidates, [2; 16], Some([3; 16])), None);
+    assert_eq!(super::shared_image_device(&candidates, [9; 16], None), None);
+}
+
+#[test]
 fn explicit_class_overrides() {
     let choices = [
         choice(0, "Integrated", vk::PhysicalDeviceType::INTEGRATED_GPU, true),
@@ -79,4 +103,14 @@ fn selector_parse_forms() {
 #[test]
 fn foreign_queue_extension() {
     assert!(wanted_device_extension("VK_EXT_queue_family_foreign"));
+}
+
+#[test]
+fn plasma_device_uuid_is_exact_and_validated() {
+    assert_eq!(
+        super::parse_device_uuid("00112233445566778899aAbBcCdDeEfF").unwrap(),
+        [0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255]
+    );
+    assert!(super::parse_device_uuid("0").is_err());
+    assert!(super::parse_device_uuid("zz112233445566778899aabbccddeeff00").is_err());
 }

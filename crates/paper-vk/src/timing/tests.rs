@@ -156,3 +156,35 @@ fn stalled_anchor_rebase() {
     let ahead = next.saturating_sub(late_now);
     assert!(ahead >= refresh && ahead <= refresh * 8);
 }
+
+#[test]
+fn plasma_resume_does_not_decode_through_hidden_time() {
+    let start = Instant::now();
+    let interval = Duration::from_millis(33);
+    let deadline = start + interval;
+    let resumed = start + Duration::from_secs(60);
+    let shift = stream_resume_shift(deadline, resumed, Duration::from_secs(60), interval);
+    assert_eq!(deadline + shift, resumed);
+    assert_eq!(deadline + interval + shift, resumed + interval);
+}
+
+#[test]
+fn ordinary_plasma_feedback_keeps_the_playback_clock() {
+    let start = Instant::now();
+    let interval = Duration::from_millis(33);
+    assert_eq!(stream_resume_shift(start, start + interval, interval, interval), Duration::ZERO);
+}
+
+#[test]
+fn plasma_resume_preserves_a_future_frame_deadline() {
+    let resumed = Instant::now();
+    assert_eq!(
+        stream_resume_shift(
+            resumed + Duration::from_millis(10),
+            resumed,
+            Duration::from_secs(60),
+            Duration::from_millis(33)
+        ),
+        Duration::ZERO
+    );
+}

@@ -35,12 +35,24 @@ struct DeviceCandidate {
     physical_device: vk::PhysicalDevice,
     choice: DeviceChoice,
     drm_nodes: Option<DrmNodes>,
+    uuid: [u8; 16],
+    driver_uuid: [u8; 16],
 }
 
 struct DeviceSelection {
     candidate_index: usize,
     reason: String,
     explicit: bool,
+}
+
+fn shared_image_device(
+    candidates: &[DeviceCandidate],
+    uuid: [u8; 16],
+    driver: Option<[u8; 16]>,
+) -> Option<usize> {
+    candidates.iter().position(|candidate| {
+        candidate.uuid == uuid && driver.is_none_or(|driver| candidate.driver_uuid == driver)
+    })
 }
 
 fn wanted_device_extension(name: &str) -> bool {
@@ -124,6 +136,19 @@ pub fn create(display: *mut std::ffi::c_void) -> Result<SharedDevice> {
 pub(crate) fn unreliable_virtual_driver_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.contains("virtio-gpu venus") || name.contains("mesa venus")
+}
+
+fn parse_device_uuid(value: &str) -> Result<[u8; 16]> {
+    anyhow::ensure!(
+        value.len() == 32 && value.is_ascii(),
+        "Plasma GPU UUID must contain 32 hexadecimal digits"
+    );
+    let mut uuid = [0u8; 16];
+    for (index, byte) in uuid.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .context("invalid Plasma GPU UUID")?;
+    }
+    Ok(uuid)
 }
 
 fn parse_device_selector(value: Option<&str>) -> DeviceSelector {
@@ -343,6 +368,9 @@ fn create_with_policy(
             let compositor_match = compositor_device.is_some_and(|device| {
                 drm_nodes.is_some_and(|nodes| drm_node_matches(nodes, device))
             });
+            let mut ids = vk::PhysicalDeviceIDProperties::default();
+            let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut ids);
+            instance.get_physical_device_properties2(physical_device, &mut properties);
             candidates.push(DeviceCandidate {
                 physical_device,
                 choice: DeviceChoice {
@@ -354,6 +382,8 @@ fn create_with_policy(
                     compositor_match,
                 },
                 drm_nodes,
+                uuid: ids.device_uuid,
+                driver_uuid: ids.driver_uuid,
             });
         }
         if candidates.is_empty() {
@@ -383,6 +413,20 @@ fn create_with_policy(
                 value = selector_value.unwrap_or_default(),
                 "skwd-wall-vk: Vulkan device override did not match; using automatic selection"
             );
+        }
+        if let Ok(value) = std::env::var("SKWD_PAPER_PLASMA_DEVICE_UUID") {
+            let uuid = parse_device_uuid(&value)?;
+            let driver = std::env::var("SKWD_PAPER_PLASMA_DRIVER_UUID")
+                .ok()
+                .map(|value| parse_device_uuid(&value))
+                .transpose()?;
+            let index = shared_image_device(&candidates, uuid, driver)
+                .context("no Vulkan device matches the Plasma OpenGL device and driver")?;
+            selection = DeviceSelection {
+                candidate_index: index,
+                reason: "Plasma shared-image device UUID".into(),
+                explicit: true,
+            };
         }
         if avoid_unreliable_virtual_driver
             && !selection.explicit
