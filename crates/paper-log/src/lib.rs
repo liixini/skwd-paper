@@ -4,3 +4,6 @@ pub use files::{
 };
 mod trace;
 pub use trace::init_tracing;
+
+mod writer;
+pub use writer::RotatingWriter;

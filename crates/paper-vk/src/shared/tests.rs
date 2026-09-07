@@ -11,6 +11,7 @@ fn choice(
     compositor_match: bool,
 ) -> DeviceChoice {
     DeviceChoice {
+        uuid: [enumeration_index as u8; 16],
         enumeration_index,
         name: name.into(),
         device_type,
@@ -113,4 +114,20 @@ fn plasma_device_uuid_is_exact_and_validated() {
     );
     assert!(super::parse_device_uuid("0").is_err());
     assert!(super::parse_device_uuid("zz112233445566778899aabbccddeeff00").is_err());
+}
+
+#[test]
+fn explicit_uuid_survives_reordering_and_overrides_integrated_preference() {
+    let integrated = choice(1, "Integrated", vk::PhysicalDeviceType::INTEGRATED_GPU, true);
+    let discrete = choice(2, "Discrete", vk::PhysicalDeviceType::DISCRETE_GPU, false);
+    let selector = parse_device_selector(Some("uuid:02020202020202020202020202020202"));
+    let choices = [integrated.clone(), discrete.clone()];
+    let selected = select_device(&choices, &selector);
+    assert_eq!(choices[selected.candidate_index].uuid, discrete.uuid);
+    assert!(selected.explicit);
+    let choices = [discrete, integrated];
+    assert_eq!(select_device(&choices, &selector).candidate_index, 0);
+    let unavailable = select_device(&choices, &DeviceSelector::Uuid([9; 16]));
+    assert_eq!(unavailable.candidate_index, 1);
+    assert!(!unavailable.explicit);
 }

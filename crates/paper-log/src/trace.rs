@@ -19,22 +19,14 @@ fn init_stderr_only() {
 }
 
 pub fn init_tracing(app: &str) {
-    let Some(path) = super::prepare(app) else {
+    let Some(path) = super::log_path(app) else {
         init_stderr_only();
         return;
     };
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+    let Ok(file_appender) = crate::RotatingWriter::new(path) else {
         init_stderr_only();
         return;
     };
-    let Ok(file_appender) = tracing_appender::rolling::RollingFileAppender::builder()
-        .filename_prefix(name.to_string_lossy().into_owned())
-        .build(dir)
-    else {
-        init_stderr_only();
-        return;
-    };
-    super::files::secure_mode(&path, 0o600);
     let (file_writer, file_guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
         .buffered_lines_limit(256)
         .lossy(true)

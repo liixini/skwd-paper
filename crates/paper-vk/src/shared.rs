@@ -12,11 +12,13 @@ enum DeviceSelector {
     Discrete,
     Cpu,
     Index(usize),
+    Uuid([u8; 16]),
     Name(String),
 }
 
 #[derive(Clone)]
 struct DeviceChoice {
+    uuid: [u8; 16],
     enumeration_index: usize,
     name: String,
     device_type: vk::PhysicalDeviceType,
@@ -141,18 +143,22 @@ pub(crate) fn unreliable_virtual_driver_name(name: &str) -> bool {
 fn parse_device_uuid(value: &str) -> Result<[u8; 16]> {
     anyhow::ensure!(
         value.len() == 32 && value.is_ascii(),
-        "Plasma GPU UUID must contain 32 hexadecimal digits"
+        "GPU UUID must contain 32 hexadecimal digits"
     );
     let mut uuid = [0u8; 16];
     for (index, byte) in uuid.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .context("invalid Plasma GPU UUID")?;
+        *byte =
+            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).context("invalid GPU UUID")?;
     }
     Ok(uuid)
 }
 
 fn parse_device_selector(value: Option<&str>) -> DeviceSelector {
     let value = value.unwrap_or("auto").trim();
+    if let Some(uuid) = value.strip_prefix("uuid:").and_then(|value| parse_device_uuid(value).ok())
+    {
+        return DeviceSelector::Uuid(uuid);
+    }
     match value.to_ascii_lowercase().as_str() {
         "" | "auto" | "default" => DeviceSelector::Auto,
         "integrated" | "low" | "low-power" => DeviceSelector::Integrated,
@@ -174,6 +180,9 @@ fn device_selector_name(selector: &DeviceSelector) -> String {
         DeviceSelector::Discrete => "discrete".into(),
         DeviceSelector::Cpu => "cpu".into(),
         DeviceSelector::Index(index) => format!("index:{index}"),
+        DeviceSelector::Uuid(uuid) => {
+            format!("uuid:{}", uuid.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+        }
         DeviceSelector::Name(name) => name.clone(),
     }
 }
@@ -251,6 +260,7 @@ fn select_device(choices: &[DeviceChoice], selector: &DeviceSelector) -> DeviceS
                 }
                 DeviceSelector::Cpu => choice.device_type == vk::PhysicalDeviceType::CPU,
                 DeviceSelector::Index(wanted) => choice.enumeration_index == *wanted,
+                DeviceSelector::Uuid(wanted) => choice.uuid == *wanted,
                 DeviceSelector::Name(wanted) => {
                     choice.name.to_ascii_lowercase().contains(wanted.as_str())
                 }
@@ -374,6 +384,7 @@ fn create_with_policy(
             candidates.push(DeviceCandidate {
                 physical_device,
                 choice: DeviceChoice {
+                    uuid: ids.device_uuid,
                     enumeration_index,
                     name,
                     device_type: props.device_type,
