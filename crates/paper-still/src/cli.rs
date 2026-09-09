@@ -45,7 +45,8 @@ fn parse_layer(value: &str) -> Result<Layer, String> {
         "background" => Ok(Layer::Background),
         "bottom" => Ok(Layer::Bottom),
         "top" => Ok(Layer::Top),
-        _ => Err(format!("unknown layer {value:?}; expected background, bottom, or top")),
+        "overlay" => Ok(Layer::Overlay),
+        _ => Err(format!("unknown layer {value:?}; expected background, bottom, top, or overlay")),
     }
 }
 

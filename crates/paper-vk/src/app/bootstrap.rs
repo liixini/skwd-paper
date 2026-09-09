@@ -13,7 +13,9 @@ use anyhow::{Context, Result};
 use paper_geom::FillMode;
 
 fn usage() -> ! {
-    tracing::info!("usage: skwd-wall-vk <output|*> <video> [--standalone] [-o mute=yes;volume=80]");
+    tracing::info!(
+        "usage: skwd-wall-vk <output|*> <video> [--standalone] [--layer background|bottom|top|overlay] [-o mute=yes;volume=80]"
+    );
     std::process::exit(2);
 }
 
@@ -264,6 +266,9 @@ fn dispatch_path(
 ) -> Result<()> {
     #[cfg(feature = "shared-device")]
     {
+        if crate::surface::needs_shader() {
+            return run_shared_dmabuf(target, video, mute, volume, start_fade);
+        }
         let cover = matches!(fill_mode(), FillMode::Fill | FillMode::Span);
         let cuts_only = std::env::var("SKWD_PAPER_TRANSITIONS").as_deref() == Ok("0");
         let explicit_path = std::env::var("SKWD_VK_PATH").ok();

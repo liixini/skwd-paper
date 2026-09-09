@@ -147,6 +147,7 @@ fn policy_golden_line() {
         duration_ms: Some(700),
     });
     let policy = RendererPolicy {
+        surface: None,
         idle_seconds: Some(45),
         transitions_enabled: Some(true),
         sand: Some(SandPolicy {
@@ -443,12 +444,12 @@ fn response_goldens() {
             r#""source_kinds":["static","video","we"],"#,
             r#""video_engines":["default","tinier"],"#,
             r#""fill_modes":["fill","fit","stretch","center","tile","span"],"#,
-            r#""layers":["background","bottom","top"],"#,
+            r#""layers":["background","bottom","top","overlay"],"#,
             r#""controls":{"pause":true,"audio":true},"#,
             r#""transitions":{"startup_source_kinds":["video","we"],"#,
             r#""static_overlay":true,"default_effect":"fade","default_duration_ms":600,"#,
             r#""min_duration_ms":50,"max_duration_ms":10000},"#,
-            r#""renderer_policy":{"idle":true,"sand":true,"scene":true,"output_fps":true},"#,
+            r#""renderer_policy":{"surface":true,"idle":true,"sand":true,"scene":true,"output_fps":true},"#,
             r#""wallpaper_engine":{"project_types":["scene","video"],"#,
             r#""rejected_project_types":["web","application"],"scene":{"#,
             r#""renderer":"native-vulkan","supported":["image-layers","effect-chains","cross-layer-render-targets","particles","puppet-skeletons","scene-audio-mixing","user-properties"],"#,
@@ -593,4 +594,36 @@ fn scene_properties_round_trip() {
     assert_eq!(properties.get("fade").unwrap(), &serde_json::json!(0.5));
     let encoded = serde_json::to_string(&apply.assignments[0].source).unwrap();
     assert!(encoded.contains(r#""properties":{"fade":0.5,"tint":"1 0 0"}"#), "{encoded}");
+}
+
+#[test]
+fn surface_policy_validates_effects_and_supported_backends() {
+    let mut request = ApplyRequest {
+        assignments: vec![Assignment::new(
+            vec!["DP-1".into()],
+            Source::video("/wall/clip.mp4", None),
+        )],
+        replace_all: true,
+        policy: Some(RendererPolicy {
+            surface: Some(Box::new(SurfacePolicy {
+                namespace: "skwd-paper-backdrop".into(),
+                blur: 12,
+                dim: 30,
+            })),
+            ..Default::default()
+        }),
+    };
+    assert!(request.validate().is_ok());
+    let encoded = serde_json::to_string(&request).unwrap();
+    assert_eq!(serde_json::from_str::<ApplyRequest>(&encoded).unwrap(), request);
+    request.policy.as_mut().unwrap().surface.as_mut().unwrap().dim = 101;
+    assert_eq!(request.validate(), Err(ValidationError::InvalidSurfacePolicy));
+    request.policy.as_mut().unwrap().surface.as_mut().unwrap().dim = 30;
+    request.assignments[0].source = Source::tinier_video("/wall/clip.ivf", "30");
+    request.assignments[0].layer = Layer::Background;
+    assert_eq!(request.validate(), Err(ValidationError::InvalidSurfacePolicy));
+    request.assignments[0].source = Source::wallpaper_engine("/wall/scene");
+    assert!(request.validate().is_ok());
+    request.policy.as_mut().unwrap().surface.as_mut().unwrap().namespace = "bad\nnamespace".into();
+    assert_eq!(request.validate(), Err(ValidationError::InvalidSurfacePolicy));
 }

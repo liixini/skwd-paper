@@ -2209,6 +2209,7 @@ fn build_presenter(
     };
     let direct_scene_copy = !exports[0].direct_render
         && renderer.scene_export_blit_supported()
+        && !crate::surface::needs_shader()
         && std::env::var("SKWD_VK_SCENE_DIRECT_COPY").as_deref() != Ok("0");
     let rts = if direct_scene_copy {
         Vec::new()

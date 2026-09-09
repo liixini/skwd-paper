@@ -35,6 +35,7 @@ pub enum Layer {
     Background,
     Bottom,
     Top,
+    Overlay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,7 +131,18 @@ pub struct ScenePolicy {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfacePolicy {
+    pub namespace: String,
+    #[serde(default)]
+    pub blur: u32,
+    #[serde(default)]
+    pub dim: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendererPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<Box<SurfacePolicy>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,6 +157,15 @@ pub struct RendererPolicy {
 
 impl RendererPolicy {
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.surface.as_ref().is_some_and(|surface| {
+            surface.namespace.trim().is_empty()
+                || surface.namespace.len() > 128
+                || surface.namespace.chars().any(char::is_control)
+                || surface.blur > 100
+                || surface.dim > 100
+        }) {
+            return Err(ValidationError::InvalidSurfacePolicy);
+        }
         if let Some(fps) = self.sand.as_ref().and_then(|sand| sand.fps)
             && !(1..=1000).contains(&fps)
         {
@@ -429,6 +450,14 @@ impl ApplyRequest {
         }
         if let Some(policy) = &self.policy {
             policy.validate()?;
+            if policy.surface.is_some()
+                && self.assignments.iter().any(|assignment| {
+                    assignment.source.effective_video_engine() == Some(VideoEngine::Tinier)
+                        || assignment.transition.is_some()
+                })
+            {
+                return Err(ValidationError::InvalidSurfacePolicy);
+            }
             if policy.transitions_enabled == Some(false)
                 && self.assignments.iter().any(|assignment| assignment.transition.is_some())
             {
@@ -660,6 +689,8 @@ pub struct TransitionCapabilities {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendererPolicyCapabilities {
+    #[serde(default)]
+    pub surface: bool,
     pub idle: bool,
     pub sand: bool,
     pub scene: bool,
@@ -772,7 +803,7 @@ impl CapabilitiesResult {
             source_kinds: vec![SourceKind::Static, SourceKind::Video, SourceKind::WallpaperEngine],
             video_engines: vec![VideoEngine::Default, VideoEngine::Tinier],
             fill_modes: FillMode::ALL.to_vec(),
-            layers: vec![Layer::Background, Layer::Bottom, Layer::Top],
+            layers: vec![Layer::Background, Layer::Bottom, Layer::Top, Layer::Overlay],
             controls: ControlCapabilities { pause: true, audio: true },
             transitions: TransitionCapabilities {
                 startup_source_kinds: vec![SourceKind::Video, SourceKind::WallpaperEngine],
@@ -783,6 +814,7 @@ impl CapabilitiesResult {
                 max_duration_ms: 10_000,
             },
             renderer_policy: RendererPolicyCapabilities {
+                surface: true,
                 idle: true,
                 sand: true,
                 scene: true,
@@ -883,6 +915,7 @@ pub type CapabilitiesResponse = Response<CapabilitiesResult>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    InvalidSurfacePolicy,
     EmptyAssignments,
     AssignmentWithoutOutputs,
     EmptyOutput,
@@ -927,6 +960,9 @@ pub enum ValidationError {
 impl Display for ValidationError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSurfacePolicy => {
+                formatter.write_str("invalid or unsupported surface policy")
+            }
             Self::EmptyAssignments => formatter.write_str("apply requires at least one assignment"),
             Self::AssignmentWithoutOutputs => {
                 formatter.write_str("each assignment requires at least one output")

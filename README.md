@@ -121,6 +121,9 @@ Repository for the wayland wallpaper daemon Skwd-paper, which can be used comple
 | Background (default) | `--layer background` | Behind desktop windows; required for static images and Tinier |
 | Bottom | `--layer bottom` | Above the background layer, below normal windows; video and scenes |
 | Top | `--layer top` | Above normal windows; video and scenes |
+| Overlay | `--layer overlay` | Above top-layer surfaces; video and scenes |
+
+The direct `skwd-wall-vk` compatibility command defaults to `bottom`. Elevated video and scene surfaces pass pointer input through to the desktop.
 
 ## Other apply options
 
@@ -135,6 +138,11 @@ Repository for the wayland wallpaper daemon Skwd-paper, which can be used comple
 | JSON manifest from a file; maximum 1 MiB | `--manifest @wallpapers.json` |
 | JSON manifest from stdin; maximum 1 MiB | `--manifest -` |
 | JSON manifest inline; maximum 1 MiB | `--manifest '{"assignments":[{"outputs":["DP-1"],"source":{"kind":"static","path":"image.jpg"}}]}'` |
+
+
+A manifest can set `policy.surface` to `{"namespace":"skwd-paper-backdrop","blur":12,"dim":20}` for a separate overview surface. Blur and dimming range from 0 to 100 and work with images, default-engine videos, and native Wallpaper Engine scenes. Surface policies keep video players resident when paused so playback resumes from the same position. They do not support transitions or the tinier engine. Set `replace_all` when changing the policy.
+
+Use a separate `SKWD_PAPER_V2_SOCKET` for an independently controlled backdrop. Apply, pause, resume, and stop then affect only that instance.
 
 ## Control
 

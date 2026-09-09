@@ -309,15 +309,18 @@ impl Renderer {
         struct BlitPush {
             uv: [f32; 4],
             fill: i32,
+            blur: f32,
+            dim: f32,
         }
-        let push = BlitPush { uv, fill: crate::fill_flag() };
+        let (blur, dim) = crate::surface::effects();
+        let push = BlitPush { uv, fill: crate::fill_flag(), blur, dim };
         unsafe {
             self.device.cmd_push_constants(
                 self.cmd,
                 self.pipeline_layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
-                std::slice::from_raw_parts((&raw const push).cast(), 20),
+                std::slice::from_raw_parts((&raw const push).cast(), 28),
             );
         }
     }

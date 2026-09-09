@@ -218,6 +218,7 @@ impl App {
                 PaperLayer::Background => WaylandLayer::Background,
                 PaperLayer::Bottom => WaylandLayer::Bottom,
                 PaperLayer::Top => WaylandLayer::Top,
+                PaperLayer::Overlay => WaylandLayer::Overlay,
             },
             self.namespace.clone(),
             &self.qh,

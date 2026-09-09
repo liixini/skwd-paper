@@ -206,6 +206,7 @@ const fn protocol_layer(layer: LayerArg) -> Layer {
         LayerArg::Background => Layer::Background,
         LayerArg::Bottom => Layer::Bottom,
         LayerArg::Top => Layer::Top,
+        LayerArg::Overlay => Layer::Overlay,
     }
 }
 

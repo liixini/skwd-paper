@@ -14,6 +14,7 @@ mod probe;
 mod sandbox;
 #[cfg(feature = "shared-device")]
 mod shared;
+mod surface;
 mod timing;
 mod vk;
 mod wayland;

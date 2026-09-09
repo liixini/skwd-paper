@@ -155,6 +155,7 @@ pub(crate) enum LayerArg {
     Background,
     Bottom,
     Top,
+    Overlay,
 }
 
 impl Cli {

@@ -444,6 +444,7 @@ fn policy_inheritance() {
     block_on(async {
         let mut fixture = Fixture::new();
         let policy = RendererPolicy {
+            surface: None,
             idle_seconds: Some(30),
             transitions_enabled: Some(true),
             sand: Some(SandPolicy {
@@ -656,5 +657,43 @@ fn failed_steady_spawn_retires_the_held_overlay_on_rollback() {
         assert!(transaction.prepare_next().is_err());
         transaction.rollback().await;
         assert_eq!(fixture.manager.status()[0].pid, initial[0].pid);
+    });
+}
+
+#[test]
+fn overview_surface_pause_retains_video_player() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let project = fixture.directory.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("project.json"), r#"{"type":"video","file":"clip.mp4"}"#)
+            .unwrap();
+        std::fs::write(project.join("clip.mp4"), []).unwrap();
+        for source in [
+            Source::video("/wall/clip.mp4", None),
+            Source::wallpaper_engine(project.display().to_string()),
+        ] {
+            let mut request = apply(vec![assignment("DP-1", source)], true);
+            request.policy = Some(RendererPolicy {
+                surface: Some(Box::new(paper_control::SurfacePolicy {
+                    namespace: "skwd-paper-backdrop".into(),
+                    blur: 12,
+                    dim: 20,
+                })),
+                ..Default::default()
+            });
+            let initial = fixture.commit(&request).await;
+            for _ in 0..3 {
+                assert!(fixture.manager.begin_pause(&fixture.socket).await.unwrap().is_none());
+                assert!(fixture.manager.paused());
+                assert_eq!(fixture.manager.status()[0].pid, initial[0].pid);
+                assert!(fixture.manager.begin_resume(&fixture.socket).await.unwrap().is_none());
+                assert!(!fixture.manager.paused());
+                assert_eq!(fixture.manager.status()[0].pid, initial[0].pid);
+            }
+            let commands = wait_log(fixture.directory.path(), "stdin", initial[0].pid, "false");
+            assert!(commands.contains("true"));
+            assert!(!commands.contains("freeze"));
+        }
     });
 }

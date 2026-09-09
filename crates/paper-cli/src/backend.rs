@@ -365,7 +365,9 @@ impl BackendPaths {
             child,
             pid,
             physical_dynamic,
-            freeze_capable: freeze_capable && !overlay,
+            freeze_capable: freeze_capable
+                && !overlay
+                && policy.is_none_or(|policy| policy.surface.is_none()),
             retain_capable,
             stdin: Some(stdin),
             _freeze_directory: freeze_directory,
@@ -581,6 +583,9 @@ fn scene_properties_arg(source: &Source) -> Option<String> {
 
 fn clear_policy_env(command: &mut Command) {
     for key in [
+        "SKWD_PAPER_NAMESPACE",
+        "SKWD_PAPER_BLUR",
+        "SKWD_PAPER_DIM",
         "SKWD_PAPER_IDLE_SEC",
         "SKWD_PAPER_TRANSITIONS",
         "SKWD_PAPER_SAND_QUALITY",
@@ -611,6 +616,16 @@ pub(crate) fn transition_source(source: &Source) -> Result<String> {
 }
 
 fn apply_policy(command: &mut Command, policy: &RendererPolicy) {
+    if let Some(surface) = &policy.surface {
+        command.env("SKWD_VK_INPUT", "passthrough");
+        command.env_remove("SKWD_VK_LAYER");
+        command.env("SKWD_PAPER_NAMESPACE", &surface.namespace);
+        command.env("SKWD_PAPER_BLUR", surface.blur.to_string());
+        command.env("SKWD_PAPER_DIM", surface.dim.to_string());
+        command.arg("--namespace").arg(&surface.namespace);
+        command.arg("--blur").arg(surface.blur.to_string());
+        command.arg("--dim").arg(surface.dim.to_string());
+    }
     if let Some(seconds) = policy.idle_seconds {
         command.env("SKWD_PAPER_IDLE_SEC", seconds.to_string());
     }
@@ -1016,6 +1031,7 @@ const fn layer(layer: Layer) -> &'static str {
         Layer::Background => "background",
         Layer::Bottom => "bottom",
         Layer::Top => "top",
+        Layer::Overlay => "overlay",
     }
 }
 

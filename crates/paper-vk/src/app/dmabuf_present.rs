@@ -1290,7 +1290,8 @@ fn run_shared_dmabuf_with_readiness(
     } else {
         (create_buffers(target, &render_dims, &exports, &ridx)?, None)
     };
-    let hybrid_allowed = std::env::var("SKWD_VK_HYBRID_NV12").as_deref() != Ok("0")
+    let hybrid_allowed = !crate::surface::needs_shader()
+        && std::env::var("SKWD_VK_HYBRID_NV12").as_deref() != Ok("0")
         && pattern.is_none()
         && !shm_present
         && !sd.software

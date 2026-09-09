@@ -20,8 +20,8 @@ pub use protocol::{
     RendererPolicy, RendererPolicyCapabilities, RendererReady, Request, RequestParams, Response,
     ResponseBody, ResponseError, RuntimeDependencyStatus, SandPolicy, SandQuality, SandScope,
     ScenePolicy, Source, SourceKind, StatusRequest, StatusResponse, StatusResult, StopRequest,
-    StopResponse, StopResult, TransitionCapabilities, TransitionPolicy, ValidationError,
-    VideoEngine, WallpaperEngineCapabilities, decode_ndjson, encode_ndjson,
+    StopResponse, StopResult, SurfacePolicy, TransitionCapabilities, TransitionPolicy,
+    ValidationError, VideoEngine, WallpaperEngineCapabilities, decode_ndjson, encode_ndjson,
 };
 pub use socket::{
     signal_paper_failed, signal_paper_failed_generation_to, signal_paper_ready,

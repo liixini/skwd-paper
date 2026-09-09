@@ -82,6 +82,7 @@ pub struct App {
 }
 
 pub struct Target {
+    pub layer: wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer,
     pub conn: Connection,
     pub queue: EventQueue<App>,
     pub app: App,

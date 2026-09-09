@@ -371,3 +371,30 @@ fn scene_properties_populated() {
         Some(r#"{"tint":"1 0 0"}"#)
     );
 }
+
+#[test]
+fn backdrop_surface_reaches_still_and_vulkan_workers() {
+    let mut command = Command::new("renderer");
+    super::apply_policy(
+        &mut command,
+        &RendererPolicy {
+            surface: Some(Box::new(paper_control::SurfacePolicy {
+                namespace: "skwd-paper-backdrop".into(),
+                blur: 18,
+                dim: 25,
+            })),
+            ..Default::default()
+        },
+    );
+    let (_, args) = command_parts(command.as_std());
+    assert_eq!(args, ["--namespace", "skwd-paper-backdrop", "--blur", "18", "--dim", "25"]);
+    let env: std::collections::BTreeMap<_, _> = command.as_std().get_envs().collect();
+    for (key, value) in [
+        ("SKWD_PAPER_NAMESPACE", "skwd-paper-backdrop"),
+        ("SKWD_PAPER_BLUR", "18"),
+        ("SKWD_PAPER_DIM", "25"),
+        ("SKWD_VK_INPUT", "passthrough"),
+    ] {
+        assert_eq!(env[std::ffi::OsStr::new(key)], Some(std::ffi::OsStr::new(value)));
+    }
+}

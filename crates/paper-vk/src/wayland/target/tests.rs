@@ -147,3 +147,18 @@ fn reexec_argv_skips_noncanonical_shapes() {
     let out = super::rebuild_argv(&args, &super::ReexecSource::Video("/new.mp4"));
     assert_eq!(out, args, "a leading flag means argv[2] is not the media path");
 }
+
+#[test]
+fn wallpaper_layer_choices_and_default() {
+    use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+    for (name, layer) in [
+        ("background", Layer::Background),
+        ("bottom", Layer::Bottom),
+        ("top", Layer::Top),
+        ("overlay", Layer::Overlay),
+    ] {
+        assert_eq!(super::parse_layer(Some(name)).unwrap(), layer);
+    }
+    assert_eq!(super::parse_layer(None).unwrap(), Layer::Bottom);
+    assert!(super::parse_layer(Some("invalid")).is_err());
+}

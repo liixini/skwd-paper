@@ -109,14 +109,14 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
     }
 
     let layer_pick = std::env::var("SKWD_VK_LAYER").ok().or_else(|| layer_arg.map(String::from));
-    let vk_layer = match layer_pick.as_deref() {
-        Some("top") => zwlr_layer_shell_v1::Layer::Top,
-        Some("bottom") => zwlr_layer_shell_v1::Layer::Bottom,
-        _ => zwlr_layer_shell_v1::Layer::Background,
-    };
-    let input_passthrough = input_passthrough();
+    let vk_layer = parse_layer(layer_pick.as_deref())?;
+    let input_passthrough = input_passthrough()
+        || matches!(
+            vk_layer,
+            zwlr_layer_shell_v1::Layer::Top | zwlr_layer_shell_v1::Layer::Overlay
+        );
     if input_passthrough {
-        tracing::info!("skwd-wall-vk: KWin input passthrough enabled");
+        tracing::info!("skwd-wall-vk: input passthrough enabled");
     }
     for (si, (output, name, scale, mode)) in picked.iter().enumerate() {
         let surface = compositor.create_surface(&qh, ());
@@ -124,7 +124,7 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
             &surface,
             Some(output),
             vk_layer,
-            "skwd-wall-vk".into(),
+            std::env::var("SKWD_PAPER_NAMESPACE").unwrap_or_else(|_| "skwd-wall-vk".into()),
             &qh,
             si,
         );
@@ -175,7 +175,20 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
     if app.closed || app.surfaces.iter().all(|surf| surf.closed || surf.width == 0) {
         return Err(anyhow!("layer surface closed or zero size"));
     }
-    Ok(Target { conn, queue, app, ctl_fd: None })
+    Ok(Target { conn, queue, app, layer: vk_layer, ctl_fd: None })
+}
+
+fn parse_layer(value: Option<&str>) -> Result<zwlr_layer_shell_v1::Layer> {
+    use zwlr_layer_shell_v1::Layer;
+    match value.unwrap_or("bottom") {
+        "background" => Ok(Layer::Background),
+        "bottom" => Ok(Layer::Bottom),
+        "top" => Ok(Layer::Top),
+        "overlay" => Ok(Layer::Overlay),
+        other => {
+            Err(anyhow!("unknown layer {other:?}; expected background, bottom, top, or overlay"))
+        }
+    }
 }
 
 fn input_passthrough() -> bool {

@@ -23,7 +23,8 @@ fn layer_parser() {
     assert_eq!(parse_layer("background"), Ok(paper_control::Layer::Background));
     assert_eq!(parse_layer("bottom"), Ok(paper_control::Layer::Bottom));
     assert_eq!(parse_layer("top"), Ok(paper_control::Layer::Top));
-    assert!(parse_layer("overlay").is_err());
+    assert_eq!(parse_layer("overlay"), Ok(paper_control::Layer::Overlay));
+    assert!(parse_layer("invalid").is_err());
 }
 
 #[test]
