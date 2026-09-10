@@ -17,6 +17,7 @@ pub struct Totals {
     pub with_particles: usize,
     pub with_puppet: usize,
     pub with_audio: usize,
+    pub with_scripts: usize,
     pub with_parallax: usize,
     pub with_sound_objects: usize,
     pub sound_objects: usize,
@@ -92,6 +93,9 @@ fn record(totals: &mut Totals, id: &str, features: SceneFeatures, sound: &SoundI
     }
     if features.audio {
         totals.with_audio += 1;
+    }
+    if features.scripts > 0 {
+        totals.with_scripts += 1;
     }
     if features.parallax {
         totals.with_parallax += 1;
@@ -258,7 +262,12 @@ pub fn audit_workshop(root: &Path) -> Totals {
                     totals.pkg_versions.insert(pkg.version().to_string(), 1);
                 }
                 match scene::extract(&pkg) {
-                    Ok(features) => {
+                    Ok(mut features) => {
+                        features.audio |= project
+                            .get("general")
+                            .and_then(|general| general.get("supportsaudioprocessing"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
                         let sound = crate::sound::sound_inventory(&pkg).unwrap_or_default();
                         record(&mut totals, &id, features, &sound);
                     }
@@ -316,12 +325,13 @@ pub fn render_markdown(totals: &Totals) -> String {
     );
     let _ = writeln!(
         out,
-        "\nfeature incidence (scenes): effects={} shared-effects={} particles={} puppet={} audio={} parallax={} sound-objects={} gif-tex={} video-tex={}",
+        "\nfeature incidence (scenes): effects={} shared-effects={} particles={} puppet={} audio={} scripts={} parallax={} sound-objects={} gif-tex={} video-tex={}",
         totals.with_effects,
         totals.with_shared_effects,
         totals.with_particles,
         totals.with_puppet,
         totals.with_audio,
+        totals.with_scripts,
         totals.with_parallax,
         totals.with_sound_objects,
         totals.with_tex_gif,

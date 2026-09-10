@@ -95,6 +95,55 @@ class CompetitorSweepTests(unittest.TestCase):
             self.assertEqual(scenario.extra["comparison"], "matched-resolution")
             self.assertEqual(scenario.extra["resolution_label"], "1080p")
 
+    def test_motion_validation_uses_only_outputs_with_active_media(self):
+        extra = {"active_wallpaper_outputs": ["DP-3"]}
+        expected_outputs = ["DP-1", "DP-2", "DP-3"]
+        self.assertEqual(
+            self.module.motion_validation_outputs(extra, expected_outputs),
+            ["DP-3"],
+        )
+        scenario = self.module.Scenario(
+            "single video", "phonto", "video", "single", "/video.mp4"
+        )
+        self.assertEqual(
+            self.module.scenario_media_outputs(
+                scenario, "DP-3", ["DP-1", "DP-2", "DP-3"]
+            ),
+            ["DP-3"],
+        )
+
+    def test_video_and_wallpaper_engine_scenes_require_motion_validation(self):
+        video = self.module.Scenario(
+            "video", "skwd-wall-vk", "video", "single", "/video.mp4"
+        )
+        scene = self.module.Scenario(
+            "scene", "skwd-wall-vk", "we", "single", "/scene"
+        )
+        static = self.module.Scenario(
+            "static", "skwd-wall-still", "static", "single", "/image.webp"
+        )
+        self.assertTrue(self.module.requires_motion_validation(video))
+        self.assertTrue(self.module.requires_motion_validation(scene))
+        self.assertFalse(self.module.requires_motion_validation(static))
+
+    def test_validation_baseline_activates_every_mapped_output(self):
+        original = self.module.VALIDATION_WORKSPACES
+        self.module.VALIDATION_WORKSPACES = {
+            "DP-1": "perf-one",
+            "DP-3": "perf-three",
+        }
+        try:
+            with mock.patch.object(
+                self.module, "prepare_validation_output"
+            ) as prepare:
+                self.module.activate_validation_baseline(["DP-1", "DP-2", "DP-3"])
+        finally:
+            self.module.VALIDATION_WORKSPACES = original
+        self.assertEqual(
+            prepare.call_args_list,
+            [mock.call("DP-1"), mock.call("DP-3")],
+        )
+
     def test_wallr_uses_isolated_config_and_explicit_targeting(self):
         scenario = self.module.build_resolution_matrix(
             "1080p", "/video/matched-1080p.av1.mp4"
@@ -172,6 +221,7 @@ class CompetitorSweepTests(unittest.TestCase):
             ["DP-3", "DP-1", "DP-2"],
         )
         self.assertEqual(command.count("--screen-root"), 3)
+        self.assertEqual(command[command.index("--layer") + 1], "background")
         self.assertEqual(command[-1], "2165290843")
 
     def test_phonto_uses_explicit_outputs_and_reuses_the_source(self):
@@ -257,6 +307,12 @@ class CompetitorSweepTests(unittest.TestCase):
             ["--frame-rate", "60"],
         )
 
+    def test_compatibility_library_path_can_extend_an_existing_path(self):
+        env = {"LD_LIBRARY_PATH": "/system/libs", "UNCHANGED": "yes"}
+        self.module.prepend_library_path(env, "/compat/libs")
+        self.assertEqual(env["LD_LIBRARY_PATH"], "/compat/libs:/system/libs")
+        self.assertEqual(env["UNCHANGED"], "yes")
+
     def test_yin_socket_cleanup_only_removes_sockets(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "yin"
@@ -323,6 +379,8 @@ class CompetitorSweepTests(unittest.TestCase):
         ), mock.patch.object(
             self.module, "frame_content_signature", side_effect=signatures
         ), mock.patch.object(
+            self.module, "require_empty_active_workspace"
+        ), mock.patch.object(
             self.module.time, "sleep"
         ):
             with self.assertRaisesRegex(RuntimeError, "blank or near-black"):
@@ -344,6 +402,8 @@ class CompetitorSweepTests(unittest.TestCase):
             self.module, "wait_for_stable_file"
         ), mock.patch.object(
             self.module, "frame_content_signature", side_effect=signatures
+        ), mock.patch.object(
+            self.module, "require_empty_active_workspace"
         ), mock.patch.object(
             self.module.time, "sleep"
         ):
@@ -369,6 +429,16 @@ class CompetitorSweepTests(unittest.TestCase):
         with mock.patch.object(self.module.subprocess, "run", return_value=queried):
             with self.assertRaisesRegex(RuntimeError, "empty active workspace"):
                 self.module.require_empty_active_workspace("DP-3")
+
+    def test_validation_workspace_mapping_is_explicit(self):
+        self.assertEqual(
+            self.module.parse_validation_workspaces(
+                ["DP-3=skwd-perf-dp3", "DP-2=skwd-perf-dp2"]
+            ),
+            {"DP-3": "skwd-perf-dp3", "DP-2": "skwd-perf-dp2"},
+        )
+        with self.assertRaisesRegex(ValueError, "expected OUTPUT=NAME"):
+            self.module.parse_validation_workspaces(["skwd-perf-dp3"])
 
     def test_scenario_returns_visual_validation_failure_as_result(self):
         scenario = self.module.build_resolution_matrix(
@@ -407,11 +477,115 @@ class CompetitorSweepTests(unittest.TestCase):
             self.module.VALIDATE_MOTION = True
             try:
                 result = self.module.run_scenario(
-                    scenario, floor, profile, "DP-3", ["DP-3"], 456
+                    scenario,
+                    floor,
+                    profile,
+                    "DP-3",
+                    ["DP-3"],
+                    456,
+                    {"snapshot": {}, "spread": {}, "samples": []},
                 )
             finally:
                 self.module.VALIDATE_MOTION = previous
         self.assertEqual(result["error"], "video validation failed")
+
+    def test_snapshot_summary_uses_median_and_records_spread(self):
+        samples = [
+            {"rss": 100, "pss": 80, "vram": 500},
+            {"rss": 101, "pss": 80, "vram": 500},
+            {"rss": 100, "pss": 81, "vram": 500},
+            {"rss": 100, "pss": 80, "vram": 500},
+            {"rss": 100, "pss": 80, "vram": 500},
+        ]
+        summary = self.module.summarize_snapshots(samples)
+        self.assertEqual(
+            summary["snapshot"], {"rss": 100, "pss": 80, "vram": 500}
+        )
+        self.assertEqual(summary["spread"], {"rss": 1, "pss": 1, "vram": 0})
+        self.assertTrue(self.module.compositor_snapshot_is_stable(summary))
+
+    def test_compositor_recovery_rejects_cross_row_carry_over(self):
+        before = {"rss": 180, "pss": 150, "vram": 900}
+        recovered = {"rss": 188, "pss": 158, "vram": 916}
+        poisoned = {"rss": 287, "pss": 257, "vram": 916}
+        self.assertTrue(self.module.compositor_baseline_recovered(before, recovered))
+        self.assertFalse(self.module.compositor_baseline_recovered(before, poisoned))
+
+    def test_clean_baseline_settles_memory_before_sampling_idle_floor(self):
+        events = []
+        compositor = {
+            "snapshot": {"rss": 180, "pss": 150, "vram": 900},
+            "spread": {"rss": 0, "pss": 0, "vram": 0},
+            "samples": [],
+        }
+
+        def clean():
+            events.append("cleanup")
+
+        def stable(_pid):
+            events.append("memory")
+            return compositor
+
+        def floor(_profile, _pid):
+            events.append("idle floor")
+            return (1.0, 40.0, 2.0)
+
+        with mock.patch.object(
+            self.module, "require_clean_wallpaper_state", side_effect=clean
+        ), mock.patch.object(
+            self.module, "stable_compositor_snapshot", side_effect=stable
+        ), mock.patch.object(
+            self.module.P, "idle_floor", side_effect=floor
+        ), mock.patch.object(
+            self.module, "wallpaper_processes", return_value={}
+        ), mock.patch.object(
+            self.module, "wallpaper_layers", return_value=[]
+        ):
+            sampled_floor, sampled_compositor = self.module.clean_compositor_baseline(
+                456, {"window": 1.0, "hz": 1.0}
+            )
+
+        self.assertEqual(events, ["cleanup", "memory", "idle floor"])
+        self.assertEqual(sampled_floor, (1.0, 40.0, 2.0))
+        self.assertIs(sampled_compositor, compositor)
+
+    def test_baseline_metrics_use_bracketed_idle_and_memory_floors(self):
+        before = {
+            "snapshot": {"rss": 100, "pss": 80, "vram": 500},
+            "spread": {"rss": 0, "pss": 0, "vram": 0},
+            "samples": [],
+        }
+        after = {
+            "snapshot": {"rss": 102, "pss": 82, "vram": 516},
+            "spread": {"rss": 0, "pss": 0, "vram": 0},
+            "samples": [],
+        }
+        result = {
+            "gpu_mean": 5.0,
+            "power_mean": 45.0,
+            "pss": 100,
+            "compositor": {"rss": 130, "pss": 95, "vram": 540, "cpu": 5.0},
+        }
+        self.module.finalize_baseline_metrics(
+            result, before, after, (1.0, 40.0, 2.0), (1.5, 42.0, 3.0)
+        )
+        self.assertEqual(result["compositor"]["rss_delta"], 29.0)
+        self.assertEqual(result["compositor"]["pss_delta"], 14.0)
+        self.assertEqual(result["compositor"]["vram_delta"], 32.0)
+        self.assertEqual(result["combined_pss"], 114.0)
+        self.assertEqual(result["gpu_delta"], 3.8)
+        self.assertEqual(result["power_delta"], 4.0)
+        self.assertTrue(all(result["baseline"]["qualified"].values()))
+
+    def test_cleanup_terminates_existing_wallpapers(self):
+        running = {"mpvpaper": [123], "wallr": [456]}
+        with mock.patch.object(
+            self.module, "wallpaper_processes", side_effect=[running, {}]
+        ), mock.patch.object(self.module, "signal_wallpaper_processes") as signal_all, mock.patch.object(
+            self.module.time, "sleep"
+        ):
+            self.module.kill_running_wallpapers()
+        signal_all.assert_called_once_with(running, self.module.signal.SIGTERM)
 
     def test_pmon_vram_includes_graphics_and_compute_processes(self):
         output = """# gpu pid type fb ccpm command

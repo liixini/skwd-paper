@@ -84,7 +84,7 @@ fn nodes(model: &SceneModel) -> Vec<OwnedNode> {
             local_targets: layer
                 .effects
                 .iter()
-                .flat_map(|effect| effect.fbos.iter().map(|(name, _)| name.clone()))
+                .flat_map(|effect| effect.fbos.iter().map(|fbo| fbo.name.clone()))
                 .collect(),
             binds: layer
                 .effects
@@ -162,17 +162,18 @@ fn main() {
             .iter()
             .flat_map(|node| &node.binds)
             .flatten()
-            .filter(|(_, binding)| matches!(binding, EffectBind::SceneSoFar))
+            .filter(|(_, binding)| {
+                matches!(binding, EffectBind::SceneSoFar | EffectBind::SceneUnderLayer)
+            })
             .count();
         if runtime_full > 0 {
             scene_snapshot_scenes.insert(id.clone());
             let count = owned
                 .iter()
                 .filter(|node| {
-                    node.binds
-                        .iter()
-                        .flatten()
-                        .any(|(_, binding)| matches!(binding, EffectBind::SceneSoFar))
+                    node.binds.iter().flatten().any(|(_, binding)| {
+                        matches!(binding, EffectBind::SceneSoFar | EffectBind::SceneUnderLayer)
+                    })
                 })
                 .map(|node| {
                     model
@@ -208,6 +209,7 @@ fn main() {
                 binds: &node.binds,
                 dynamic: false,
                 prefix_dynamic: false,
+                passthrough: false,
             })
             .collect();
         let active_ids: BTreeSet<&str> = borrowed.iter().map(|node| node.id).collect();

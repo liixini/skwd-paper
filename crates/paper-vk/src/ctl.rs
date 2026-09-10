@@ -53,6 +53,7 @@ pub struct Ctl {
     pub volume: u32,
     pub paused: bool,
     freeze: Option<String>,
+    capture: Option<paper_control::SceneCapture>,
     wake: Option<paper_runtime::wake::Pipe>,
 }
 
@@ -111,12 +112,21 @@ impl Ctl {
         }
         let audio =
             with_audio.then(|| AudioSink::Media(paper_audio::GatedAudio::new(video, mute, volume)));
-        Self { rx, audio, mute, volume, paused: false, freeze: None, wake }
+        Self { rx, audio, mute, volume, paused: false, freeze: None, capture: None, wake }
     }
 
     #[cfg(test)]
     fn with_receiver(rx: std::sync::mpsc::Receiver<PaperCommand>) -> Self {
-        Self { rx, audio: None, mute: true, volume: 80, paused: false, freeze: None, wake: None }
+        Self {
+            rx,
+            audio: None,
+            mute: true,
+            volume: 80,
+            paused: false,
+            freeze: None,
+            capture: None,
+            wake: None,
+        }
     }
 
     pub fn from_channel(
@@ -130,7 +140,7 @@ impl Ctl {
         let volume = volume.min(100);
         let audio =
             with_audio.then(|| AudioSink::Media(paper_audio::GatedAudio::new(video, mute, volume)));
-        Self { rx, audio, mute, volume, paused: false, freeze: None, wake }
+        Self { rx, audio, mute, volume, paused: false, freeze: None, capture: None, wake }
     }
 
     pub fn set_scene_voices(&mut self, voices: Vec<paper_audio::Voice>) {
@@ -195,7 +205,15 @@ impl Ctl {
         }
     }
 
-    fn reduce(&mut self, cmd: PaperCommand) -> Option<SwapReq> {
+    pub fn take_capture(&mut self) -> Option<paper_control::SceneCapture> {
+        self.capture.take()
+    }
+
+    fn reduce(&mut self, mut cmd: PaperCommand) -> Option<SwapReq> {
+        if let Some(capture) = cmd.capture.take() {
+            self.capture = Some(capture);
+            return None;
+        }
         match paper_control::classify_command(cmd) {
             paper_control::CommandClass::Freeze(path) => {
                 tracing::info!(path, "skwd-wall-vk: freeze frame requested");

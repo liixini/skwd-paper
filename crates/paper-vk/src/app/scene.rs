@@ -51,6 +51,9 @@ struct LayerFx {
     verts: vk::QuadBuffer,
     inputs: Vec<Vec<usize>>,
     fbos: Vec<(String, FxTargetStorage)>,
+    fbo_owners: Vec<Option<usize>>,
+    remap: Vec<std::cell::Cell<usize>>,
+    swaps: Vec<(Option<usize>, usize, usize)>,
     pass_targets: Vec<Option<String>>,
     binds: Vec<Vec<(usize, EffectBind)>>,
     owner: Vec<usize>,
@@ -60,7 +63,36 @@ struct LayerFx {
     dependency_dynamic: bool,
     retain_targets: bool,
     snapshot: bool,
+    passthrough: bool,
+    snapshot_slot: Option<usize>,
+    crop: Option<FxTargetStorage>,
+    crop_quad: Option<vk::SceneQuad>,
+    fallback_tint: [f32; 4],
     sampled_targets: BTreeSet<CompositeBuffer>,
+    uniforms: std::collections::BTreeMap<String, Vec<f32>>,
+}
+
+struct LiveText {
+    slot: usize,
+    prepared: paper_scene::text::Prepared,
+    shown: String,
+}
+
+struct LayerAnimation {
+    quad: usize,
+    frames: Vec<paper_scene::model::SpriteFrame>,
+    total: f32,
+}
+
+fn frame_uv(frames: &[paper_scene::model::SpriteFrame], total: f32, time: f32) -> [f32; 4] {
+    let mut cursor = if total > 0.0 { time.rem_euclid(total) } else { 0.0 };
+    for frame in frames {
+        if cursor < frame.time {
+            return frame.uv;
+        }
+        cursor -= frame.time;
+    }
+    frames.last().map_or([0.0, 0.0, 1.0, 1.0], |frame| frame.uv)
 }
 
 struct PuppetGroup {
@@ -125,11 +157,29 @@ struct FxTargetClass {
     width: u32,
     height: u32,
     repeat: bool,
+    format: i32,
 }
 
 impl FxTargetClass {
     fn of(target: &vk::SceneTarget) -> Self {
-        Self { width: target.extent.width, height: target.extent.height, repeat: target.repeat }
+        Self {
+            width: target.extent.width,
+            height: target.extent.height,
+            repeat: target.repeat,
+            format: target.format.as_raw(),
+        }
+    }
+}
+
+fn vk_format(format: paper_scene::effects::FboFormat) -> ash::vk::Format {
+    use paper_scene::effects::FboFormat;
+    match format {
+        FboFormat::Rgba8 => ash::vk::Format::R8G8B8A8_UNORM,
+        FboFormat::R8 => ash::vk::Format::R8_UNORM,
+        FboFormat::Rg8 => ash::vk::Format::R8G8_UNORM,
+        FboFormat::R16f => ash::vk::Format::R16_SFLOAT,
+        FboFormat::Rg16f => ash::vk::Format::R16G16_SFLOAT,
+        FboFormat::Rgba16f => ash::vk::Format::R16G16B16A16_SFLOAT,
     }
 }
 
@@ -223,6 +273,9 @@ impl LayerFx {
                 .map(|(_, target)| target.owned().map(|target| target.allocation_bytes))
                 .collect::<Option<Vec<_>>>()?,
         );
+        if let Some(crop) = &self.crop {
+            allocations.push(crop.owned()?.allocation_bytes);
+        }
         classify_effect_target_bytes(&allocations, self.output?)
     }
 
@@ -257,7 +310,34 @@ impl LayerFx {
     }
 
     fn plan(&self) -> Result<TargetPlan, lifetime::TargetPlanError> {
-        lifetime::plan_targets(&self.fbo_names(), &self.pass_targets, &self.binds, &self.owner)
+        lifetime::plan_targets_with(
+            &self.fbo_names(),
+            &self.fbo_owners,
+            &self.swaps,
+            &self.pass_targets,
+            &self.binds,
+            &self.owner,
+        )
+    }
+
+    fn resolve_fbo(&self, owner: usize, name: &str) -> Option<usize> {
+        lifetime::resolve_fbo_scoped(
+            self.fbos.iter().map(|(fbo, _)| fbo.as_str()),
+            &self.fbo_owners,
+            owner,
+            name,
+        )
+        .map(|logical| self.remap[logical].get())
+    }
+
+    fn apply_swaps(&self, after: Option<usize>) {
+        for &(when, a, b) in &self.swaps {
+            if when == after && a != b && a < self.remap.len() && b < self.remap.len() {
+                let (physical_a, physical_b) = (self.remap[a].get(), self.remap[b].get());
+                self.remap[a].set(physical_b);
+                self.remap[b].set(physical_a);
+            }
+        }
     }
 
     fn intrinsic_dynamic(&self) -> bool {
@@ -276,9 +356,7 @@ impl LayerFx {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct TextureKey {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
+    pixels: paper_scene::tex::Pixels,
     clamp: bool,
     nearest: bool,
 }
@@ -286,11 +364,17 @@ struct TextureKey {
 impl TextureKey {
     fn take(texture: &mut paper_scene::model::Texture) -> Self {
         Self {
-            width: texture.width,
-            height: texture.height,
-            rgba: std::mem::take(&mut texture.rgba),
+            pixels: std::mem::take(&mut texture.pixels),
             clamp: texture.clamp,
             nearest: texture.nearest,
+        }
+    }
+
+    fn clear() -> Self {
+        Self {
+            pixels: paper_scene::tex::Pixels::rgba(1, 1, vec![0, 0, 0, 0]),
+            clamp: true,
+            nearest: false,
         }
     }
 }
@@ -311,19 +395,14 @@ impl TextureInterner {
     ) -> std::result::Result<usize, (anyhow::Error, TextureKey)> {
         if let Some(&slot) = self.slots.get(&key) {
             self.reused += 1;
-            self.reused_bytes += key.rgba.len();
+            self.reused_bytes += key.pixels.bytes();
             return Ok(slot);
         }
-        let uploaded = match renderer.create_scene_texture_opts(
-            key.width,
-            key.height,
-            &key.rgba,
-            key.clamp,
-            key.nearest,
-        ) {
-            Ok(uploaded) => uploaded,
-            Err(err) => return Err((err, key)),
-        };
+        let uploaded =
+            match renderer.create_scene_texture_pixels(&key.pixels, key.clamp, key.nearest, true) {
+                Ok(uploaded) => uploaded,
+                Err(err) => return Err((err, key)),
+            };
         let slot = textures.len();
         textures.push(uploaded);
         self.slots.insert(key, slot);
@@ -340,7 +419,7 @@ impl TextureInterner {
         match self.intern_key(renderer, textures, key) {
             Ok(slot) => Ok(slot),
             Err((err, key)) => {
-                texture.rgba = key.rgba;
+                texture.pixels = key.pixels;
                 Err(err)
             }
         }
@@ -361,6 +440,18 @@ fn size4(extent: ash::vk::Extent2D) -> [f32; 4] {
     [w, h, w, h]
 }
 
+struct ParticleEngine {
+    pipeline: vk::EffectPipeline,
+    meta: paper_scene::effects::PassMeta,
+    vertices: vk::DynBuffer,
+    indices: vk::DynBuffer,
+    capacity: usize,
+    extra_textures: Vec<usize>,
+    render_var1: [f32; 4],
+    texture_size: [f32; 4],
+    scratch: Vec<f32>,
+}
+
 struct ParticleGroup {
     system: paper_scene::particles::ParticleSystem,
     sim: paper_scene::particles::Sim,
@@ -368,11 +459,222 @@ struct ParticleGroup {
     ratio: f32,
     frames: Vec<paper_scene::model::SpriteFrame>,
     scene_order: usize,
+    engine: Option<ParticleEngine>,
 }
 
 struct OrderedParticleQuad {
     scene_order: usize,
     quad: vk::SceneQuad,
+}
+
+struct OrderedParticleDraw {
+    scene_order: usize,
+    group: usize,
+    index_count: u32,
+}
+
+type Mat4 = [f32; 16];
+
+fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
+    let mut out = [0.0f32; 16];
+    for col in 0..4 {
+        for row in 0..4 {
+            out[col * 4 + row] = (0..4).map(|k| a[k * 4 + row] * b[col * 4 + k]).sum();
+        }
+    }
+    out
+}
+
+fn clip_y(d3d_clip: bool) -> f32 {
+    if d3d_clip { 1.0 } else { -1.0 }
+}
+
+fn scene_ortho(canvas: (f32, f32), d3d_clip: bool) -> Mat4 {
+    let (w, h) = (canvas.0.max(1.0), canvas.1.max(1.0));
+    let ys = clip_y(d3d_clip);
+    [2.0 / w, 0.0, 0.0, 0.0, 0.0, ys * 2.0 / h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -ys, 0.5, 1.0]
+}
+
+pub(crate) const PARTICLE_EYE_FACTOR: f32 = 0.45;
+
+pub(crate) fn particle_eye_distance(canvas_height: f32) -> f32 {
+    PARTICLE_EYE_FACTOR * canvas_height.max(1.0)
+}
+
+fn scene_perspective(canvas: (f32, f32), d3d_clip: bool) -> Mat4 {
+    let (w, h) = (canvas.0.max(1.0), canvas.1.max(1.0));
+    let (near, far) = (1.0f32, 100_000.0f32);
+    let eye_distance = particle_eye_distance(h);
+    let f = eye_distance / (h * 0.5);
+    let a = far / (near - far);
+    let b = near * far / (near - far);
+    let ys = clip_y(d3d_clip);
+    let projection: Mat4 =
+        [f / (w / h), 0.0, 0.0, 0.0, 0.0, ys * f, 0.0, 0.0, 0.0, 0.0, a, -1.0, 0.0, 0.0, b, 0.0];
+    let view: Mat4 = [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        -w * 0.5,
+        -h * 0.5,
+        -eye_distance,
+        1.0,
+    ];
+    mat4_mul(&projection, &view)
+}
+
+fn layer_model_matrix(layer: &paper_scene::model::Layer, canvas: (f32, f32)) -> (Mat4, Mat4) {
+    let (ox, oy, oz) = (layer.center.0, canvas.1 - layer.center.1, layer.depth);
+    let (kx, ky) = (layer.scale.0, layer.scale.1);
+    let (n, c) = (-layer.angle).sin_cos();
+    let inv = |s: f32| if s.abs() < 1e-6 { 0.0 } else { 1.0 / s };
+    let (ix, iy) = (inv(kx), inv(ky));
+    let model =
+        [kx * c, kx * n, 0.0, 0.0, -ky * n, ky * c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, ox, oy, oz, 1.0];
+    let inverse = [
+        c * ix,
+        -n * iy,
+        0.0,
+        0.0,
+        n * ix,
+        c * iy,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        -(c * ox + n * oy) * ix,
+        -(-n * ox + c * oy) * iy,
+        -oz,
+        1.0,
+    ];
+    (model, inverse)
+}
+
+fn layer_uniforms(
+    layer: &paper_scene::model::Layer,
+    canvas: (f32, f32),
+    lights: ([f32; 3], [f32; 3]),
+) -> std::collections::BTreeMap<String, Vec<f32>> {
+    let (matrix, inverse) = layer_model_matrix(layer, canvas);
+    std::collections::BTreeMap::from([
+        ("g_LayerModelMatrix".to_string(), matrix.to_vec()),
+        ("g_ModelMatrix".to_string(), matrix.to_vec()),
+        ("g_ModelMatrixInverse".to_string(), inverse.to_vec()),
+        ("g_LightAmbientColor".to_string(), lights.0.to_vec()),
+        ("g_LightSkylightColor".to_string(), lights.1.to_vec()),
+    ])
+}
+
+fn model_matrix(origin: (f32, f32, f32), scale: [f32; 3], angle: f32) -> Mat4 {
+    let (sin, cos) = angle.sin_cos();
+    [
+        cos * scale[0],
+        sin * scale[0],
+        0.0,
+        0.0,
+        -sin * scale[1],
+        cos * scale[1],
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        scale[2],
+        0.0,
+        origin.0,
+        origin.1,
+        origin.2,
+        1.0,
+    ]
+}
+
+fn model_inverse(origin: (f32, f32, f32), scale: [f32; 3], angle: f32) -> Mat4 {
+    let inv = |s: f32| if s.abs() < 1e-6 { 0.0 } else { 1.0 / s };
+    let (sx, sy, sz) = (inv(scale[0]), inv(scale[1]), inv(scale[2]));
+    let (sin, cos) = angle.sin_cos();
+    let (a, b, c, d) = (cos * sx, -sin * sy, sin * sx, cos * sy);
+    [
+        a,
+        b,
+        0.0,
+        0.0,
+        c,
+        d,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        sz,
+        0.0,
+        -(a * origin.0 + c * origin.1),
+        -(b * origin.0 + d * origin.1),
+        -origin.2 * sz,
+        1.0,
+    ]
+}
+
+fn sprite_grid(texture: &paper_scene::model::Texture) -> [f32; 4] {
+    let (w, h) = (texture.width.max(1) as f32, texture.height.max(1) as f32);
+    if texture.frames.len() > 1 {
+        let uv = texture.frames[0].uv;
+        let cols = (1.0 / uv[2].max(1e-6)).round().max(1.0);
+        let rows = (1.0 / uv[3].max(1e-6)).round().max(1.0);
+        let ratio = (h / rows) / (w / cols);
+        [1.0 / cols, 1.0 / rows, texture.frames.len() as f32, ratio]
+    } else {
+        [0.0, 0.0, 0.0, h / w]
+    }
+}
+
+fn particle_batches<'a>(
+    groups: &'a [ParticleGroup],
+    image_orders: &[usize],
+    particle_quads: &[OrderedParticleQuad],
+    draws: &[OrderedParticleDraw],
+    before: Option<usize>,
+    grab: Option<&'a vk::SceneTarget>,
+) -> Vec<vk::ParticleDraw<'a>> {
+    let mut out: Vec<vk::ParticleDraw<'a>> = draws
+        .iter()
+        .filter(|draw| before.is_none_or(|limit| draw.scene_order < limit))
+        .filter_map(|draw| {
+            let group = groups.get(draw.group)?;
+            let engine = group.engine.as_ref()?;
+            let after = image_orders
+                .iter()
+                .filter(|order| {
+                    before.is_none_or(|limit| **order < limit) && **order <= draw.scene_order
+                })
+                .count()
+                + particle_quads
+                    .iter()
+                    .filter(|quad| {
+                        before.is_none_or(|limit| quad.scene_order < limit)
+                            && quad.scene_order <= draw.scene_order
+                    })
+                    .count();
+            Some(vk::ParticleDraw {
+                after,
+                pipeline: &engine.pipeline,
+                vertices: engine.vertices.buffer,
+                indices: engine.indices.buffer,
+                index_count: draw.index_count,
+                grab: group.system.grab_slot.and(grab),
+            })
+        })
+        .collect();
+    out.sort_by_key(|batch| batch.after);
+    out
 }
 
 struct FrameSample {
@@ -447,6 +749,8 @@ struct Group {
     renderer: vk::Renderer,
     target: vk::SceneTarget,
     scene_snapshot: Option<vk::SceneTarget>,
+    scene_grab: Option<vk::SceneTarget>,
+    frozen: bool,
     from: Option<FadeSource>,
     quads: Vec<vk::SceneQuad>,
     quad_scene_order: Vec<usize>,
@@ -458,7 +762,16 @@ struct Group {
     puppets: Vec<PuppetGroup>,
     fx_scratch: Vec<vk::SceneTarget>,
     ndc_quad: Option<vk::QuadBuffer>,
+    ndc_quad_d3d: Option<vk::QuadBuffer>,
     particles: Vec<ParticleGroup>,
+    animations: Vec<LayerAnimation>,
+    audio: Option<paper_audio::Analyser>,
+    audio_fx: Vec<usize>,
+    bands: paper_audio::Bands,
+    live_text: Vec<LiveText>,
+    live_text_due: f32,
+    scene_uniforms: std::collections::BTreeMap<String, Vec<f32>>,
+    fixed_daytime: Option<f32>,
     canvas: (f32, f32),
     clear: [f32; 3],
 }
@@ -664,6 +977,7 @@ impl Group {
                 local_targets: &local_targets[index],
                 binds: &fx.binds,
                 dynamic: fx.intrinsic_dynamic(),
+                passthrough: fx.passthrough,
                 prefix_dynamic: self
                     .particles
                     .iter()
@@ -702,7 +1016,22 @@ impl Group {
                     .context("scene-so-far shadow target")?,
             );
         }
-        let shadow_bytes = self.scene_snapshot.as_ref().map_or(0, |target| target.allocation_bytes);
+        if let Some(snapshot) = &self.scene_snapshot {
+            for slot in self.fx.iter().filter_map(|fx| fx.snapshot_slot) {
+                self.renderer.point_slot_at(&self.textures[slot], snapshot.view);
+            }
+        }
+        if self.scene_grab.is_none()
+            && self.particles.iter().any(|group| group.system.grab_slot.is_some())
+        {
+            self.scene_grab = Some(
+                self.renderer
+                    .create_scene_target(self.target.extent.width, self.target.extent.height)
+                    .context("scene grab target")?,
+            );
+        }
+        let shadow_bytes = self.scene_snapshot.as_ref().map_or(0, |target| target.allocation_bytes)
+            + self.scene_grab.as_ref().map_or(0, |target| target.allocation_bytes);
         let passive_target_bytes =
             self.passive_scene_targets.iter().map(|target| target.allocation_bytes).sum::<u64>();
         tracing::info!(
@@ -740,6 +1069,7 @@ impl Group {
                     for index in affected.into_iter().rev() {
                         if index < self.fx.len() {
                             let fx = self.fx.remove(index);
+                            self.quads[fx.quad].tint = fx.fallback_tint;
                             self.destroy_layer_fx(fx);
                         }
                     }
@@ -748,17 +1078,187 @@ impl Group {
         }
     }
 
+    fn frame_clock(&self, time: f32, dt: f32) -> paper_scene::effects::FrameClock {
+        match self.fixed_daytime {
+            Some(daytime) => paper_scene::effects::FrameClock { time, dt, daytime },
+            None => paper_scene::effects::FrameClock::now(time, dt),
+        }
+    }
+
+    fn read_canvas(&mut self) -> Result<(u32, u32, Vec<u8>)> {
+        self.renderer.read_scene_target(&self.target)
+    }
+
+    fn advance_layer_animations(&mut self, time: f32) {
+        for animation in &self.animations {
+            let uv = frame_uv(&animation.frames, animation.total, time);
+            match self.fx.iter_mut().find(|fx| fx.quad == animation.quad) {
+                Some(fx) if !fx.passthrough => fx.base_quad.uv = uv,
+                Some(_) => {}
+                None => self.quads[animation.quad].uv = uv,
+            }
+        }
+    }
+
     fn animated(&self) -> bool {
-        !self.particles.is_empty()
+        !self.animations.is_empty()
+            || !self.particles.is_empty()
             || self.puppets.iter().any(PuppetGroup::animated)
             || self.fx.iter().flat_map(|fx| &fx.passes).any(|pass| pass.time_dependent())
             || self.fx.iter().any(LayerFx::frame_state_dependent)
+            || self.audio.is_some()
     }
 
-    fn particle_quads(&mut self, dt: f32) -> Vec<OrderedParticleQuad> {
+    fn live_text_wait(&self, time: f32) -> Option<f32> {
+        (!self.live_text.is_empty()).then(|| (self.live_text_due - time).max(0.0))
+    }
+
+    fn advance_live_text(&mut self, time: f32) -> Result<()> {
+        if self.live_text.is_empty() || time < self.live_text_due {
+            return Ok(());
+        }
+        let Some(now) = paper_scene::dynamic_text::local_now() else {
+            self.live_text_due = time + 60.0;
+            return Ok(());
+        };
+        let cadence = self
+            .live_text
+            .iter()
+            .map(|entry| entry.prepared.cadence())
+            .min()
+            .unwrap_or(paper_scene::dynamic_text::Cadence::Day);
+        self.live_text_due = time + paper_scene::dynamic_text::seconds_until_next(cadence, now);
+        for index in 0..self.live_text.len() {
+            let wanted = self.live_text[index].prepared.value(now);
+            if wanted == self.live_text[index].shown {
+                continue;
+            }
+            let Some(texture) = self.live_text[index].prepared.rasterize(&wanted) else {
+                continue;
+            };
+            let replacement =
+                self.renderer.create_scene_texture_pixels(&texture.pixels, true, false, false)?;
+            let slot = self.live_text[index].slot;
+            if slot >= self.textures.len() {
+                self.renderer.destroy_scene_texture(replacement);
+                continue;
+            }
+            let previous = std::mem::replace(&mut self.textures[slot], replacement);
+            self.renderer.destroy_scene_texture(previous);
+            self.live_text[index].shown = wanted;
+        }
+        Ok(())
+    }
+
+    fn advance_audio(&mut self, dt: f32) {
+        let Some(analyser) = self.audio.as_mut() else {
+            return;
+        };
+        analyser.fill(&mut self.bands, dt);
+        write_bands(&mut self.scene_uniforms, &self.bands);
+        for index in &self.audio_fx {
+            if let Some(fx) = self.fx.get_mut(*index) {
+                write_bands(&mut fx.uniforms, &self.bands);
+            }
+        }
+    }
+
+    fn particle_quads(
+        &mut self,
+        time: f32,
+        dt: f32,
+    ) -> (Vec<OrderedParticleQuad>, Vec<OrderedParticleDraw>) {
         let mut out = Vec::new();
-        for group in &mut self.particles {
+        let mut draws = Vec::new();
+        let clock = self.frame_clock(time, dt);
+        let screen = (self.target.extent.width, self.target.extent.height);
+        let canvas = self.canvas;
+        for (group_index, group) in self.particles.iter_mut().enumerate() {
             group.sim.step(&group.system, dt);
+            if let Some(engine) = group.engine.as_mut() {
+                let system = &group.system;
+                let count = paper_scene::particles::pack_sprites(
+                    system,
+                    &group.sim,
+                    group.frames.len(),
+                    &mut engine.scratch,
+                );
+                let count = count.min(engine.capacity);
+                if count == 0 {
+                    continue;
+                }
+                let floats = count
+                    * paper_scene::particles::SPRITE_VERTICES
+                    * paper_scene::particles::SPRITE_FLOATS_PER_VERTEX;
+                let bytes: Vec<u8> =
+                    engine.scratch[..floats].iter().flat_map(|value| value.to_le_bytes()).collect();
+                self.renderer.write_dyn_buffer(&engine.vertices, &bytes);
+                let d3d_clip = engine.pipeline.hlsl && vk::d3d_clip_enabled();
+                let view_projection = if system.perspective {
+                    scene_perspective(canvas, d3d_clip)
+                } else {
+                    scene_ortho(canvas, d3d_clip)
+                };
+                let model = model_matrix(system.origin, system.draw_scale3(), system.angle);
+                let mut overrides = std::collections::BTreeMap::new();
+                overrides.insert(
+                    "g_ModelViewProjectionMatrix".to_string(),
+                    mat4_mul(&view_projection, &model).to_vec(),
+                );
+                overrides.insert("g_ModelMatrix".to_string(), model.to_vec());
+                overrides.insert(
+                    "g_ModelMatrixInverse".to_string(),
+                    model_inverse(system.origin, system.draw_scale3(), system.angle).to_vec(),
+                );
+                overrides.insert("g_OrientationUp".to_string(), vec![0.0, 1.0, 0.0]);
+                overrides.insert("g_OrientationRight".to_string(), vec![1.0, 0.0, 0.0]);
+                overrides.insert("g_OrientationForward".to_string(), vec![0.0, 0.0, 1.0]);
+                overrides.insert("g_ViewUp".to_string(), vec![0.0, 1.0, 0.0]);
+                overrides.insert("g_ViewRight".to_string(), vec![1.0, 0.0, 0.0]);
+                overrides.insert(
+                    "g_EyePosition".to_string(),
+                    vec![canvas.0 * 0.5, canvas.1 * 0.5, particle_eye_distance(canvas.1)],
+                );
+                overrides.insert(
+                    "g_RenderVar0".to_string(),
+                    vec![
+                        system.trail.length,
+                        system.trail.max_length,
+                        system.trail.min_length,
+                        0.0,
+                    ],
+                );
+                overrides.insert("g_RenderVar1".to_string(), engine.render_var1.to_vec());
+                for (name, value) in &self.scene_uniforms {
+                    overrides.entry(name.clone()).or_insert_with(|| value.clone());
+                }
+                let base = &self.textures[group.texture];
+                let mut views = vec![(base.view, base.sampler)];
+                let mut sizes = vec![Some(engine.texture_size)];
+                for &slot in &engine.extra_textures {
+                    let texture = &self.textures[slot];
+                    views.push((texture.view, texture.sampler));
+                    sizes.push(None);
+                }
+                if let (Some(slot), Some(grab)) = (system.grab_slot, self.scene_grab.as_ref()) {
+                    if views.len() <= slot {
+                        views.resize(slot + 1, views[0]);
+                        sizes.resize(slot + 1, None);
+                    }
+                    views[slot] = (grab.view, grab.sampler);
+                    sizes[slot] = Some(size4(grab.extent));
+                }
+                let uniforms = engine.meta.uniform_bytes_with(
+                    clock, None, screen.0, screen.1, screen, &sizes, &overrides, d3d_clip,
+                );
+                self.renderer.write_effect_inputs(&engine.pipeline, &views, &uniforms);
+                draws.push(OrderedParticleDraw {
+                    scene_order: group.scene_order,
+                    group: group_index,
+                    index_count: (count * paper_scene::particles::SPRITE_INDICES) as u32,
+                });
+                continue;
+            }
             let system = &group.system;
             let blend = if system.additive { vk::SceneBlend::Add } else { vk::SceneBlend::Alpha };
             if system.renderer == paper_scene::particles::Renderer::Ribbon {
@@ -768,15 +1268,16 @@ impl Group {
                     }
                     let sample = particle_frame(group, particle);
                     let (uv, extra) = (sample.uv, sample.extra);
-                    let width = particle.size * system.scale;
+                    let width =
+                        particle.size * paper_scene::particles::SPRITE_EXTENT * system.draw_scale();
                     for (index, pair) in trail.windows(2).enumerate() {
                         let (ax, ay) = (
-                            system.origin.0 + pair[0][0] * system.scale,
-                            system.origin.1 + pair[0][1] * system.scale,
+                            system.origin.0 + pair[0][0] * system.draw_scale(),
+                            system.origin.1 + pair[0][1] * system.draw_scale(),
                         );
                         let (bx, by) = (
-                            system.origin.0 + pair[1][0] * system.scale,
-                            system.origin.1 + pair[1][1] * system.scale,
+                            system.origin.0 + pair[1][0] * system.draw_scale(),
+                            system.origin.1 + pair[1][1] * system.draw_scale(),
                         );
                         let (dx, dy) = (bx - ax, by - ay);
                         let span = dx.hypot(dy);
@@ -818,9 +1319,10 @@ impl Group {
                     continue;
                 }
                 let sample = particle_frame(group, particle);
-                let size = particle.size * system.scale;
-                let x = system.origin.0 + particle.pos[0] * system.scale;
-                let y = system.origin.1 + particle.pos[1] * system.scale;
+                let size =
+                    particle.size * paper_scene::particles::SPRITE_EXTENT * system.draw_scale();
+                let x = system.origin.0 + particle.pos[0] * system.draw_scale();
+                let y = system.origin.1 + particle.pos[1] * system.draw_scale();
                 let (width, height, angle) =
                     if system.renderer == paper_scene::particles::Renderer::Trail {
                         let (vx, vy) = (particle.vel[0], particle.vel[1]);
@@ -869,7 +1371,7 @@ impl Group {
                 }
             }
         }
-        out
+        (out, draws)
     }
 
     fn puppet_frame(&mut self, time: f32, batched: bool) -> Result<()> {
@@ -891,18 +1393,34 @@ impl Group {
     }
 
     fn compose(&mut self, time: f32, dt: f32) -> Result<()> {
+        if self.frozen {
+            return Ok(());
+        }
         let logical_canvas = [self.canvas.0.max(1.0), self.canvas.1.max(1.0)];
+        let clock = self.frame_clock(time, dt);
+        let screen = (self.target.extent.width, self.target.extent.height);
+        self.advance_layer_animations(time);
+        self.advance_live_text(time)?;
+        self.advance_audio(dt);
         let debug_fx = std::env::var("SKWD_VK_FX_DEBUG").is_ok();
         let batched = !debug_fx && (!self.fx.is_empty() || !self.puppets.is_empty());
         if batched {
             self.renderer.begin_scene_batch()?;
         }
         self.puppet_frame(time, batched)?;
-        let particle_quads = self.particle_quads(dt);
+        let (particle_quads, particle_draws) = self.particle_quads(time, dt);
         if self.fx.is_empty() {
             let clear = [self.clear[0], self.clear[1], self.clear[2], 1.0];
             let quads =
                 ordered_scene_quads(&self.quads, &self.quad_scene_order, &particle_quads, None);
+            let batches = particle_batches(
+                &self.particles,
+                &self.quad_scene_order,
+                &particle_quads,
+                &particle_draws,
+                None,
+                self.scene_grab.as_ref(),
+            );
             if batched {
                 self.renderer.record_scene_with_canvas(
                     &self.target,
@@ -910,6 +1428,7 @@ impl Group {
                     clear,
                     &quads,
                     &self.textures,
+                    &batches,
                 );
                 return self.renderer.submit_scene_batch();
             }
@@ -919,9 +1438,11 @@ impl Group {
                 clear,
                 &quads,
                 &self.textures,
+                &batches,
             );
         }
         let ndc_quad = self.ndc_quad.as_ref().context("ndc quad missing")?;
+        let ndc_quad_d3d = self.ndc_quad_d3d.as_ref().context("ndc quad missing")?;
         let fx_scratch = &self.fx_scratch;
         let mut scene_targets = HashMap::new();
         for layer in &self.base_scene_targets {
@@ -949,6 +1470,14 @@ impl Group {
                     &particle_quads,
                     Some(scene_order),
                 );
+                let batches = particle_batches(
+                    &self.particles,
+                    &self.quad_scene_order,
+                    &particle_quads,
+                    &particle_draws,
+                    Some(scene_order),
+                    self.scene_grab.as_ref(),
+                );
                 let clear = [self.clear[0], self.clear[1], self.clear[2], 1.0];
                 if debug_fx {
                     self.renderer.render_scene_with_canvas(
@@ -957,6 +1486,7 @@ impl Group {
                         clear,
                         &prefix,
                         &self.textures,
+                        &batches,
                     )?;
                 } else {
                     self.renderer.record_scene_with_canvas(
@@ -965,12 +1495,22 @@ impl Group {
                         clear,
                         &prefix,
                         &self.textures,
+                        &batches,
                     );
                 }
             }
             let fx = &mut self.fx[fx_index];
             let ping = fx.ping.get(fx_scratch);
             let pong = fx.pong.get(fx_scratch);
+            if let (Some(crop), Some(crop_quad)) = (&fx.crop, &fx.crop_quad) {
+                let crop = crop.get(fx_scratch);
+                let quad = std::slice::from_ref(crop_quad);
+                if debug_fx {
+                    self.renderer.render_scene(crop, [0.0; 4], quad, &self.textures)?;
+                } else {
+                    self.renderer.record_scene(crop, [0.0; 4], quad, &self.textures);
+                }
+            }
             if debug_fx {
                 self.renderer.render_scene(
                     pong,
@@ -1006,19 +1546,16 @@ impl Group {
             let mut source_id = FxTargetId::Pong;
             let mut flip = true;
             let mut current_effect = fx.owner.first().copied().unwrap_or(0);
-            for (slot, pipe) in fx.pipelines.iter().enumerate() {
+            fx.apply_swaps(None);
+            for slot in 0..fx.pipelines.len() {
+                let pipe = &fx.pipelines[slot];
                 if fx.owner.get(slot).copied().unwrap_or(0) != current_effect {
                     current_effect = fx.owner.get(slot).copied().unwrap_or(0);
                     previous = source;
                 }
                 let named_id = fx.pass_targets[slot]
                     .as_ref()
-                    .and_then(|name| {
-                        lifetime::resolve_fbo_index(
-                            fx.fbos.iter().map(|(fbo, _)| fbo.as_str()),
-                            name,
-                        )
-                    })
+                    .and_then(|name| fx.resolve_fbo(fx.owner[slot], name))
                     .map(FxTargetId::Fbo);
                 let named = named_id.map(|id| fx.target(id, fx_scratch));
                 let mut views = vec![(source.0, source.1)];
@@ -1031,16 +1568,18 @@ impl Group {
                 for (index, binding) in &fx.binds[slot] {
                     let bound = match binding {
                         EffectBind::Previous => Some(previous),
-                        EffectBind::Named(name) => lifetime::resolve_fbo_index(
-                            fx.fbos.iter().map(|(fbo, _)| fbo.as_str()),
-                            name,
-                        )
-                        .map(|index| fx.target(FxTargetId::Fbo(index), fx_scratch))
-                        .map(|rt| (rt.view, rt.sampler, rt.extent)),
+                        EffectBind::Named(name) => fx
+                            .resolve_fbo(fx.owner[slot], name)
+                            .map(|index| fx.target(FxTargetId::Fbo(index), fx_scratch))
+                            .map(|rt| (rt.view, rt.sampler, rt.extent)),
                         EffectBind::LayerComposite { layer, buffer } => {
                             scene_targets.get(&(layer.clone(), *buffer)).copied()
                         }
                         EffectBind::SceneSoFar => snapshot,
+                        EffectBind::SceneUnderLayer => fx.crop.as_ref().map(|storage| {
+                            let crop = storage.get(fx_scratch);
+                            (crop.view, crop.sampler, crop.extent)
+                        }),
                     };
                     if let Some((view, sampler, extent)) = bound {
                         if *index >= views.len() {
@@ -1067,12 +1606,15 @@ impl Group {
                 let target = fx.target(target_id, fx_scratch);
                 let meta = &fx.passes[slot];
                 let quad_dims = named.is_none().then_some((ping.extent.width, ping.extent.height));
-                let uniforms = meta.uniform_bytes(
-                    time,
+                let uniforms = meta.uniform_bytes_with(
+                    clock,
                     quad_dims,
                     target.extent.width,
                     target.extent.height,
+                    screen,
                     &sizes,
+                    &fx.uniforms,
+                    pipe.hlsl && vk::d3d_clip_enabled(),
                 );
                 if debug_fx {
                     let ids: Vec<String> = views
@@ -1100,19 +1642,30 @@ impl Group {
                     } else {
                         "FBO"
                     };
-                    tracing::info!("FXDBG pass{slot} views={ids:?} target={tgt}");
+                    tracing::info!(
+                        "FXDBG pass{slot} {} hlsl={} views={ids:?} target={tgt}",
+                        meta.name,
+                        pipe.hlsl
+                    );
                     if let Ok((_, _, px)) = self.renderer.read_scene_target(ping) {
                         let n = (px.len() / 4).max(1);
                         let alpha: u64 = px.chunks_exact(4).map(|p| u64::from(p[3])).sum();
                         tracing::info!("FXDBG   ping now a={}", alpha / n as u64);
                     }
                 }
-                let buffer = if named.is_some() { ndc_quad } else { &fx.verts };
+                let buffer = if named.is_none() && !meta.ndc() {
+                    &fx.verts
+                } else if pipe.hlsl && vk::d3d_clip_enabled() {
+                    ndc_quad_d3d
+                } else {
+                    ndc_quad
+                };
                 if debug_fx {
                     self.renderer.run_effect_pass(pipe, buffer, target, &views, &uniforms)?;
                 } else {
                     self.renderer.record_effect_pass(pipe, buffer, target, &views, &uniforms);
                 }
+                fx.apply_swaps(Some(slot));
                 if debug_fx && let Ok((w, h, px)) = self.renderer.read_scene_target(target) {
                     let n = (px.len() / 4).max(1);
                     let sum: u64 = px
@@ -1149,6 +1702,14 @@ impl Group {
         }
         let clear = [self.clear[0], self.clear[1], self.clear[2], 1.0];
         let quads = ordered_scene_quads(&self.quads, &self.quad_scene_order, &particle_quads, None);
+        let batches = particle_batches(
+            &self.particles,
+            &self.quad_scene_order,
+            &particle_quads,
+            &particle_draws,
+            None,
+            self.scene_grab.as_ref(),
+        );
         if debug_fx {
             for (i, q) in quads.iter().enumerate().take(6) {
                 tracing::info!(
@@ -1168,6 +1729,7 @@ impl Group {
                 clear,
                 &quads,
                 &self.textures,
+                &batches,
             )
         } else {
             self.renderer.record_scene_with_canvas(
@@ -1176,6 +1738,7 @@ impl Group {
                 clear,
                 &quads,
                 &self.textures,
+                &batches,
             );
             self.renderer.submit_scene_batch()
         }
@@ -1194,8 +1757,10 @@ impl Group {
         for pipe in fx.pipelines {
             self.renderer.destroy_effect_pipeline(pipe);
         }
-        for storage in
-            [fx.ping, fx.pong].into_iter().chain(fx.fbos.into_iter().map(|(_, storage)| storage))
+        for storage in [fx.ping, fx.pong]
+            .into_iter()
+            .chain(fx.crop)
+            .chain(fx.fbos.into_iter().map(|(_, storage)| storage))
         {
             if let FxTargetStorage::Owned(target) = storage {
                 self.renderer.destroy_scene_target(target);
@@ -1243,10 +1808,13 @@ impl Group {
             }
         }
         self.fx = live_fx;
-        if self.fx.is_empty()
-            && let Some(quad) = self.ndc_quad.take()
-        {
-            self.renderer.destroy_quad_buffer(quad);
+        if self.fx.is_empty() {
+            if let Some(quad) = self.ndc_quad.take() {
+                self.renderer.destroy_quad_buffer(quad);
+            }
+            if let Some(quad) = self.ndc_quad_d3d.take() {
+                self.renderer.destroy_quad_buffer(quad);
+            }
         }
         Ok(report)
     }
@@ -1385,6 +1953,9 @@ impl Group {
         if let Some(quad) = self.ndc_quad.take() {
             self.renderer.destroy_quad_buffer(quad);
         }
+        if let Some(quad) = self.ndc_quad_d3d.take() {
+            self.renderer.destroy_quad_buffer(quad);
+        }
         for texture in std::mem::take(&mut self.textures) {
             self.renderer.destroy_scene_texture(texture);
         }
@@ -1394,11 +1965,21 @@ impl Group {
         if let Some(target) = self.scene_snapshot.take() {
             self.renderer.destroy_scene_target(target);
         }
+        if let Some(target) = self.scene_grab.take() {
+            self.renderer.destroy_scene_target(target);
+        }
     }
 
     fn destroy(mut self) {
         self.drop_from();
         self.release_composition_inputs();
+        for group in std::mem::take(&mut self.particles) {
+            if let Some(engine) = group.engine {
+                self.renderer.destroy_effect_pipeline(engine.pipeline);
+                self.renderer.destroy_dyn_buffer(engine.vertices);
+                self.renderer.destroy_dyn_buffer(engine.indices);
+            }
+        }
         self.renderer.destroy_scene_target(self.target);
     }
 }
@@ -1413,22 +1994,73 @@ fn quads(model: &SceneModel, layer_slots: &[usize]) -> Vec<vk::SceneQuad> {
             vk::SceneQuad {
                 rect: [layer.center.0, layer.center.1, layer.size.0, layer.size.1],
                 uv: [0.0, 0.0, uvw, uvh],
-                tint: [
-                    layer.color[0],
-                    layer.color[1],
-                    layer.color[2],
-                    if layer.visible { layer.alpha } else { 0.0 },
-                ],
+                tint: if !layer.passthrough && !layer.effects.is_empty() {
+                    [1.0, 1.0, 1.0, if layer.visible { 1.0 } else { 0.0 }]
+                } else {
+                    layer_tint(layer)
+                },
                 angle: layer.angle,
                 texture: layer_slots[idx],
-                blend: if layer.color_blend == 6 {
-                    vk::SceneBlend::Screen
-                } else {
-                    vk::SceneBlend::Alpha
+                blend: match layer.color_blend {
+                    6 => vk::SceneBlend::Screen,
+                    8 => vk::SceneBlend::Add,
+                    _ => vk::SceneBlend::Alpha,
                 },
             }
         })
         .collect()
+}
+
+fn audio_enabled() -> bool {
+    std::env::var("SKWD_VK_AUDIO").as_deref() != Ok("0")
+}
+
+fn start_audio(audio_fx: &[usize]) -> Option<paper_audio::Analyser> {
+    if audio_fx.is_empty() {
+        return None;
+    }
+    if !audio_enabled() {
+        tracing::info!(
+            "skwd-wall-vk: audio response disabled, {} layer(s) stay silent",
+            audio_fx.len()
+        );
+        return None;
+    }
+    match paper_audio::Analyser::start() {
+        Ok(analyser) => Some(analyser),
+        Err(error) => {
+            tracing::warn!("skwd-wall-vk: audio response unavailable: {error:#}");
+            None
+        }
+    }
+}
+
+const AUDIO_LANES: [(usize, bool, &str); 6] = [
+    (16, false, "g_AudioSpectrum16Left"),
+    (16, true, "g_AudioSpectrum16Right"),
+    (32, false, "g_AudioSpectrum32Left"),
+    (32, true, "g_AudioSpectrum32Right"),
+    (64, false, "g_AudioSpectrum64Left"),
+    (64, true, "g_AudioSpectrum64Right"),
+];
+
+fn seed_bands(target: &mut std::collections::BTreeMap<String, Vec<f32>>) {
+    for (count, _, name) in AUDIO_LANES {
+        target.entry(name.to_string()).or_insert_with(|| vec![0.0; count]);
+    }
+}
+
+fn write_bands(
+    target: &mut std::collections::BTreeMap<String, Vec<f32>>,
+    bands: &paper_audio::Bands,
+) {
+    for (count, right, name) in AUDIO_LANES {
+        let (Some(values), Some(lane)) = (bands.slice(count, right), target.get_mut(name)) else {
+            continue;
+        };
+        lane.clear();
+        lane.extend_from_slice(values);
+    }
 }
 
 fn ordered_scene_quads(
@@ -1454,6 +2086,28 @@ fn ordered_scene_quads(
     );
     ordered.sort_by_key(|(order, serial, _)| (*order, *serial));
     ordered.into_iter().map(|(_, _, quad)| quad).collect()
+}
+
+fn layer_tint(layer: &paper_scene::model::Layer) -> [f32; 4] {
+    [layer.color[0], layer.color[1], layer.color[2], if layer.visible { layer.alpha } else { 0.0 }]
+}
+
+fn fallback_tint(layer: &paper_scene::model::Layer) -> [f32; 4] {
+    if layer.passthrough || (layer.solid && !layer.effects.is_empty()) {
+        [1.0, 1.0, 1.0, 0.0]
+    } else {
+        layer_tint(layer)
+    }
+}
+
+fn passthrough_uv(layer: &paper_scene::model::Layer, canvas: (f32, f32)) -> [f32; 4] {
+    let (cw, ch) = (canvas.0.max(1.0), canvas.1.max(1.0));
+    [
+        (layer.center.0 - layer.size.0 * 0.5) / cw,
+        (layer.center.1 - layer.size.1 * 0.5) / ch,
+        layer.size.0 / cw,
+        layer.size.1 / ch,
+    ]
 }
 
 fn passive_target_quad(
@@ -1613,11 +2267,11 @@ fn shared_renderer(sd: &shared::SharedDevice, width: u32, height: u32) -> Result
 fn release_model_texture_payloads(model: &mut SceneModel) -> usize {
     let mut released = 0;
     for layer in &mut model.layers {
-        released += std::mem::take(&mut layer.texture.rgba).len();
+        released += std::mem::take(&mut layer.texture.pixels).bytes();
         for effect in &mut layer.effects {
             for pass in &mut effect.passes {
                 for texture in pass.textures.iter_mut().flatten() {
-                    released += std::mem::take(&mut texture.rgba).len();
+                    released += std::mem::take(&mut texture.pixels).bytes();
                 }
             }
         }
@@ -1780,7 +2434,7 @@ fn build_group(
         .map(|effect| effect.fbos.len())
         .sum();
     let sets =
-        model.layers.len() + fx_layers * 3 + fx_textures + fx_fbos + model.particles.len() + 16;
+        model.layers.len() + fx_layers * 4 + fx_textures + fx_fbos + model.particles.len() + 16;
     renderer.ensure_scene_pool(sets.max(1) as u32)?;
     let target = renderer.create_scene_target(canvas_w, canvas_h).context("scene target")?;
     let mut textures = Vec::with_capacity(model.layers.len());
@@ -1793,17 +2447,7 @@ fn build_group(
                 slot
             } else {
                 let slot = texture_interner
-                    .intern_rgba(
-                        &mut renderer,
-                        &mut textures,
-                        TextureKey {
-                            width: 1,
-                            height: 1,
-                            rgba: vec![0, 0, 0, 0],
-                            clamp: true,
-                            nearest: false,
-                        },
-                    )
+                    .intern_rgba(&mut renderer, &mut textures, TextureKey::clear())
                     .context("transparent hidden-layer render target")?;
                 hidden_target_texture = Some(slot);
                 slot
@@ -1819,16 +2463,39 @@ fn build_group(
     }
     let puppets =
         create_puppets(&mut renderer, model, &mut layer_slots, &mut textures, dimensions)?;
-    let quads = quads(model, &layer_slots);
+    let mut quads = quads(model, &layer_slots);
+    let animations: Vec<LayerAnimation> = model
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, layer)| {
+            let frames = layer.texture.atlas_frames()?.to_vec();
+            let total = frames.iter().map(|frame| frame.time).sum();
+            Some(LayerAnimation { quad: index, frames, total })
+        })
+        .collect();
+    for animation in &animations {
+        quads[animation.quad].uv = animation.frames[0].uv;
+    }
+    if !animations.is_empty() {
+        tracing::info!("skwd-wall-vk: animated image layers {}", animations.len());
+    }
     let quad_scene_order = model.layers.iter().map(|layer| layer.scene_order).collect();
     let mut fx = Vec::new();
+    let canvas = model.canvas;
+    let mut dynamic_chains = 0usize;
+    let mut admitted_bytes = 0u64;
+    let byte_limit = std::env::var("SKWD_VK_SCENE_FX_BYTES")
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .unwrap_or(512)
+        .saturating_mul(1024 * 1024);
+    let scene_lights = (model.ambient, model.skylight);
     for (index, layer) in model.layers.iter_mut().enumerate() {
         if !layer.visible || layer.effects.is_empty() {
             continue;
         }
-        if fx.len() >= fx_limit {
-            continue;
-        }
+
         let (fx_w, fx_h) = effect_dimensions_for(layer.size, dimensions);
         let mut pipelines = Vec::new();
         let mut inputs = Vec::new();
@@ -1837,32 +2504,36 @@ fn build_group(
         let mut pass_binds = Vec::new();
         let mut pass_owner: Vec<usize> = Vec::new();
         let mut fbos: Vec<(String, vk::SceneTarget)> = Vec::new();
+        let mut fbo_owners: Vec<Option<usize>> = Vec::new();
+        let mut swaps: Vec<(Option<usize>, usize, usize)> = Vec::new();
         let mut failed = None;
         for (effect_index, effect) in layer.effects.iter_mut().enumerate() {
             if pipelines.len() >= pass_cap {
                 break;
             }
-            for (name, scale) in &effect.fbos {
-                if fbos.iter().any(|(existing, _)| existing == name) {
+            for fbo in &effect.fbos {
+                let owner = fbo.unique.then_some(effect_index);
+                if fbos
+                    .iter()
+                    .zip(&fbo_owners)
+                    .any(|((existing, _), known)| existing == &fbo.name && *known == owner)
+                {
                     continue;
                 }
-                let (sw, sh) = ((fx_w / scale).max(16), (fx_h / scale).max(16));
-                let created = if layer.texture.clamp {
-                    renderer.create_scene_target(sw, sh)
-                } else {
-                    renderer.create_scene_target_repeat(sw, sh)
-                };
-                match created {
+                let (sw, sh) = fbo.extent((fx_w, fx_h));
+                let repeat = fbo.repeat.unwrap_or(!layer.texture.clamp);
+                match renderer.create_scene_target_fmt(sw, sh, repeat, vk_format(fbo.format)) {
                     Ok(rt) => {
-                        if let Err(err) = renderer.render_scene(&rt, [0.0; 4], &[], &[]) {
-                            failed = Some(format!("{name}: {err:#}"));
+                        if let Err(err) = renderer.render_scene(&rt, fbo.clear, &[], &[]) {
+                            failed = Some(format!("{}: {err:#}", fbo.name));
                             renderer.destroy_scene_target(rt);
                             break;
                         }
-                        fbos.push((name.clone(), rt));
+                        fbos.push((fbo.name.clone(), rt));
+                        fbo_owners.push(owner);
                     }
                     Err(err) => {
-                        failed = Some(format!("{name}: {err:#}"));
+                        failed = Some(format!("{}: {err:#}", fbo.name));
                         break;
                     }
                 }
@@ -1870,12 +2541,48 @@ fn build_group(
             if failed.is_some() {
                 break;
             }
+            let pass_offset = pipelines.len();
+            for swap in &effect.swaps {
+                let resolve = |name: &str| {
+                    lifetime::resolve_fbo_scoped(
+                        fbos.iter().map(|(fbo, _)| fbo.as_str()),
+                        &fbo_owners,
+                        effect_index,
+                        name,
+                    )
+                };
+                if let (Some(a), Some(b)) = (resolve(&swap.source), resolve(&swap.target)) {
+                    let after = match swap.after_pass {
+                        Some(local) => Some(pass_offset + local),
+                        None => pass_offset.checked_sub(1),
+                    };
+                    swaps.push((after, a, b));
+                }
+            }
             for pass in &mut effect.passes {
                 if pipelines.len() >= pass_cap {
                     break;
                 }
                 let meta = paper_scene::effects::PassMeta::of(pass);
-                match renderer.create_effect_pipeline(&pass.vertex, &pass.fragment, &pass.name) {
+                let write_format = pass
+                    .target
+                    .as_deref()
+                    .and_then(|name| {
+                        lifetime::resolve_fbo_scoped(
+                            fbos.iter().map(|(fbo, _)| fbo.as_str()),
+                            &fbo_owners,
+                            effect_index,
+                            name,
+                        )
+                    })
+                    .map_or(ash::vk::Format::R8G8B8A8_UNORM, |index| fbos[index].1.format);
+                match renderer.create_effect_pipeline_for(
+                    &pass.vertex,
+                    &pass.fragment,
+                    pass.hlsl.as_ref(),
+                    &pass.name,
+                    write_format,
+                ) {
                     Ok(pipe) => {
                         let mut slot_textures = Vec::new();
                         let wanted = pipe.sampler_count.saturating_sub(1) as usize;
@@ -1898,17 +2605,7 @@ fn build_group(
                             let uploaded = match uploaded {
                                 Some(texture) => Some(texture),
                                 None if slot <= wanted => texture_interner
-                                    .intern_rgba(
-                                        &mut renderer,
-                                        &mut textures,
-                                        TextureKey {
-                                            width: 1,
-                                            height: 1,
-                                            rgba: vec![0, 0, 0, 0],
-                                            clamp: true,
-                                            nearest: false,
-                                        },
-                                    )
+                                    .intern_rgba(&mut renderer, &mut textures, TextureKey::clear())
                                     .ok(),
                                 None => None,
                             };
@@ -1942,12 +2639,49 @@ fn build_group(
             for (_, rt) in fbos {
                 renderer.destroy_scene_target(rt);
             }
+            quads[index].tint = fallback_tint(layer);
             validate_pipeline_skip(strict, &layer.name, &reason)?;
             continue;
         }
         if pipelines.is_empty() {
+            quads[index].tint = fallback_tint(layer);
             continue;
         }
+        let intrinsic_dynamic = metas.iter().any(paper_scene::effects::PassMeta::time_dependent)
+            || lifetime::plan_targets(
+                &fbos.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
+                &pass_targets,
+                &pass_binds,
+                &pass_owner,
+            )
+            .map(|plan| plan.lifetimes.iter().any(|lifetime| lifetime.loop_carried))
+            .unwrap_or(true);
+        let chain_bytes = u64::from(fx_w) * u64::from(fx_h) * 4 * 2
+            + fbos.iter().map(|(_, target)| target.allocation_bytes).sum::<u64>();
+        let over_dynamic_cap = intrinsic_dynamic && dynamic_chains >= fx_limit;
+        let over_bytes = admitted_bytes + chain_bytes > byte_limit;
+        if over_dynamic_cap || over_bytes {
+            tracing::info!(
+                "skwd-wall-vk: effect chain dropped on {} (dynamic={} chains={} bytes={} budget={})",
+                layer.name,
+                intrinsic_dynamic,
+                dynamic_chains,
+                admitted_bytes + chain_bytes,
+                byte_limit
+            );
+            for pipe in pipelines {
+                renderer.destroy_effect_pipeline(pipe);
+            }
+            for (_, rt) in fbos {
+                renderer.destroy_scene_target(rt);
+            }
+            quads[index].tint = fallback_tint(layer);
+            continue;
+        }
+        if intrinsic_dynamic {
+            dynamic_chains += 1;
+        }
+        admitted_bytes += chain_bytes;
         let verts = renderer.create_quad_buffer(fx_w, fx_h)?;
         let (ping, pong) = if layer.texture.clamp {
             (renderer.create_scene_target(fx_w, fx_h)?, renderer.create_scene_target(fx_w, fx_h)?)
@@ -1959,14 +2693,54 @@ fn build_group(
         };
         renderer.render_scene(&ping, [0.0; 4], &[], &[])?;
         let (uvw, uvh) = layer.texture.uv_scale();
+        let needs_crop = pass_binds
+            .iter()
+            .flatten()
+            .any(|(_, bind)| matches!(bind, EffectBind::SceneUnderLayer));
+        let snapshot_slot = if layer.passthrough || needs_crop {
+            let slot_texture = renderer.create_view_slot()?;
+            textures.push(slot_texture);
+            Some(textures.len() - 1)
+        } else {
+            None
+        };
+        let atlas = layer.texture.atlas_frames().map(|frames| frames[0].uv);
+        let (base_texture, base_uv) = match snapshot_slot {
+            Some(slot) if layer.passthrough => (slot, passthrough_uv(layer, canvas)),
+            _ => (layer_slots[index], atlas.unwrap_or([0.0, 0.0, uvw, uvh])),
+        };
+        let full_rect = [fx_w as f32 / 2.0, fx_h as f32 / 2.0, fx_w as f32, fx_h as f32];
         let base_quad = vk::SceneQuad {
-            rect: [fx_w as f32 / 2.0, fx_h as f32 / 2.0, fx_w as f32, fx_h as f32],
-            uv: [0.0, 0.0, uvw, uvh],
-            tint: [1.0, 1.0, 1.0, 1.0],
+            rect: full_rect,
+            uv: base_uv,
+            tint: if layer.passthrough {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [layer.color[0], layer.color[1], layer.color[2], layer.alpha]
+            },
             angle: 0.0,
-            texture: layer_slots[index],
+            texture: base_texture,
             blend: vk::SceneBlend::Copy,
         };
+        let crop = if needs_crop {
+            let target = if layer.texture.clamp {
+                renderer.create_scene_target(fx_w, fx_h)?
+            } else {
+                renderer.create_scene_target_repeat(fx_w, fx_h)?
+            };
+            renderer.render_scene(&target, [0.0; 4], &[], &[])?;
+            Some(FxTargetStorage::Owned(target))
+        } else {
+            None
+        };
+        let crop_quad = snapshot_slot.filter(|_| needs_crop).map(|slot| vk::SceneQuad {
+            rect: full_rect,
+            uv: passthrough_uv(layer, canvas),
+            tint: [1.0, 1.0, 1.0, 1.0],
+            angle: 0.0,
+            texture: slot,
+            blend: vk::SceneBlend::Copy,
+        });
         let slot_texture = renderer.create_view_slot()?;
         let slot = textures.len();
         textures.push(slot_texture);
@@ -1981,20 +2755,30 @@ fn build_group(
             base_quad,
             verts,
             inputs,
+            remap: (0..fbos.len()).map(std::cell::Cell::new).collect(),
             fbos: fbos
                 .into_iter()
                 .map(|(name, target)| (name, FxTargetStorage::Owned(target)))
                 .collect(),
+            fbo_owners,
+            swaps,
             pass_targets,
             binds: pass_binds,
             owner: pass_owner,
             passes: metas,
             output: None,
-            source_dynamic: puppets.iter().any(|puppet| puppet.layer == index && puppet.animated()),
+            source_dynamic: atlas.is_some()
+                || puppets.iter().any(|puppet| puppet.layer == index && puppet.animated()),
             dependency_dynamic: false,
             retain_targets: false,
             snapshot: false,
+            passthrough: layer.passthrough,
+            snapshot_slot,
+            crop,
+            crop_quad,
+            fallback_tint: fallback_tint(layer),
             sampled_targets: BTreeSet::new(),
+            uniforms: layer_uniforms(layer, canvas, scene_lights),
         });
     }
     let mut particles = Vec::new();
@@ -2019,6 +2803,88 @@ fn build_group(
         sim.prewarm(&system, 1.0 / 30.0);
         let ratio = texture.img_width.max(1) as f32 / texture.img_height.max(1) as f32;
         let frames = texture.frames.clone();
+        let render_var1 = sprite_grid(&texture);
+        let engine = match system.pass.take() {
+            Some(mut pass) => {
+                let label = format!("particles:{}", pass.name);
+                match renderer.create_particle_pipeline(
+                    &pass.vertex,
+                    &pass.fragment,
+                    pass.hlsl.as_ref(),
+                    &label,
+                    system.blend,
+                ) {
+                    Ok(pipeline) => {
+                        let capacity = paper_scene::particles::Sim::capacity(&system);
+                        let mut extra_textures = Vec::new();
+                        for extra in pass.textures.iter_mut().skip(1).flatten() {
+                            if let Ok(slot) =
+                                texture_interner.intern_texture(&mut renderer, &mut textures, extra)
+                            {
+                                extra_textures.push(slot);
+                            }
+                        }
+                        let vertex_bytes = capacity
+                            * paper_scene::particles::SPRITE_VERTICES
+                            * paper_scene::particles::SPRITE_FLOATS_PER_VERTEX
+                            * 4;
+                        let index_words = paper_scene::particles::sprite_indices(capacity);
+                        let buffers = renderer
+                            .create_dyn_buffer(
+                                vertex_bytes,
+                                ash::vk::BufferUsageFlags::VERTEX_BUFFER,
+                            )
+                            .and_then(|vertices| {
+                                renderer
+                                    .create_dyn_buffer(
+                                        index_words.len() * 4,
+                                        ash::vk::BufferUsageFlags::INDEX_BUFFER,
+                                    )
+                                    .map(|indices| (vertices, indices))
+                            });
+                        match buffers {
+                            Ok((vertices, indices)) => {
+                                let bytes: Vec<u8> = index_words
+                                    .iter()
+                                    .flat_map(|word| word.to_le_bytes())
+                                    .collect();
+                                renderer.write_dyn_buffer(&indices, &bytes);
+                                Some(ParticleEngine {
+                                    pipeline,
+                                    meta: paper_scene::effects::PassMeta::of(&pass),
+                                    vertices,
+                                    indices,
+                                    capacity,
+                                    extra_textures,
+                                    render_var1,
+                                    texture_size: [
+                                        texture.width as f32,
+                                        texture.height as f32,
+                                        texture.img_width as f32,
+                                        texture.img_height as f32,
+                                    ],
+                                    scratch: Vec::new(),
+                                })
+                            }
+                            Err(err) => {
+                                tracing::info!(
+                                    "skwd-wall-vk: particle buffers failed ({err:#}), billboards"
+                                );
+                                renderer.destroy_effect_pipeline(pipeline);
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            "skwd-wall-vk: particle shader skipped ({err:#}), billboards"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         particles.push(ParticleGroup {
             system,
             sim,
@@ -2026,6 +2892,7 @@ fn build_group(
             ratio,
             frames,
             scene_order: layer.scene_order,
+            engine,
         });
     }
     let referenced: BTreeSet<String> = fx
@@ -2077,7 +2944,7 @@ fn build_group(
     let reused_textures = texture_interner.reused;
     let reused_payload_bytes = texture_interner.reused_bytes;
     let uploaded_payload_bytes =
-        texture_interner.slots.keys().map(|key| key.rgba.len()).sum::<usize>();
+        texture_interner.slots.keys().map(|key| key.pixels.bytes()).sum::<usize>();
     drop(texture_interner);
     let unused_payload_bytes = release_model_texture_payloads(model);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -2094,10 +2961,61 @@ fn build_group(
         "skwd-wall-vk: released decoded scene texture payloads after GPU upload"
     );
     let ndc_quad = if fx.is_empty() { None } else { Some(renderer.create_quad_buffer_ndc()?) };
+    let ndc_quad_d3d =
+        if fx.is_empty() { None } else { Some(renderer.create_quad_buffer_ndc_d3d()?) };
+    let texture_bytes: u64 = textures.iter().map(|texture| texture.allocation_bytes).sum();
+    tracing::info!(
+        chains_admitted = fx.len(),
+        chains_dynamic = dynamic_chains,
+        effect_target_bytes = admitted_bytes,
+        effect_target_budget = byte_limit,
+        particle_systems = particles.len(),
+        particle_capacity = particles
+            .iter()
+            .map(|group| group.engine.as_ref().map_or(0, |engine| engine.capacity))
+            .sum::<usize>(),
+        texture_slots = textures.len(),
+        texture_bytes,
+        "skwd-wall-vk: scene budget"
+    );
+    let live_text: Vec<LiveText> = model
+        .layers
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(index, layer)| {
+            let prepared = layer.live_text.take()?;
+            let now = paper_scene::dynamic_text::local_now()?;
+            let shown = prepared.value(now);
+            Some(LiveText { slot: *layer_slots.get(index)?, prepared, shown })
+        })
+        .collect();
+    if !live_text.is_empty() {
+        tracing::info!("skwd-wall-vk: {} live text layer(s) follow the clock", live_text.len());
+    }
+
+    let audio_fx: Vec<usize> = fx
+        .iter()
+        .enumerate()
+        .filter(|(_, layer)| {
+            layer.passes.iter().any(paper_scene::effects::PassMeta::audio_dependent)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let audio = start_audio(&audio_fx);
+    if audio.is_some() {
+        for index in &audio_fx {
+            if let Some(layer) = fx.get_mut(*index) {
+                seed_bands(&mut layer.uniforms);
+            }
+        }
+    }
+
     let mut group = Group {
         renderer,
         target,
         scene_snapshot: None,
+        scene_grab: None,
+        frozen: false,
         from: None,
         quads,
         quad_scene_order,
@@ -2109,10 +3027,25 @@ fn build_group(
         puppets,
         fx_scratch: Vec::new(),
         ndc_quad,
+        ndc_quad_d3d,
         particles,
+        animations,
+        audio,
+        audio_fx,
+        bands: paper_audio::Bands::default(),
+        live_text,
+        live_text_due: 0.0,
+        scene_uniforms: std::collections::BTreeMap::from([
+            ("g_LightAmbientColor".to_string(), model.ambient.to_vec()),
+            ("g_LightSkylightColor".to_string(), model.skylight.to_vec()),
+        ]),
+        fixed_daytime: None,
         canvas: (dimensions.logical[0], dimensions.logical[1]),
         clear: model.clear,
     };
+    if group.audio.is_some() {
+        seed_bands(&mut group.scene_uniforms);
+    }
     if let Err(error) = group.configure_scene_targets(strict) {
         group.destroy();
         return Err(error);
@@ -2123,11 +3056,12 @@ fn build_group(
     group.compose(0.0, 1.0 / 30.0)?;
     let effect_layers = group.fx.len();
     let effect_target_bytes_before = group.effect_target_allocation_bytes();
-    let was_animated = group.animated();
+    let was_animated = group.animated() || !group.live_text.is_empty();
     let memory = if was_animated {
         group.bake_static_effects()?
     } else {
         group.release_composition_inputs();
+        group.frozen = true;
         EffectBakeReport {
             baked_layers: effect_layers,
             released_transient_bytes: effect_target_bytes_before,
@@ -2207,7 +3141,8 @@ fn build_presenter(
             .map(|_| renderer.create_export_image_opts(width, height, false))
             .collect::<Result<Vec<_>>>()?
     };
-    let direct_scene_copy = !exports[0].direct_render
+    let direct_scene_copy = !crate::surface::needs_shader()
+        && !exports[0].direct_render
         && renderer.scene_export_blit_supported()
         && !crate::surface::needs_shader()
         && std::env::var("SKWD_VK_SCENE_DIRECT_COPY").as_deref() != Ok("0");
@@ -2542,7 +3477,10 @@ pub(super) fn run_scene(
     }
     validate_scene_skips(strict, &model.skipped)?;
     if model.layers.is_empty() && model.particles.is_empty() {
-        return Err(anyhow!("scene has no renderable image layers"));
+        return Err(anyhow!(
+            "scene has no renderable image layers ({})",
+            model.skipped.iter().take(4).cloned().collect::<Vec<_>>().join("; ")
+        ));
     }
     tracing::info!(
         "skwd-wall-vk: scene {} canvas {}x{} layers {} skipped {}",
@@ -2846,6 +3784,14 @@ pub(super) fn run_scene(
             );
             continue;
         }
+        if let Some(capture) = ctl.take_capture() {
+            let frame = if capture.source == active_dir && presented {
+                group.renderer.read_scene_target(&group.target)
+            } else {
+                Err(anyhow::anyhow!("scene changed before thumbnail capture"))
+            };
+            crate::freeze::capture_scene(capture, frame);
+        }
         if ctl.freeze_pending() {
             match group.renderer.read_scene_target(&group.target) {
                 Ok((width, height, rgba)) => {
@@ -2904,8 +3850,17 @@ pub(super) fn run_scene(
             fade_first_frame,
         );
         if presented && fade_start.is_none() && !animated {
-            target.dispatch_wait_events(Instant::now() + Duration::from_secs(30))?;
-            continue;
+            let elapsed = epoch.elapsed().as_secs_f32();
+            let wait = group.live_text_wait(elapsed);
+            if wait.is_none_or(|seconds| seconds > 0.0) {
+                let seconds = wait.map_or(30.0, |seconds| seconds.clamp(0.0, 30.0));
+                target.dispatch_wait_events(Instant::now() + Duration::from_secs_f32(seconds))?;
+                continue;
+            }
+            let now = Instant::now();
+            let dt = now.duration_since(last_sim).as_secs_f32().clamp(1.0 / 240.0, 0.1);
+            last_sim = now;
+            group.compose(elapsed, dt)?;
         }
 
         let mut committed = false;
@@ -3034,6 +3989,79 @@ pub(super) fn run_scene(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dump_scene(
+    dir: &str,
+    properties: &paper_scene::model::Properties,
+    width: u32,
+    height: u32,
+    frames: u32,
+    warmup: u32,
+    dt: f32,
+    time0: f32,
+    daytime: f32,
+    out_dir: &std::path::Path,
+) -> Result<()> {
+    let (width, height) = (width.max(16), height.max(16));
+    let pkg_path = locate_pkg(dir)?;
+    let pkg_len = std::fs::metadata(&pkg_path).map(|meta| meta.len()).unwrap_or(0);
+    let pkg = paper_scene::pkg::Package::open(&pkg_path)?;
+    let strict = strict_scene_startup();
+    let mut model =
+        paper_scene::model::load_from_dir_with(&pkg, std::path::Path::new(dir), properties)?;
+    drop(pkg);
+    validate_scene_skips(strict, &model.skipped)?;
+    if model.layers.is_empty() && model.particles.is_empty() {
+        return Err(anyhow!(
+            "scene has no renderable image layers ({})",
+            model.skipped.iter().take(4).cloned().collect::<Vec<_>>().join("; ")
+        ));
+    }
+    let skipped = model.skipped.clone();
+    let sd = shared::create(std::ptr::null_mut()).context("scene dump shared device")?;
+    let mut group = build_group(&sd, &mut model, strict, &[(width, height)], fill_mode())?;
+    drop(model);
+    group.fixed_daytime = Some(daytime);
+    std::fs::create_dir_all(out_dir)?;
+    let started = Instant::now();
+    let mut written = Vec::new();
+    for index in 0..warmup {
+        let time = time0 - (warmup - index) as f32 * dt;
+        group.compose(time.max(0.0), dt)?;
+    }
+    for index in 0..frames.max(1) {
+        let time = time0 + index as f32 * dt;
+        group.compose(time, dt)?;
+        let (w, h, rgba) = group.read_canvas()?;
+        let name = format!("frame_{index:04}.png");
+        let image = image::RgbaImage::from_raw(w, h, rgba)
+            .ok_or_else(|| anyhow!("frame {index} buffer size mismatch"))?;
+        image.save(out_dir.join(&name)).with_context(|| format!("write {name}"))?;
+        written.push(name);
+    }
+    let manifest = serde_json::json!({
+        "scene": dir,
+        "pkg": pkg_path.to_string_lossy(),
+        "pkg_bytes": pkg_len,
+        "canvas": [group.target.extent.width, group.target.extent.height],
+        "logical_canvas": [group.canvas.0, group.canvas.1],
+        "frames": written,
+        "time0": time0,
+        "dt": dt,
+        "daytime": daytime,
+        "pointer": [0.5, 0.5],
+        "fill_mode": format!("{:?}", fill_mode()),
+        "effect_chains": group.fx.len(),
+        "particle_systems": group.particles.len(),
+        "animated": group.animated(),
+        "skipped": skipped,
+        "render_ms": started.elapsed().as_secs_f64() * 1000.0,
+    });
+    std::fs::write(out_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    group.destroy();
+    Ok(())
+}
+
 pub(super) fn stream_scene(
     dir: &str,
     properties: &paper_scene::model::Properties,
@@ -3061,7 +4089,10 @@ pub(super) fn stream_scene(
     }
     validate_scene_skips(strict, &model.skipped)?;
     if model.layers.is_empty() && model.particles.is_empty() {
-        return Err(anyhow!("scene has no renderable image layers"));
+        return Err(anyhow!(
+            "scene has no renderable image layers ({})",
+            model.skipped.iter().take(4).cloned().collect::<Vec<_>>().join("; ")
+        ));
     }
     let sd = shared::create(std::ptr::null_mut()).context("scene stream shared device")?;
     let mut group = build_group(&sd, &mut model, strict, &[(width, height)], fill_mode())?;
@@ -3276,3 +4307,4 @@ pub(super) fn stream_scene(
 
 #[cfg(test)]
 mod tests;
+pub(super) mod thumbnail;

@@ -1,7 +1,7 @@
 use super::*;
 
 fn texture_key(rgba: &[u8], clamp: bool, nearest: bool) -> TextureKey {
-    TextureKey { width: 2, height: 1, rgba: rgba.to_vec(), clamp, nearest }
+    TextureKey { pixels: paper_scene::tex::Pixels::rgba(2, 1, rgba.to_vec()), clamp, nearest }
 }
 
 #[test]
@@ -12,8 +12,7 @@ fn texture_interning_uses_exact_payload_and_sampler_identity() {
 
     assert_eq!(slots.get(&texture_key(&[1, 2, 3, 4, 5, 6, 7, 8], true, false)), Some(&7));
     let mut wrong_dimensions = texture_key(&[1, 2, 3, 4, 5, 6, 7, 8], true, false);
-    wrong_dimensions.width = 1;
-    wrong_dimensions.height = 2;
+    wrong_dimensions.pixels = paper_scene::tex::Pixels::rgba(1, 2, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(slots.get(&wrong_dimensions), None);
     assert_eq!(slots.get(&texture_key(&[1, 2, 3, 4, 5, 6, 7, 9], true, false)), None);
     assert_eq!(slots.get(&texture_key(&[1, 2, 3, 4, 5, 6, 7, 8], false, false)), None);
@@ -23,13 +22,14 @@ fn texture_interning_uses_exact_payload_and_sampler_identity() {
 #[test]
 fn taking_a_texture_key_releases_the_model_payload() {
     let mut texture = paper_scene::model::solid_texture();
-    let expected = texture.rgba.clone();
+    let expected = texture.pixels.clone();
     let key = TextureKey::take(&mut texture);
 
-    assert!(texture.rgba.is_empty());
-    assert_eq!(texture.rgba.capacity(), 0);
-    assert_eq!(key.rgba, expected);
-    assert_eq!((key.width, key.height), (1, 1));
+    assert!(texture.pixels.levels.is_empty());
+    assert_eq!(texture.pixels.bytes(), 0);
+    assert_eq!(key.pixels, expected);
+    assert_eq!((key.pixels.width(), key.pixels.height()), (1, 1));
+    assert_eq!(key.pixels.bytes(), 4);
 }
 
 #[test]
@@ -252,8 +252,8 @@ fn effect_target_accounting_rejects_an_unknown_named_output() {
 
 #[test]
 fn scratch_layout_reuses_only_compatible_cross_layer_targets() {
-    let full = FxTargetClass { width: 1920, height: 1080, repeat: false };
-    let half = FxTargetClass { width: 960, height: 540, repeat: false };
+    let full = FxTargetClass { width: 1920, height: 1080, repeat: false, format: 37 };
+    let half = FxTargetClass { width: 960, height: 540, repeat: false, format: 37 };
     let repeating = FxTargetClass { repeat: true, ..full };
 
     let layout = plan_scratch_layout(&[vec![full, full, half], vec![full, half], vec![repeating]]);
@@ -286,6 +286,7 @@ fn passive_target_quad_crops_padded_texture_at_layer_extent() {
     texture.img_width = 3;
     texture.img_height = 5;
     let layer = paper_scene::model::Layer {
+        live_text: None,
         id: "producer".into(),
         name: "producer".into(),
         visible: true,
@@ -293,12 +294,15 @@ fn passive_target_quad_crops_padded_texture_at_layer_extent() {
         puppet: None,
         center: (0.0, 0.0),
         size: (300.0, 500.0),
+        scale: (1.0, 1.0),
         depth: 0.0,
         scene_order: 0,
         alpha: 1.0,
         angle: 0.0,
         color: [1.0; 3],
         color_blend: 0,
+        passthrough: false,
+        solid: false,
         effects: Vec::new(),
     };
 
@@ -312,6 +316,7 @@ fn passive_target_quad_crops_padded_texture_at_layer_extent() {
 #[test]
 fn active_and_passive_duplicate_ids_remain_ambiguous() {
     let layer = |name: &str| paper_scene::model::Layer {
+        live_text: None,
         id: "duplicate".into(),
         name: name.into(),
         visible: true,
@@ -319,12 +324,15 @@ fn active_and_passive_duplicate_ids_remain_ambiguous() {
         puppet: None,
         center: (0.0, 0.0),
         size: (1.0, 1.0),
+        scale: (1.0, 1.0),
         depth: 0.0,
         scene_order: 0,
         alpha: 1.0,
         angle: 0.0,
         color: [1.0; 3],
         color_blend: 0,
+        passthrough: false,
+        solid: false,
         effects: Vec::new(),
     };
     let layers = [layer("active"), layer("passive")];
@@ -345,6 +353,7 @@ fn active_and_passive_duplicate_ids_remain_ambiguous() {
             binds: &[],
             dynamic: false,
             prefix_dynamic: false,
+            passthrough: false,
         },
         LayerTargetNode {
             id: "consumer",
@@ -353,6 +362,7 @@ fn active_and_passive_duplicate_ids_remain_ambiguous() {
             binds: &consumer_binds,
             dynamic: false,
             prefix_dynamic: false,
+            passthrough: false,
         },
     ];
     let passive = [PassiveLayerTarget { id: &layers[passive_indices[0]].id, dynamic: false }];
@@ -493,4 +503,147 @@ fn a_user_bound_sound_volume_follows_the_scene_property() {
     properties.insert("music_volume".into(), vec![0.2]);
     let tuned = SceneAudio::extract(&pkg, &properties).unwrap().expect("sound");
     assert!((tuned.voices()[0].gain - 0.2).abs() < f32::EPSILON);
+}
+
+#[test]
+fn atlas_frames_advance_by_cumulative_frame_time_and_wrap() {
+    use paper_scene::model::SpriteFrame;
+    let frames = vec![
+        SpriteFrame { uv: [0.0, 0.0, 0.5, 1.0], rotated: false, time: 0.1, image: 0 },
+        SpriteFrame { uv: [0.5, 0.0, 0.5, 1.0], rotated: false, time: 0.3, image: 0 },
+    ];
+    assert_eq!(frame_uv(&frames, 0.4, 0.0), frames[0].uv);
+    assert_eq!(frame_uv(&frames, 0.4, 0.05), frames[0].uv);
+    assert_eq!(frame_uv(&frames, 0.4, 0.2), frames[1].uv);
+    assert_eq!(frame_uv(&frames, 0.4, 0.45), frames[0].uv);
+    assert_eq!(frame_uv(&frames, 0.0, 9.0), frames[0].uv);
+}
+
+fn transform(m: &Mat4, p: [f32; 4]) -> [f32; 4] {
+    let mut out = [0.0; 4];
+    for (row, slot) in out.iter_mut().enumerate() {
+        *slot = (0..4).map(|k| m[k * 4 + row] * p[k]).sum();
+    }
+    out
+}
+
+#[test]
+fn scene_ortho_maps_engine_space_to_vulkan_clip() {
+    let m = scene_ortho((1920.0, 1080.0), false);
+    assert_eq!(transform(&m, [0.0, 0.0, 0.0, 1.0]), [-1.0, 1.0, 0.5, 1.0]);
+    assert_eq!(transform(&m, [1920.0, 1080.0, 0.0, 1.0]), [1.0, -1.0, 0.5, 1.0]);
+    let d3d = scene_ortho((1920.0, 1080.0), true);
+    assert_eq!(transform(&d3d, [0.0, 0.0, 0.0, 1.0]), [-1.0, -1.0, 0.5, 1.0]);
+    assert_eq!(transform(&d3d, [1920.0, 1080.0, 0.0, 1.0]), [1.0, 1.0, 0.5, 1.0]);
+    let model = model_matrix((100.0, 50.0, 0.0), [2.0, 3.0, 1.0], 0.0);
+    let mvp = mat4_mul(&m, &model);
+    let p = transform(&mvp, [10.0, 10.0, 0.0, 1.0]);
+    assert!((p[0] - (2.0 * 120.0 / 1920.0 - 1.0)).abs() < 1e-5);
+    assert!((p[1] - (1.0 - 2.0 * 80.0 / 1080.0)).abs() < 1e-5);
+    let inverse = model_inverse((100.0, 50.0, 0.0), [2.0, 3.0, 1.0], 0.0);
+    let back = transform(&inverse, [120.0, 80.0, 0.0, 1.0]);
+    assert!((back[0] - 10.0).abs() < 1e-5 && (back[1] - 10.0).abs() < 1e-5);
+
+    let turned = model_matrix((100.0, 50.0, 0.0), [2.0, 3.0, 1.0], std::f32::consts::FRAC_PI_2);
+    let up = transform(&turned, [10.0, 0.0, 0.0, 1.0]);
+    assert!(
+        (up[0] - 100.0).abs() < 1e-4 && (up[1] - 70.0).abs() < 1e-4,
+        "a quarter turn sends local +x to world +y: {up:?}"
+    );
+    let undo = model_inverse((100.0, 50.0, 0.0), [2.0, 3.0, 1.0], std::f32::consts::FRAC_PI_2);
+    let back = transform(&undo, [up[0], up[1], 0.0, 1.0]);
+    assert!(
+        (back[0] - 10.0).abs() < 1e-4 && back[1].abs() < 1e-4,
+        "the inverse undoes rotation and scale: {back:?}"
+    );
+}
+
+#[test]
+fn scene_perspective_keeps_the_centre_and_depth_in_range() {
+    let m = scene_perspective((1920.0, 1080.0), false);
+    let d3d = scene_perspective((1920.0, 1080.0), true);
+    let up = transform(&m, [960.0, 1080.0, 0.0, 1.0]);
+    let up_d3d = transform(&d3d, [960.0, 1080.0, 0.0, 1.0]);
+    assert!((up[1] / up[3] + up_d3d[1] / up_d3d[3]).abs() < 1e-5);
+    assert!(up_d3d[1] / up_d3d[3] > 0.0);
+    let centre = transform(&m, [960.0, 540.0, 0.0, 1.0]);
+    assert!(centre[0].abs() < 1e-5 && centre[1].abs() < 1e-5);
+    let ndc_z = centre[2] / centre[3];
+    assert!(ndc_z > 0.0 && ndc_z < 1.0, "{ndc_z}");
+    let near = transform(&m, [960.0, 540.0, 500.0, 1.0]);
+    let far = transform(&m, [960.0, 540.0, -500.0, 1.0]);
+    assert!(near[3] < far[3]);
+    let right = transform(&m, [1500.0, 540.0, 0.0, 1.0]);
+    assert!(right[0] / right[3] > 0.0);
+    let up = transform(&m, [960.0, 1000.0, 0.0, 1.0]);
+    assert!(up[1] / up[3] < 0.0);
+}
+
+#[test]
+fn scene_perspective_matches_the_engine_eye_distance() {
+    for (w, h) in [(1920.0f32, 1080.0f32), (2560.0, 1440.0), (1920.0, 1920.0)] {
+        let m = scene_perspective((w, h), false);
+        let d = super::particle_eye_distance(h);
+        assert!((d - 0.45 * h).abs() < 1e-3);
+        let flat = transform(&m, [w * 0.5, h * 0.5 + 100.0, 0.0, 1.0]);
+        assert!((flat[1] / flat[3] - (-100.0 / (h * 0.5))).abs() < 1e-5, "{:?}", flat);
+        for z in [200.0f32, 100.0, -100.0, -200.0] {
+            let p = transform(&m, [w * 0.5 + 100.0, h * 0.5 + 100.0, z, 1.0]);
+            let s = d / (d - z);
+            assert!((p[0] / p[3] - 100.0 * s / (w * 0.5)).abs() < 1e-4, "z={z} {:?}", p);
+            assert!((p[1] / p[3] + 100.0 * s / (h * 0.5)).abs() < 1e-4, "z={z} {:?}", p);
+        }
+    }
+}
+
+#[test]
+fn sprite_grid_reports_engine_render_var() {
+    use paper_scene::model::{SpriteFrame, Texture};
+    let mut texture = paper_scene::model::solid_texture();
+    texture.width = 400;
+    texture.height = 200;
+    assert_eq!(sprite_grid(&texture), [0.0, 0.0, 0.0, 0.5]);
+    let frame =
+        |x: f32, y: f32| SpriteFrame { uv: [x, y, 0.25, 0.5], rotated: false, time: 0.1, image: 0 };
+    texture.frames = vec![frame(0.0, 0.0), frame(0.25, 0.0), frame(0.5, 0.0)];
+    let grid = sprite_grid(&texture);
+    assert_eq!(grid[0], 0.25);
+    assert_eq!(grid[1], 0.5);
+    assert_eq!(grid[2], 3.0);
+    assert!((grid[3] - 1.0).abs() < 1e-6);
+    let _: &Texture = &texture;
+}
+
+#[test]
+fn layer_model_matrix_composes_origin_rotation_and_scale_without_size() {
+    let mut layer = paper_scene::model::Layer {
+        live_text: None,
+        id: "1".into(),
+        name: "L".into(),
+        visible: true,
+        texture: paper_scene::model::solid_texture(),
+        puppet: None,
+        center: (300.0, 200.0),
+        size: (944.0, 147.0),
+        scale: (7.375, 1.15),
+        depth: 5.0,
+        scene_order: 0,
+        alpha: 1.0,
+        angle: -std::f32::consts::FRAC_PI_2,
+        color: [1.0, 1.0, 1.0],
+        color_blend: 0,
+        passthrough: false,
+        solid: false,
+        effects: Vec::new(),
+    };
+    let (m, inv) = layer_model_matrix(&layer, (1920.0, 1080.0));
+    let x_axis = transform(&m, [1.0, 0.0, 0.0, 0.0]);
+    assert!((x_axis[0]).abs() < 1e-5 && (x_axis[1] - 7.375).abs() < 1e-5, "{x_axis:?}");
+    assert_eq!(transform(&m, [0.0, 0.0, 0.0, 1.0]), [300.0, 880.0, 5.0, 1.0]);
+    let back = transform(&inv, [300.0, 880.0, 5.0, 1.0]);
+    assert!(back.iter().zip([0.0, 0.0, 0.0, 1.0]).all(|(a, b)| (a - b).abs() < 1e-4), "{back:?}");
+    layer.angle = 0.0;
+    let (m, _) = layer_model_matrix(&layer, (1920.0, 1080.0));
+    assert!((m[0] - 7.375).abs() < 1e-6 && (m[5] - 1.15).abs() < 1e-6);
+    assert_ne!(m[0], 944.0);
 }

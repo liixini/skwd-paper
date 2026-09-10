@@ -27,6 +27,7 @@ fn ctl_reduce() {
         volume: Some(40),
         pause: None,
         freeze: None,
+        capture: None,
         shader: None,
         duration_ms: None,
         outputs: None,
@@ -43,6 +44,7 @@ fn ctl_reduce() {
         volume: None,
         pause: Some(true),
         freeze: None,
+        capture: None,
         shader: None,
         duration_ms: None,
         outputs: None,
@@ -104,4 +106,21 @@ fn direct_pause_state_updates() {
     assert!(ctl.paused);
     ctl.set_paused(false);
     assert!(!ctl.paused);
+}
+
+#[test]
+fn scene_capture_preserves_playback_and_pause_state() {
+    for paused in [false, true] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut ctl = Ctl::with_receiver(rx);
+        ctl.set_paused(paused);
+        tx.send(PaperCommand::capture_scene("/scene/a", "/cache/frame.png")).unwrap();
+        assert!(ctl.poll().is_none());
+        assert_eq!(ctl.paused, paused);
+        assert!(!ctl.freeze_pending());
+        let capture = ctl.take_capture().unwrap();
+        assert_eq!(capture.source, "/scene/a");
+        assert_eq!(capture.path, "/cache/frame.png");
+        assert!(ctl.take_capture().is_none());
+    }
 }

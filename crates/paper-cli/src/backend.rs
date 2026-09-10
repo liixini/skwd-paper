@@ -17,6 +17,13 @@ use tokio::process::{Child, ChildStdin, Command};
 
 const EXIT_GRACE: Duration = Duration::from_millis(500);
 
+pub(crate) fn capture_scenes() -> Result<()> {
+    let backends = BackendPaths::discover();
+    let executable = backends.vk.require_headless("Wallpaper Engine thumbnail capture")?;
+    let error = StdCommand::new(executable).arg("--scene-thumbnail-worker").exec();
+    Err(error).context("start scene thumbnail worker")
+}
+
 #[derive(Debug)]
 pub(crate) struct RendererUnavailable {
     message: String,

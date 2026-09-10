@@ -11,7 +11,15 @@ fn node<'a>(
     binds: &'a [Vec<(usize, EffectBind)>],
     dynamic: bool,
 ) -> LayerTargetNode<'a> {
-    LayerTargetNode { id, scene_order, local_targets, binds, dynamic, prefix_dynamic: false }
+    LayerTargetNode {
+        id,
+        scene_order,
+        local_targets,
+        binds,
+        dynamic,
+        prefix_dynamic: false,
+        passthrough: false,
+    }
 }
 
 #[test]
@@ -154,4 +162,34 @@ fn passive_image_layer_is_a_valid_completed_target() {
     assert_eq!(plan.order, [0]);
     assert!(plan.dependencies.is_empty());
     assert!(plan.dynamic[0]);
+}
+
+#[test]
+fn passthrough_layer_snapshots_the_scene_prefix() {
+    let binds: [Vec<(usize, EffectBind)>; 1] = [vec![]];
+    let mut passthrough = node("compose", 1, &[], &binds, false);
+    passthrough.passthrough = true;
+    let nodes = [node("bg", 0, &[], &binds, false), passthrough];
+
+    let plan = plan_scene_targets(&nodes, &[]).unwrap();
+
+    assert_eq!(plan.snapshots, [false, true]);
+    assert_eq!(plan.shadow_targets, 1);
+    assert_eq!(
+        plan.dependencies,
+        [Dependency { producer: 0, consumer: 1, kind: DependencyKind::ScenePrefix }]
+    );
+    assert_eq!(plan.order, [0, 1]);
+}
+
+#[test]
+fn scene_under_layer_binds_snapshot_the_prefix() {
+    let binds: [Vec<(usize, EffectBind)>; 1] = [vec![(4, EffectBind::SceneUnderLayer)]];
+    let none: [Vec<(usize, EffectBind)>; 1] = [vec![]];
+    let nodes = [node("bg", 0, &[], &none, false), node("blend", 1, &[], &binds, false)];
+
+    let plan = plan_scene_targets(&nodes, &[]).unwrap();
+
+    assert_eq!(plan.snapshots, [false, true]);
+    assert_eq!(plan.shadow_targets, 1);
 }

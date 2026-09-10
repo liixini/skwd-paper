@@ -34,6 +34,8 @@ pub struct Renderer {
     pub(super) pipeline_base: vk::Pipeline,
     pub(super) effect_pipes: std::collections::HashMap<usize, vk::Pipeline>,
     pub(super) scene_pass: vk::RenderPass,
+    pub(super) format_passes: Vec<(vk::Format, vk::RenderPass)>,
+    pub(super) format_passes_load: Vec<(vk::Format, vk::RenderPass)>,
     pub(super) scene_pool: vk::DescriptorPool,
     pub(super) fx_pool: vk::DescriptorPool,
     pub(super) pipeline_layout_layer: vk::PipelineLayout,
@@ -53,6 +55,12 @@ pub struct Renderer {
     pub(super) sampler_repeat: vk::Sampler,
     pub(super) sampler_nearest: vk::Sampler,
     pub(super) sampler_nearest_repeat: vk::Sampler,
+    pub(super) sampler_mip: vk::Sampler,
+    pub(super) sampler_mip_repeat: vk::Sampler,
+    pub(super) sampler_mip_nearest: vk::Sampler,
+    pub(super) sampler_mip_nearest_repeat: vk::Sampler,
+    pub(super) bc_supported: bool,
+    pub(super) tex_mips: bool,
     pub(super) cmd_pool: vk::CommandPool,
     pub(super) cmd: vk::CommandBuffer,
     pub(super) acquire_sem: vk::Semaphore,
@@ -249,12 +257,16 @@ impl Renderer {
             let qci = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&prio)];
+            let supported = instance.get_physical_device_features(phys);
+            let features = vk::PhysicalDeviceFeatures::default()
+                .texture_compression_bc(supported.texture_compression_bc == vk::TRUE);
             let device = instance
                 .create_device(
                     phys,
                     &vk::DeviceCreateInfo::default()
                         .queue_create_infos(&qci)
-                        .enabled_extension_names(&dev_exts),
+                        .enabled_extension_names(&dev_exts)
+                        .enabled_features(&features),
                     None,
                 )
                 .context("create device")?;
@@ -323,23 +335,38 @@ impl Renderer {
                 })
                 .collect::<std::result::Result<_, _>>()?;
 
-            let make_sampler = |filter: vk::Filter, mode: vk::SamplerAddressMode| {
+            let make_sampler = |filter: vk::Filter, mode: vk::SamplerAddressMode, mips: bool| {
+                let mipmap_mode = if filter == vk::Filter::NEAREST {
+                    vk::SamplerMipmapMode::NEAREST
+                } else {
+                    vk::SamplerMipmapMode::LINEAR
+                };
                 device.create_sampler(
                     &vk::SamplerCreateInfo::default()
                         .mag_filter(filter)
                         .min_filter(filter)
+                        .mipmap_mode(mipmap_mode)
                         .address_mode_u(mode)
                         .address_mode_v(mode)
-                        .address_mode_w(mode),
+                        .address_mode_w(mode)
+                        .max_lod(if mips { vk::LOD_CLAMP_NONE } else { 0.0 }),
                     None,
                 )
             };
-            let sampler = make_sampler(vk::Filter::LINEAR, vk::SamplerAddressMode::CLAMP_TO_EDGE)?;
-            let sampler_repeat = make_sampler(vk::Filter::LINEAR, vk::SamplerAddressMode::REPEAT)?;
-            let sampler_nearest =
-                make_sampler(vk::Filter::NEAREST, vk::SamplerAddressMode::CLAMP_TO_EDGE)?;
-            let sampler_nearest_repeat =
-                make_sampler(vk::Filter::NEAREST, vk::SamplerAddressMode::REPEAT)?;
+            let clamp = vk::SamplerAddressMode::CLAMP_TO_EDGE;
+            let repeat = vk::SamplerAddressMode::REPEAT;
+            let sampler = make_sampler(vk::Filter::LINEAR, clamp, false)?;
+            let sampler_repeat = make_sampler(vk::Filter::LINEAR, repeat, false)?;
+            let sampler_nearest = make_sampler(vk::Filter::NEAREST, clamp, false)?;
+            let sampler_nearest_repeat = make_sampler(vk::Filter::NEAREST, repeat, false)?;
+            let sampler_mip = make_sampler(vk::Filter::LINEAR, clamp, true)?;
+            let sampler_mip_repeat = make_sampler(vk::Filter::LINEAR, repeat, true)?;
+            let sampler_mip_nearest = make_sampler(vk::Filter::NEAREST, clamp, true)?;
+            let sampler_mip_nearest_repeat = make_sampler(vk::Filter::NEAREST, repeat, true)?;
+            let env_on = |name: &str| std::env::var(name).as_deref() != Ok("0");
+            let bc_supported = env_on("SKWD_PAPER_TEX_BC")
+                && instance.get_physical_device_features(phys).texture_compression_bc == vk::TRUE;
+            let tex_mips = env_on("SKWD_PAPER_TEX_MIPS");
 
             let bindings = [
                 vk::DescriptorSetLayoutBinding::default()
@@ -445,6 +472,8 @@ impl Renderer {
                 pipeline_base: vk::Pipeline::null(),
                 effect_pipes: std::collections::HashMap::new(),
                 scene_pass: vk::RenderPass::null(),
+                format_passes: Vec::new(),
+                format_passes_load: Vec::new(),
                 scene_pool: vk::DescriptorPool::null(),
                 fx_pool: vk::DescriptorPool::null(),
                 pipeline_layout_layer: vk::PipelineLayout::null(),
@@ -464,6 +493,12 @@ impl Renderer {
                 sampler_repeat,
                 sampler_nearest,
                 sampler_nearest_repeat,
+                sampler_mip,
+                sampler_mip_repeat,
+                sampler_mip_nearest,
+                sampler_mip_nearest_repeat,
+                bc_supported,
+                tex_mips,
                 cmd_pool,
                 cmd,
                 acquire_sem,
@@ -521,6 +556,11 @@ impl Drop for Renderer {
             }
             if self.scene_pass != vk::RenderPass::null() {
                 self.device.destroy_render_pass(self.scene_pass, None);
+                for (_, pass) in
+                    self.format_passes.drain(..).chain(self.format_passes_load.drain(..))
+                {
+                    self.device.destroy_render_pass(pass, None);
+                }
             }
             self.device.destroy_pipeline(self.pipeline_sand, None);
             self.device.destroy_pipeline(self.pipeline_base, None);
@@ -535,6 +575,10 @@ impl Drop for Renderer {
             self.device.destroy_sampler(self.sampler_repeat, None);
             self.device.destroy_sampler(self.sampler_nearest, None);
             self.device.destroy_sampler(self.sampler_nearest_repeat, None);
+            self.device.destroy_sampler(self.sampler_mip, None);
+            self.device.destroy_sampler(self.sampler_mip_repeat, None);
+            self.device.destroy_sampler(self.sampler_mip_nearest, None);
+            self.device.destroy_sampler(self.sampler_mip_nearest_repeat, None);
             for fb in &self.framebuffers {
                 self.device.destroy_framebuffer(*fb, None);
             }

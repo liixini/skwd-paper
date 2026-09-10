@@ -53,10 +53,51 @@ fn transition_hold_enabled(args: &[String]) -> bool {
 
 pub(crate) fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(feature = "shared-device")]
+    if args.get(1).map(String::as_str) == Some("--scene-thumbnail-worker") {
+        return super::scene::thumbnail::run();
+    }
     ctl::set_stdin_enabled(control_stdin_enabled(&args));
     #[cfg(feature = "shared-device")]
     if let Some(index) = args.iter().position(|arg| arg == "--decode-probe") {
         return crate::probe::run(&args[index + 1..]);
+    }
+    #[cfg(feature = "shared-device")]
+    if args.get(1).map(String::as_str) == Some("scene-dump") {
+        if args.len() < 3 {
+            usage();
+        }
+        let opts = &args[3..];
+        let number = |flag: &str, fallback: f32| {
+            parse_flag(opts, flag).and_then(|text| text.parse::<f32>().ok()).unwrap_or(fallback)
+        };
+        let (width, height) = crate::preview::parse_size(parse_flag(opts, "--size"));
+        let frames =
+            parse_flag(opts, "--frames").and_then(|text| text.parse::<u32>().ok()).unwrap_or(1);
+        let warmup =
+            parse_flag(opts, "--warmup").and_then(|text| text.parse::<u32>().ok()).unwrap_or(0);
+        let out = parse_flag(opts, "--out")
+            .map(std::path::PathBuf::from)
+            .context("scene-dump requires --out")?;
+        let properties = parse_flag(opts, "--scene-properties")
+            .map(super::scene::parse_scene_properties)
+            .unwrap_or_default();
+        let fill = parse_flag(opts, "--fill-mode")
+            .and_then(|text| text.parse::<FillMode>().ok())
+            .unwrap_or_default();
+        set_fill_mode(fill);
+        return super::scene::dump_scene(
+            &args[2],
+            &properties,
+            width,
+            height,
+            frames,
+            warmup,
+            number("--dt", 1.0 / 30.0),
+            number("--time0", 0.0),
+            number("--daytime", 0.5),
+            &out,
+        );
     }
     if args.iter().any(|arg| arg == "--video-stream") {
         if args.len() < 3 {

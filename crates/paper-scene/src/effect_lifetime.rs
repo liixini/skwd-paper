@@ -64,8 +64,28 @@ pub fn resolve_fbo_index<'a>(
     names: impl IntoIterator<Item = &'a str>,
     name: &str,
 ) -> Option<usize> {
+    resolve_fbo_among(names.into_iter().enumerate(), name)
+}
+
+pub fn resolve_fbo_scoped<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    fbo_owners: &[Option<usize>],
+    owner: usize,
+    name: &str,
+) -> Option<usize> {
+    let candidates = names
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| fbo_owners.get(*index).copied().flatten().is_none_or(|o| o == owner));
+    resolve_fbo_among(candidates, name)
+}
+
+fn resolve_fbo_among<'a>(
+    candidates: impl IntoIterator<Item = (usize, &'a str)>,
+    name: &str,
+) -> Option<usize> {
     let mut longest: Option<(usize, usize)> = None;
-    for (index, candidate) in names.into_iter().enumerate() {
+    for (index, candidate) in candidates {
         if candidate == name {
             return Some(index);
         }
@@ -74,9 +94,11 @@ pub fn resolve_fbo_index<'a>(
             continue;
         };
         if suffix.is_empty()
+            || !suffix.split('_').all(|part| !part.is_empty())
             || !suffix
-                .split('_')
-                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+                .rsplit('_')
+                .next()
+                .is_some_and(|tail| tail.bytes().all(|b| b.is_ascii_digit()))
         {
             continue;
         }
@@ -87,8 +109,15 @@ pub fn resolve_fbo_index<'a>(
     longest.map(|(index, _)| index)
 }
 
-fn fbo_target(names: &[String], name: &str) -> Option<Target> {
-    resolve_fbo_index(names.iter().map(String::as_str), name).map(Target::Fbo)
+fn fbo_target(
+    names: &[String],
+    fbo_owners: &[Option<usize>],
+    owner: usize,
+    remap: &[usize],
+    name: &str,
+) -> Option<Target> {
+    resolve_fbo_scoped(names.iter().map(String::as_str), fbo_owners, owner, name)
+        .map(|logical| Target::Fbo(remap[logical]))
 }
 
 fn note_read(lifetime: &mut TargetLifetime, step: usize) {
@@ -111,6 +140,18 @@ pub fn plan_targets(
     binds: &[Vec<(usize, EffectBind)>],
     owners: &[usize],
 ) -> Result<TargetPlan, TargetPlanError> {
+    let fbo_owners = vec![None; fbo_names.len()];
+    plan_targets_with(fbo_names, &fbo_owners, &[], targets, binds, owners)
+}
+
+pub fn plan_targets_with(
+    fbo_names: &[String],
+    fbo_owners: &[Option<usize>],
+    swaps: &[(Option<usize>, usize, usize)],
+    targets: &[Option<String>],
+    binds: &[Vec<(usize, EffectBind)>],
+    owners: &[usize],
+) -> Result<TargetPlan, TargetPlanError> {
     if targets.len() != binds.len() || targets.len() != owners.len() {
         return Err(TargetPlanError::MetadataLength {
             targets: targets.len(),
@@ -121,6 +162,19 @@ pub fn plan_targets(
 
     let mut lifetimes = vec![TargetLifetime::default(); fbo_names.len() + 2];
     note_write(&mut lifetimes[Target::Pong.index()], 0);
+    let mut remap: Vec<usize> = (0..fbo_names.len()).collect();
+    let apply_swaps =
+        |after: Option<usize>, remap: &mut Vec<usize>, lifetimes: &mut Vec<TargetLifetime>| {
+            for &(when, a, b) in swaps {
+                if when == after && a < remap.len() && b < remap.len() && a != b {
+                    remap.swap(a, b);
+                    for logical in [a, b] {
+                        lifetimes[Target::Fbo(remap[logical]).index()].loop_carried = true;
+                    }
+                }
+            }
+        };
+    apply_swaps(None, &mut remap, &mut lifetimes);
 
     let mut accesses = Vec::with_capacity(targets.len());
     let mut previous = Target::Pong;
@@ -141,8 +195,10 @@ pub fn plan_targets(
         for (slot, binding) in pass_binds {
             let bound = match binding {
                 EffectBind::Previous => Some(previous),
-                EffectBind::Named(name) => fbo_target(fbo_names, name),
-                EffectBind::LayerComposite { .. } | EffectBind::SceneSoFar => None,
+                EffectBind::Named(name) => fbo_target(fbo_names, fbo_owners, *owner, &remap, name),
+                EffectBind::LayerComposite { .. }
+                | EffectBind::SceneSoFar
+                | EffectBind::SceneUnderLayer => None,
             };
             if let Some(bound) = bound {
                 target_reads.insert(*slot, bound);
@@ -152,7 +208,9 @@ pub fn plan_targets(
         reads.sort_unstable_by_key(|target| target.index());
         reads.dedup();
 
-        let named = target_name.as_deref().and_then(|name| fbo_target(fbo_names, name));
+        let named = target_name
+            .as_deref()
+            .and_then(|name| fbo_target(fbo_names, fbo_owners, *owner, &remap, name));
         let write = if let Some(named) = named {
             named
         } else {
@@ -178,6 +236,7 @@ pub fn plan_targets(
         if named.is_none() {
             flip = !flip;
         }
+        apply_swaps(Some(pass), &mut remap, &mut lifetimes);
     }
 
     let compose_step = targets.len() + 1;

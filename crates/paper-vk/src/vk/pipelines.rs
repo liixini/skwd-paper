@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ash::vk;
 
 use super::Renderer;
@@ -265,54 +265,111 @@ unsafe fn build_pipeline(device: &ash::Device, spec: &PipelineSpec<'_>) -> Resul
     }
 }
 
+pub(super) fn create_scene_render_pass(
+    device: &ash::Device,
+    format: vk::Format,
+) -> Result<vk::RenderPass> {
+    create_scene_pass(device, format, false)
+}
+
+pub(super) fn create_scene_render_pass_load(
+    device: &ash::Device,
+    format: vk::Format,
+) -> Result<vk::RenderPass> {
+    create_scene_pass(device, format, true)
+}
+
+fn create_scene_pass(
+    device: &ash::Device,
+    format: vk::Format,
+    load: bool,
+) -> Result<vk::RenderPass> {
+    unsafe {
+        let attachment = [vk::AttachmentDescription::default()
+            .format(format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(if load { vk::AttachmentLoadOp::LOAD } else { vk::AttachmentLoadOp::CLEAR })
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .initial_layout(if load {
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            } else {
+                vk::ImageLayout::UNDEFINED
+            })
+            .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let color_ref = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let subpass = [vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_ref)];
+        let dependencies = [
+            vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::TRANSFER,
+                )
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags::TRANSFER_READ,
+                )
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ),
+        ];
+        device
+            .create_render_pass(
+                &vk::RenderPassCreateInfo::default()
+                    .attachments(&attachment)
+                    .subpasses(&subpass)
+                    .dependencies(&dependencies),
+                None,
+            )
+            .map_err(|err| anyhow!("scene render pass: {err}"))
+    }
+}
+
 impl Renderer {
+    pub fn scene_pass_for(&mut self, format: vk::Format) -> Result<vk::RenderPass> {
+        self.ensure_scene_pipelines()?;
+        if format == vk::Format::R8G8B8A8_UNORM {
+            return Ok(self.scene_pass);
+        }
+        if let Some((_, pass)) = self.format_passes.iter().find(|(known, _)| *known == format) {
+            return Ok(*pass);
+        }
+        let pass = create_scene_render_pass(&self.device, format)?;
+        self.format_passes.push((format, pass));
+        Ok(pass)
+    }
+
+    pub fn scene_pass_load_for(&mut self, format: vk::Format) -> Result<vk::RenderPass> {
+        self.ensure_scene_pipelines()?;
+        if let Some((_, pass)) = self.format_passes_load.iter().find(|(known, _)| *known == format)
+        {
+            return Ok(*pass);
+        }
+        let pass = create_scene_render_pass_load(&self.device, format)?;
+        self.format_passes_load.push((format, pass));
+        Ok(pass)
+    }
+
     pub(crate) fn ensure_scene_pipelines(&mut self) -> Result<()> {
         if self.pipeline_layer != vk::Pipeline::null() {
             return Ok(());
         }
         let device = self.device.clone();
         unsafe {
-            let attachment = [vk::AttachmentDescription::default()
-                .format(vk::Format::R8G8B8A8_UNORM)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let color_ref = [vk::AttachmentReference::default()
-                .attachment(0)
-                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-            let subpass = [vk::SubpassDescription::default()
-                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                .color_attachments(&color_ref)];
-            let dependencies = [
-                vk::SubpassDependency::default()
-                    .src_subpass(vk::SUBPASS_EXTERNAL)
-                    .dst_subpass(0)
-                    .src_stage_mask(
-                        vk::PipelineStageFlags::FRAGMENT_SHADER
-                            | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    )
-                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                    .src_access_mask(
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                    )
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-                vk::SubpassDependency::default()
-                    .src_subpass(0)
-                    .dst_subpass(vk::SUBPASS_EXTERNAL)
-                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                    .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ),
-            ];
-            self.scene_pass = device.create_render_pass(
-                &vk::RenderPassCreateInfo::default()
-                    .attachments(&attachment)
-                    .subpasses(&subpass)
-                    .dependencies(&dependencies),
-                None,
-            )?;
+            self.scene_pass = create_scene_render_pass(&device, vk::Format::R8G8B8A8_UNORM)?;
 
             let layouts = [self.desc_layout];
             let push = [vk::PushConstantRange::default()

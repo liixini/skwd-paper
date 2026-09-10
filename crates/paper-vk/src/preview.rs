@@ -524,6 +524,7 @@ pub(crate) fn dmabuf_video_stream(
     let mut transition_active = transition.is_some();
     let mut timeline_shift = std::time::Duration::ZERO;
     let mut emit_frame = |frame: &ffmpeg_the_third::frame::Video,
+                          decoder: &mut crate::decode::AnyDecoder,
                           upload_frame: bool,
                           deadline: Instant,
                           emitted: &mut bool,
@@ -568,7 +569,14 @@ pub(crate) fn dmabuf_video_stream(
         {
             return Ok(transition.is_some());
         }
-        if let Some(delay) = deadline.checked_duration_since(now) {
+        let transferred = if upload_frame && let crate::decode::AnyDecoder::Vaapi(decoder) = decoder
+        {
+            Some(decoder.transfer_frame(frame)?)
+        } else {
+            None
+        };
+        let frame = transferred.as_ref().unwrap_or(frame);
+        if let Some(delay) = deadline.checked_duration_since(Instant::now()) {
             std::thread::sleep(delay);
         }
         let slot = free.iter().position(|value| *value).unwrap();
@@ -660,7 +668,10 @@ pub(crate) fn dmabuf_video_stream(
         Ok(transition.is_some())
     };
     loop {
-        let (frame, pts) = decoder.next()?;
+        let (frame, pts) = match &mut decoder {
+            crate::decode::AnyDecoder::Vaapi(decoder) => decoder.next_hw_frame()?,
+            _ => decoder.next()?,
+        };
         if last_pts.is_some_and(|last| pts < last) {
             first_pts = None;
             next_emit = 0.0;
@@ -683,12 +694,19 @@ pub(crate) fn dmabuf_video_stream(
         {
             let mut fill_deadline = previous_deadline + frame_duration;
             while transition_active && fill_deadline < deadline {
-                transition_active =
-                    emit_frame(previous, false, fill_deadline, &mut emitted, &mut timeline_shift)?;
+                transition_active = emit_frame(
+                    previous,
+                    &mut decoder,
+                    false,
+                    fill_deadline,
+                    &mut emitted,
+                    &mut timeline_shift,
+                )?;
                 fill_deadline += frame_duration;
             }
         }
-        transition_active = emit_frame(&frame, true, deadline, &mut emitted, &mut timeline_shift)?;
+        transition_active =
+            emit_frame(&frame, &mut decoder, true, deadline, &mut emitted, &mut timeline_shift)?;
         last_deadline = Some(deadline);
         previous_frame = Some(frame);
     }

@@ -25,6 +25,7 @@ pub struct SceneFeatures {
     pub puppet_unsupported: bool,
     pub parallax: bool,
     pub audio: bool,
+    pub scripts: usize,
     pub tex_formats: BTreeMap<String, usize>,
     pub tex_gif: usize,
     pub animated_image_textures: BTreeSet<String>,
@@ -218,6 +219,16 @@ fn key_present(value: &Value, needle: &str) -> bool {
     }
 }
 
+fn count_key(value: &Value, key: &str) -> usize {
+    match value {
+        Value::Object(map) => {
+            map.iter().map(|(k, v)| usize::from(k == key) + count_key(v, key)).sum()
+        }
+        Value::Array(items) => items.iter().map(|item| count_key(item, key)).sum(),
+        _ => 0,
+    }
+}
+
 pub fn extract(pkg: &Package) -> Result<SceneFeatures, String> {
     let mut out = SceneFeatures::default();
     let scene = match pkg.find_json("scene.json") {
@@ -267,9 +278,17 @@ pub fn extract(pkg: &Package) -> Result<SceneFeatures, String> {
         }
     }
 
-    out.parallax = key_present(&scene, "parallax");
+    out.parallax = scene
+        .get("general")
+        .and_then(|general| general.get("cameraparallax"))
+        .is_some_and(|value| match value {
+            Value::Bool(flag) => *flag,
+            Value::Object(map) => map.get("value").and_then(Value::as_bool).unwrap_or(false),
+            _ => false,
+        });
     out.audio = key_present(&scene, "audioprocessing")
         || out.combos.iter().any(|combo| combo.to_ascii_lowercase().contains("audio"));
+    out.scripts = count_key(&scene, "script");
 
     for entry in pkg.entries() {
         if !entry.path.ends_with(".tex") {

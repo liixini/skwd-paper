@@ -12,12 +12,12 @@ mod upload;
 #[cfg(feature = "shared-device")]
 pub use draw::Src;
 #[cfg(feature = "shared-device")]
-pub use effect::{EffectPipeline, QuadBuffer};
+pub use effect::{DynBuffer, EffectPipeline, QuadBuffer, d3d_clip_enabled};
 #[cfg(feature = "shared-device")]
 pub use export::{ExportImage, ExternalSemaphore, Nv12Export, ReadbackBuf, RenderTarget};
 pub use export::{FrameImages, FrameViews};
 #[cfg(feature = "shared-device")]
 pub use nv12::Nv12Presenter;
 pub use renderer::Renderer;
-pub use scene::{SceneBlend, SceneMesh, SceneQuad, SceneTarget, SceneTexture};
+pub use scene::{ParticleDraw, SceneBlend, SceneMesh, SceneQuad, SceneTarget, SceneTexture};
 pub use upload::UploadPath;

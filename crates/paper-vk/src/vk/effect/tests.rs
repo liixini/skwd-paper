@@ -39,3 +39,14 @@ fn uniform_block_rejected() {
     let frag = translated(&[], MAX_EFFECT_UBO_BYTES);
     assert!(effect_caps(&vert, &frag).is_ok());
 }
+
+#[test]
+fn dxc_pipelines_get_a_negative_height_viewport_over_the_same_rows() {
+    let extent = ash::vk::Extent2D { width: 640, height: 360 };
+    let gl = super::viewport(extent, false);
+    let d3d = super::viewport(extent, true);
+    assert_eq!((gl.y, gl.height), (0.0, 360.0));
+    assert_eq!((d3d.y, d3d.height), (360.0, -360.0));
+    assert_eq!(gl.y + gl.height, d3d.y + d3d.height + 360.0);
+    assert_eq!((gl.width, d3d.width), (640.0, 640.0));
+}

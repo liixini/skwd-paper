@@ -231,6 +231,11 @@ fn confirm_presentation(
     checkpoint: &[u64],
     label: &str,
 ) -> Result<()> {
+    if target.layer
+        == wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer::Background
+    {
+        return Ok(());
+    }
     let confirmed = target
         .wait_presentation_after(checkpoint, Instant::now() + std::time::Duration::from_secs(2))?;
     require_presentation_confirmation(confirmed, label)
@@ -1089,7 +1094,7 @@ pub(super) fn run_nv12(
                 committed,
                 || {
                     confirm_presentation(target, &presentation_checkpoint, "NV12 source frame")?;
-                    tracing::info!("skwd-wall-vk: NV12 source frame presented");
+                    tracing::info!("skwd-wall-vk: NV12 source frame ready");
                     Ok::<(), anyhow::Error>(())
                 },
                 signal_ready,

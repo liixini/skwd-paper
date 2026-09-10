@@ -13,6 +13,7 @@ const MAX_MANIFEST: u64 = 1024 * 1024;
 pub(crate) fn run() -> Result<()> {
     match crate::cli::Cli::read().command {
         Command::Serve => crate::server::run(),
+        Command::CaptureScenes => crate::backend::capture_scenes(),
         Command::Apply(args) => send(RequestParams::Apply(apply_request(args)?)),
         Command::Stop(args) => {
             send(RequestParams::Stop(StopRequest { outputs: normalize_outputs(args.outputs) }))

@@ -1,6 +1,7 @@
 use crate::vk::Renderer;
 use anyhow::{Context, Result, anyhow};
 use ash::vk;
+use paper_scene::tex::{PixelFormat, Pixels};
 
 pub struct SceneTexture {
     image: vk::Image,
@@ -8,6 +9,7 @@ pub struct SceneTexture {
     pub view: vk::ImageView,
     pub sampler: vk::Sampler,
     set: vk::DescriptorSet,
+    pub allocation_bytes: u64,
 }
 
 pub struct SceneTarget {
@@ -19,6 +21,8 @@ pub struct SceneTarget {
     pub extent: vk::Extent2D,
     pub allocation_bytes: u64,
     pub repeat: bool,
+    pub format: vk::Format,
+    pub(super) render_pass: vk::RenderPass,
 }
 
 pub struct SceneMesh {
@@ -46,6 +50,15 @@ pub struct SceneQuad {
     pub angle: f32,
     pub texture: usize,
     pub blend: SceneBlend,
+}
+
+pub struct ParticleDraw<'a> {
+    pub after: usize,
+    pub pipeline: &'a crate::vk::EffectPipeline,
+    pub vertices: vk::Buffer,
+    pub indices: vk::Buffer,
+    pub index_count: u32,
+    pub grab: Option<&'a SceneTarget>,
 }
 
 #[repr(C)]
@@ -185,7 +198,7 @@ impl Renderer {
             self.device.cmd_begin_render_pass(
                 self.cmd,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.scene_pass)
+                    .render_pass(target.render_pass)
                     .framebuffer(target.framebuffer)
                     .render_area(vk::Rect2D {
                         offset: vk::Offset2D { x: 0, y: 0 },
@@ -259,6 +272,12 @@ impl Renderer {
                     .descriptor_count(512),
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(4096),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(4096),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLER)
                     .descriptor_count(4096),
             ];
             self.fx_pool = unsafe {
@@ -335,15 +354,71 @@ impl Renderer {
         clamp: bool,
         nearest: bool,
     ) -> Result<SceneTexture> {
-        let sampler = match (clamp, nearest) {
-            (true, false) => self.sampler,
-            (false, false) => self.sampler_repeat,
-            (true, true) => self.sampler_nearest,
-            (false, true) => self.sampler_nearest_repeat,
-        };
         let expect = width as usize * height as usize * 4;
         if rgba.len() < expect {
             return Err(anyhow!("texture payload {} < {expect}", rgba.len()));
+        }
+        let pixels = Pixels::rgba(width, height, rgba[..expect].to_vec());
+        self.create_scene_texture_pixels(&pixels, clamp, nearest, false)
+    }
+
+    pub fn create_scene_texture_pixels(
+        &mut self,
+        pixels: &Pixels,
+        clamp: bool,
+        nearest: bool,
+        mips: bool,
+    ) -> Result<SceneTexture> {
+        let decoded;
+        let pixels = if pixels.format.compressed() && !self.bc_supported {
+            decoded = pixels.decompressed().ok_or_else(|| anyhow!("tex bc decode"))?;
+            &decoded
+        } else {
+            pixels
+        };
+        let (width, height) = (pixels.width(), pixels.height());
+        if width == 0 || height == 0 || pixels.levels.is_empty() {
+            return Err(anyhow!("empty texture"));
+        }
+        let format = match pixels.format {
+            PixelFormat::Rgba8 => vk::Format::R8G8B8A8_UNORM,
+            PixelFormat::Bc1 => vk::Format::BC1_RGBA_UNORM_BLOCK,
+            PixelFormat::Bc2 => vk::Format::BC2_UNORM_BLOCK,
+            PixelFormat::Bc3 => vk::Format::BC3_UNORM_BLOCK,
+            PixelFormat::R8 => vk::Format::R8_UNORM,
+            PixelFormat::Rg8 => vk::Format::R8G8_UNORM,
+        };
+        let mips = mips && self.tex_mips;
+        let shipped = pixels.levels.len() as u32;
+        let full_chain = 32 - width.max(height).leading_zeros();
+        let generate = mips && !pixels.format.compressed() && shipped == 1 && full_chain > 1;
+        let levels = if generate {
+            full_chain
+        } else if mips {
+            shipped
+        } else {
+            1
+        };
+        let sampler = match (clamp, nearest, levels > 1) {
+            (true, false, false) => self.sampler,
+            (false, false, false) => self.sampler_repeat,
+            (true, true, false) => self.sampler_nearest,
+            (false, true, false) => self.sampler_nearest_repeat,
+            (true, false, true) => self.sampler_mip,
+            (false, false, true) => self.sampler_mip_repeat,
+            (true, true, true) => self.sampler_mip_nearest,
+            (false, true, true) => self.sampler_mip_nearest_repeat,
+        };
+        let mut offsets = Vec::with_capacity(levels as usize);
+        let mut total = 0usize;
+        for level in pixels.levels.iter().take(levels as usize) {
+            total = (total + 15) & !15;
+            offsets.push(total);
+            total += level.data.len();
+        }
+        let mut usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+        if generate {
+            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
         }
         unsafe {
             let image = self
@@ -351,13 +426,13 @@ impl Renderer {
                 .create_image(
                     &vk::ImageCreateInfo::default()
                         .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .format(format)
                         .extent(vk::Extent3D { width, height, depth: 1 })
-                        .mip_levels(1)
+                        .mip_levels(levels)
                         .array_layers(1)
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                        .usage(usage)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE)
                         .initial_layout(vk::ImageLayout::UNDEFINED),
                     None,
@@ -374,7 +449,7 @@ impl Renderer {
 
             let staging = self.device.create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(expect as u64)
+                    .size(total.max(16) as u64)
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
@@ -389,18 +464,38 @@ impl Renderer {
             self.device.bind_buffer_memory(staging, smem, 0)?;
             let ptr = self
                 .device
-                .map_memory(smem, 0, expect as u64, vk::MemoryMapFlags::empty())
-                .context("tex map")?;
-            std::ptr::copy_nonoverlapping(rgba.as_ptr(), ptr.cast::<u8>(), expect);
+                .map_memory(smem, 0, sreqs.size, vk::MemoryMapFlags::empty())
+                .context("tex map")?
+                .cast::<u8>();
+            for (level, offset) in pixels.levels.iter().zip(&offsets) {
+                std::ptr::copy_nonoverlapping(
+                    level.data.as_ptr(),
+                    ptr.add(*offset),
+                    level.data.len(),
+                );
+            }
             self.device.unmap_memory(smem);
 
             self.begin_frame_cmd()?;
-            let range = vk::ImageSubresourceRange {
+            let range = |base: u32, count: u32| vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
+                base_mip_level: base,
+                level_count: count,
                 base_array_layer: 0,
                 layer_count: 1,
+            };
+            let barrier = |old: vk::ImageLayout,
+                           new: vk::ImageLayout,
+                           src: vk::AccessFlags,
+                           dst: vk::AccessFlags,
+                           range: vk::ImageSubresourceRange| {
+                vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(old)
+                    .new_layout(new)
+                    .src_access_mask(src)
+                    .dst_access_mask(dst)
+                    .subresource_range(range)
             };
             self.device.cmd_pipeline_barrier(
                 self.cmd,
@@ -409,42 +504,130 @@ impl Renderer {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[vk::ImageMemoryBarrier::default()
-                    .image(image)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .subresource_range(range)],
+                &[barrier(
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    range(0, levels),
+                )],
             );
+            let regions: Vec<vk::BufferImageCopy> = pixels
+                .levels
+                .iter()
+                .zip(&offsets)
+                .enumerate()
+                .map(|(index, (level, offset))| {
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(*offset as u64)
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: index as u32,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width: level.width,
+                            height: level.height,
+                            depth: 1,
+                        })
+                })
+                .collect();
             self.device.cmd_copy_buffer_to_image(
                 self.cmd,
                 staging,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
+                &regions,
+            );
+            if generate {
+                let (mut src_w, mut src_h) = (width as i32, height as i32);
+                for level in 1..levels {
+                    self.device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier(
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::TRANSFER_READ,
+                            range(level - 1, 1),
+                        )],
+                    );
+                    let (dst_w, dst_h) = ((src_w / 2).max(1), (src_h / 2).max(1));
+                    let layers = |mip: u32| vk::ImageSubresourceLayers {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
+                        mip_level: mip,
                         base_array_layer: 0,
                         layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D { width, height, depth: 1 })],
-            );
-            self.device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[vk::ImageMemoryBarrier::default()
-                    .image(image)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .subresource_range(range)],
-            );
+                    };
+                    let blit = vk::ImageBlit::default()
+                        .src_subresource(layers(level - 1))
+                        .src_offsets([
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D { x: src_w, y: src_h, z: 1 },
+                        ])
+                        .dst_subresource(layers(level))
+                        .dst_offsets([
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D { x: dst_w, y: dst_h, z: 1 },
+                        ]);
+                    self.device.cmd_blit_image(
+                        self.cmd,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[blit],
+                        vk::Filter::LINEAR,
+                    );
+                    (src_w, src_h) = (dst_w, dst_h);
+                }
+                self.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[
+                        barrier(
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::AccessFlags::TRANSFER_READ,
+                            vk::AccessFlags::SHADER_READ,
+                            range(0, levels - 1),
+                        ),
+                        barrier(
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::SHADER_READ,
+                            range(levels - 1, 1),
+                        ),
+                    ],
+                );
+            } else {
+                self.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier(
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                        range(0, levels),
+                    )],
+                );
+            }
             self.device.end_command_buffer(self.cmd)?;
             let cmds = [self.cmd];
             self.device.reset_fences(&[self.fence])?;
@@ -466,8 +649,8 @@ impl Renderer {
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
-                    .subresource_range(range),
+                    .format(format)
+                    .subresource_range(range(0, levels)),
                 None,
             )?;
             let layouts = [self.desc_layout];
@@ -495,7 +678,7 @@ impl Renderer {
                 ],
                 &[],
             );
-            Ok(SceneTexture { image, memory, view, sampler, set })
+            Ok(SceneTexture { image, memory, view, sampler, set, allocation_bytes: reqs.size })
         }
     }
 
@@ -514,6 +697,7 @@ impl Renderer {
             view: vk::ImageView::null(),
             sampler: self.sampler,
             set,
+            allocation_bytes: 0,
         })
     }
 
@@ -571,13 +755,23 @@ impl Renderer {
         height: u32,
         repeat: bool,
     ) -> Result<SceneTarget> {
-        self.ensure_scene_pipelines()?;
+        self.create_scene_target_fmt(width, height, repeat, vk::Format::R8G8B8A8_UNORM)
+    }
+
+    pub fn create_scene_target_fmt(
+        &mut self,
+        width: u32,
+        height: u32,
+        repeat: bool,
+        format: vk::Format,
+    ) -> Result<SceneTarget> {
+        let render_pass = self.scene_pass_for(format)?;
         let sampler = if repeat { self.sampler_repeat } else { self.sampler };
         unsafe {
             let image = self.device.create_image(
                 &vk::ImageCreateInfo::default()
                     .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .format(format)
                     .extent(vk::Extent3D { width, height, depth: 1 })
                     .mip_levels(1)
                     .array_layers(1)
@@ -586,7 +780,8 @@ impl Renderer {
                     .usage(
                         vk::ImageUsageFlags::COLOR_ATTACHMENT
                             | vk::ImageUsageFlags::SAMPLED
-                            | vk::ImageUsageFlags::TRANSFER_SRC,
+                            | vk::ImageUsageFlags::TRANSFER_SRC
+                            | vk::ImageUsageFlags::TRANSFER_DST,
                     )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .initial_layout(vk::ImageLayout::UNDEFINED),
@@ -604,7 +799,7 @@ impl Renderer {
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .format(format)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
@@ -617,7 +812,7 @@ impl Renderer {
             let atts = [view];
             let framebuffer = self.device.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
-                    .render_pass(self.scene_pass)
+                    .render_pass(render_pass)
                     .attachments(&atts)
                     .width(width)
                     .height(height)
@@ -633,6 +828,8 @@ impl Renderer {
                 extent: vk::Extent2D { width, height },
                 allocation_bytes: reqs.size,
                 repeat,
+                format,
+                render_pass,
             })
         }
     }
@@ -655,7 +852,7 @@ impl Renderer {
         textures: &[SceneTexture],
     ) -> Result<()> {
         let canvas = [target.extent.width as f32, target.extent.height as f32];
-        self.render_scene_with_canvas(target, canvas, clear, quads, textures)
+        self.render_scene_with_canvas(target, canvas, clear, quads, textures, &[])
     }
 
     pub fn render_scene_with_canvas(
@@ -665,9 +862,10 @@ impl Renderer {
         clear: [f32; 4],
         quads: &[SceneQuad],
         textures: &[SceneTexture],
+        particles: &[ParticleDraw<'_>],
     ) -> Result<()> {
         self.begin_scene_batch()?;
-        self.record_scene_with_canvas(target, canvas, clear, quads, textures);
+        self.record_scene_with_canvas(target, canvas, clear, quads, textures, particles);
         self.submit_scene_batch()
     }
 
@@ -698,7 +896,125 @@ impl Renderer {
         textures: &[SceneTexture],
     ) {
         let canvas = [target.extent.width as f32, target.extent.height as f32];
-        self.record_scene_with_canvas(target, canvas, clear, quads, textures);
+        self.record_scene_with_canvas(target, canvas, clear, quads, textures, &[]);
+    }
+
+    fn grab_scene(&self, target: &SceneTarget, grab: &SceneTarget, load_pass: vk::RenderPass) {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        let extent = vk::Extent3D {
+            width: target.extent.width.min(grab.extent.width),
+            height: target.extent.height.min(grab.extent.height),
+            depth: 1,
+        };
+        unsafe {
+            self.device.cmd_end_render_pass(self.cmd);
+            let to_src = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(target.image)
+                .subresource_range(range);
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(grab.image)
+                .subresource_range(range);
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_src, to_dst],
+            );
+            self.device.cmd_copy_image(
+                self.cmd,
+                target.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                grab.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageCopy::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .extent(extent)],
+            );
+            let ready = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(grab.image)
+                .subresource_range(range);
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[ready],
+            );
+            self.device.cmd_begin_render_pass(
+                self.cmd,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(load_pass)
+                    .framebuffer(target.framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: target.extent,
+                    }),
+                vk::SubpassContents::INLINE,
+            );
+            self.device.cmd_set_scissor(
+                self.cmd,
+                0,
+                &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: target.extent }],
+            );
+        }
+    }
+
+    fn draw_particles(&self, batch: &ParticleDraw<'_>, extent: vk::Extent2D) {
+        unsafe {
+            self.device.cmd_set_viewport(
+                self.cmd,
+                0,
+                &[super::effect::viewport(extent, batch.pipeline.hlsl)],
+            );
+            self.device.cmd_bind_pipeline(
+                self.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                batch.pipeline.pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                batch.pipeline.layout,
+                0,
+                &[batch.pipeline.set],
+                &[],
+            );
+            self.device.cmd_bind_vertex_buffers(self.cmd, 0, &[batch.vertices], &[0]);
+            self.device.cmd_bind_index_buffer(self.cmd, batch.indices, 0, vk::IndexType::UINT32);
+            self.device.cmd_draw_indexed(self.cmd, batch.index_count, 1, 0, 0, 0);
+            self.device.cmd_set_viewport(self.cmd, 0, &[super::effect::viewport(extent, false)]);
+        }
     }
 
     pub fn record_scene_with_canvas(
@@ -708,14 +1024,27 @@ impl Renderer {
         clear: [f32; 4],
         quads: &[SceneQuad],
         textures: &[SceneTexture],
+        particles: &[ParticleDraw<'_>],
     ) {
         let canvas = [canvas[0].max(1.0), canvas[1].max(1.0)];
+        let mut next_particle = 0usize;
+        let load_pass = if particles.iter().any(|batch| batch.grab.is_some()) {
+            match self.scene_pass_load_for(target.format) {
+                Ok(pass) => Some(pass),
+                Err(err) => {
+                    tracing::warn!("skwd-wall-vk: scene grab pass unavailable: {err:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         unsafe {
             let clear_value = [vk::ClearValue { color: vk::ClearColorValue { float32: clear } }];
             self.device.cmd_begin_render_pass(
                 self.cmd,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.scene_pass)
+                    .render_pass(target.render_pass)
                     .framebuffer(target.framebuffer)
                     .render_area(vk::Rect2D {
                         offset: vk::Offset2D { x: 0, y: 0 },
@@ -742,7 +1071,16 @@ impl Renderer {
                 &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: target.extent }],
             );
             let mut bound_blend = None;
-            for quad in quads {
+            for (index, quad) in quads.iter().enumerate() {
+                while next_particle < particles.len() && particles[next_particle].after <= index {
+                    let batch = &particles[next_particle];
+                    if let (Some(grab), Some(load_pass)) = (batch.grab, load_pass) {
+                        self.grab_scene(target, grab, load_pass);
+                    }
+                    self.draw_particles(batch, target.extent);
+                    bound_blend = None;
+                    next_particle += 1;
+                }
                 let Some(texture) = textures.get(quad.texture) else {
                     continue;
                 };
@@ -783,6 +1121,12 @@ impl Renderer {
                     std::slice::from_raw_parts((&raw const push).cast(), 64),
                 );
                 self.device.cmd_draw(self.cmd, 4, 1, 0, 0);
+            }
+            for batch in &particles[next_particle..] {
+                if let (Some(grab), Some(load_pass)) = (batch.grab, load_pass) {
+                    self.grab_scene(target, grab, load_pass);
+                }
+                self.draw_particles(batch, target.extent);
             }
             self.device.cmd_end_render_pass(self.cmd);
         }

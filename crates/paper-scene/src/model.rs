@@ -3,12 +3,14 @@ use crate::tex;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-pub const MAX_SCENE_TEXTURE_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_SCENE_TEXTURE_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_SCENE_OBJECTS: usize = 16_384;
 
 pub struct SceneModel {
     pub canvas: (f32, f32),
     pub clear: [f32; 3],
+    pub ambient: [f32; 3],
+    pub skylight: [f32; 3],
     pub layers: Vec<Layer>,
     pub particles: Vec<ParticleLayer>,
     pub skipped: Vec<String>,
@@ -22,12 +24,16 @@ pub struct Layer {
     pub puppet: Option<Puppet>,
     pub center: (f32, f32),
     pub size: (f32, f32),
+    pub scale: (f32, f32),
     pub depth: f32,
     pub scene_order: usize,
     pub alpha: f32,
     pub angle: f32,
     pub color: [f32; 3],
     pub color_blend: u32,
+    pub passthrough: bool,
+    pub solid: bool,
+    pub live_text: Option<crate::text::Prepared>,
     pub effects: Vec<crate::effects::Effect>,
 }
 
@@ -52,6 +58,13 @@ struct Transform {
     angle: f32,
 }
 
+fn layer_alpha(object: &Value, props: &Properties) -> f32 {
+    if crate::dynamic_text::media_scripted(object.get("alpha")) {
+        return 0.0;
+    }
+    number(object.get("alpha"), props, 1.0).clamp(0.0, 1.0)
+}
+
 fn object_transform(object: &Value, props: &Properties) -> Transform {
     Transform {
         origin: vec3(object.get("origin"), props).unwrap_or((0.0, 0.0, 0.0)),
@@ -61,7 +74,7 @@ fn object_transform(object: &Value, props: &Properties) -> Transform {
 }
 
 fn compose(parent: Transform, child: Transform) -> Transform {
-    let (sin, cos) = parent.angle.to_radians().sin_cos();
+    let (sin, cos) = parent.angle.sin_cos();
     let sx = child.origin.0 * parent.scale.0;
     let sy = child.origin.1 * parent.scale.1;
     Transform {
@@ -75,11 +88,37 @@ fn compose(parent: Transform, child: Transform) -> Transform {
     }
 }
 
-fn resolve_transform(
-    object: &Value,
-    by_id: &std::collections::HashMap<String, &Value>,
-    props: &Properties,
-) -> Transform {
+struct Parallax {
+    amount: f32,
+    focus: (f32, f32),
+}
+
+impl Parallax {
+    fn of(scene: &Value, canvas: (f32, f32), props: &Properties) -> Option<Self> {
+        let general = scene.get("general");
+        if !truthy(general.and_then(|top| top.get("cameraparallax")), props, false) {
+            return None;
+        }
+        let amount = number(general.and_then(|top| top.get("cameraparallaxamount")), props, 0.5);
+        let eye = vec3(scene.get("camera").and_then(|camera| camera.get("eye")), props)
+            .unwrap_or((0.0, 0.0, 0.0));
+        Some(Self { amount, focus: (canvas.0 * 0.5 + eye.0, canvas.1 * 0.5 + eye.1) })
+    }
+
+    fn offset(&self, root: &Value, props: &Properties) -> (f32, f32) {
+        let depth = vec2_or(root.get("parallaxDepth"), props, (0.0, 0.0));
+        let origin = vec3(root.get("origin"), props).unwrap_or((0.0, 0.0, 0.0));
+        (
+            (origin.0 - self.focus.0) * self.amount * depth.0,
+            (origin.1 - self.focus.1) * self.amount * depth.1,
+        )
+    }
+}
+
+fn ancestor_chain<'a>(
+    object: &'a Value,
+    by_id: &std::collections::HashMap<String, &'a Value>,
+) -> Vec<&'a Value> {
     let mut chain = vec![object];
     let mut cursor = object;
     for _ in 0..8 {
@@ -95,9 +134,26 @@ fn resolve_transform(
         chain.push(parent);
         cursor = parent;
     }
+    chain
+}
+
+fn resolve_transform<'a>(
+    object: &'a Value,
+    by_id: &std::collections::HashMap<String, &'a Value>,
+    props: &Properties,
+    parallax: Option<&Parallax>,
+) -> Transform {
+    let chain = ancestor_chain(object, by_id);
     let mut out = Transform { scale: (1.0, 1.0), ..Transform::default() };
     for node in chain.iter().rev() {
         out = compose(out, object_transform(node, props));
+    }
+    if let Some(parallax) = parallax
+        && let Some(root) = chain.last()
+    {
+        let (dx, dy) = parallax.offset(root, props);
+        out.origin.0 += dx;
+        out.origin.1 += dy;
     }
     out
 }
@@ -142,11 +198,12 @@ fn collect_render_target_layer_ids(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpriteFrame {
     pub uv: [f32; 4],
     pub rotated: bool,
     pub time: f32,
+    pub image: i32,
 }
 
 pub struct Texture {
@@ -154,32 +211,11 @@ pub struct Texture {
     pub height: u32,
     pub img_width: u32,
     pub img_height: u32,
-    pub rgba: Vec<u8>,
+    pub pixels: tex::Pixels,
     pub frames: Vec<SpriteFrame>,
     pub clamp: bool,
     pub nearest: bool,
     pub format: tex::TexFormat,
-}
-
-pub fn apply_particle_channels(texture: &mut Texture) {
-    match texture.format {
-        tex::TexFormat::R8 => {
-            for px in texture.rgba.chunks_exact_mut(4) {
-                px[3] = px[0];
-                px[0] = 255;
-                px[1] = 255;
-                px[2] = 255;
-            }
-        }
-        tex::TexFormat::Rg88 => {
-            for px in texture.rgba.chunks_exact_mut(4) {
-                px[3] = px[1];
-                px[1] = px[0];
-                px[2] = px[0];
-            }
-        }
-        _ => {}
-    }
 }
 
 fn sprite_frames(parsed: &tex::Tex, width: u32, height: u32) -> Vec<SpriteFrame> {
@@ -198,12 +234,34 @@ fn sprite_frames(parsed: &tex::Tex, width: u32, height: u32) -> Vec<SpriteFrame>
                 uv: [frame.x / aw, frame.y / ah, uw / aw, uh / ah],
                 rotated,
                 time: frame.frame_time.max(0.0),
+                image: frame.image_id,
             })
         })
         .collect()
 }
 
 impl Texture {
+    #[must_use]
+    pub fn we_format(&self) -> i64 {
+        match self.format {
+            tex::TexFormat::Rgba8888 => 0,
+            tex::TexFormat::Dxt5 => 4,
+            tex::TexFormat::Dxt3 => 6,
+            tex::TexFormat::Dxt1 => 7,
+            tex::TexFormat::Rg88 => 8,
+            tex::TexFormat::R8 => 9,
+            tex::TexFormat::Other(raw) => i64::from(raw),
+        }
+    }
+
+    #[must_use]
+    pub fn atlas_frames(&self) -> Option<&[SpriteFrame]> {
+        let playable = self.frames.len() > 1
+            && self.frames.iter().all(|frame| frame.image == 0 && !frame.rotated)
+            && self.frames.iter().map(|frame| frame.time).sum::<f32>() > 0.0;
+        playable.then_some(self.frames.as_slice())
+    }
+
     pub fn uv_scale(&self) -> (f32, f32) {
         (
             (self.img_width as f32 / self.width.max(1) as f32).clamp(0.0, 1.0),
@@ -225,7 +283,7 @@ fn vec2_or(value: Option<&Value>, props: &Properties, fallback: (f32, f32)) -> (
     vec3(value, props).map_or(fallback, |(x, y, _)| (x, y))
 }
 
-fn number(value: Option<&Value>, props: &Properties, fallback: f32) -> f32 {
+pub(crate) fn number(value: Option<&Value>, props: &Properties, fallback: f32) -> f32 {
     let Some(value) = value else {
         return fallback;
     };
@@ -256,10 +314,11 @@ fn tex_candidates(raw: &str) -> Vec<String> {
 }
 
 pub fn load_texture_bytes(bytes: &[u8]) -> Option<Texture> {
-    let parsed = tex::parse(bytes).ok()?;
+    let mut parsed = tex::parse(bytes).ok()?;
     let img_width = u32::try_from(parsed.meta.img_width).unwrap_or(0);
     let img_height = u32::try_from(parsed.meta.img_height).unwrap_or(0);
-    let (width, height, rgba) = tex::decode_rgba(&parsed)?;
+    let pixels = tex::take_pixels(&mut parsed)?;
+    let (width, height) = (pixels.width(), pixels.height());
     let img_width = if img_width == 0 { width } else { img_width.min(width) };
     let img_height = if img_height == 0 { height } else { img_height.min(height) };
     let frames = sprite_frames(&parsed, width, height);
@@ -268,7 +327,7 @@ pub fn load_texture_bytes(bytes: &[u8]) -> Option<Texture> {
         height,
         img_width,
         img_height,
-        rgba,
+        pixels,
         frames,
         clamp: parsed.meta.flags & tex::FLAG_CLAMP_UVS != 0,
         nearest: parsed.meta.flags & tex::FLAG_NO_INTERPOLATION != 0,
@@ -294,6 +353,19 @@ fn load_texture(pkg: &Package, raw: &str) -> Option<Texture> {
     None
 }
 
+fn load_texture_or_asset(
+    pkg: &Package,
+    assets: &crate::effects::Assets,
+    raw: &str,
+) -> Option<Texture> {
+    load_texture(pkg, raw).or_else(|| {
+        tex_candidates(raw)
+            .iter()
+            .find_map(|candidate| assets.read_bytes(candidate))
+            .and_then(|bytes| load_texture_bytes(&bytes))
+    })
+}
+
 fn asset_json(
     pkg: &Package,
     assets: &crate::effects::Assets,
@@ -311,12 +383,32 @@ pub fn solid_texture() -> Texture {
         height: 1,
         img_width: 1,
         img_height: 1,
-        rgba: vec![255, 255, 255, 255],
+        pixels: tex::Pixels::rgba(1, 1, vec![255, 255, 255, 255]),
         frames: Vec::new(),
         clamp: true,
         nearest: false,
         format: tex::TexFormat::Rgba8888,
     }
+}
+
+#[derive(Default)]
+struct UtilModel {
+    passthrough: bool,
+    fullscreen: bool,
+    flat: bool,
+}
+
+fn util_model(pkg: &Package, assets: &crate::effects::Assets, model_path: &str) -> UtilModel {
+    let Some(model) = asset_json(pkg, assets, model_path) else {
+        return UtilModel::default();
+    };
+    let flag = |key: &str| model.get(key) == Some(&Value::Bool(true));
+    let flat = model
+        .get("material")
+        .and_then(Value::as_str)
+        .and_then(|path| asset_json(pkg, assets, path))
+        .is_some_and(|material| material_is_flat(&material));
+    UtilModel { passthrough: flag("passthrough"), fullscreen: flag("fullscreen"), flat }
 }
 
 fn material_is_flat(material: &Value) -> bool {
@@ -337,6 +429,7 @@ fn material_texture(pkg: &Package, path: &str) -> Option<String> {
             for slot in textures {
                 if let Some(text) = slot.as_str()
                     && !text.is_empty()
+                    && !text.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("_rt_"))
                 {
                     return Some(text.to_string());
                 }
@@ -344,6 +437,27 @@ fn material_texture(pkg: &Package, path: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn legacy_material_tint(pkg: &Package, model_path: &str) -> Option<([f32; 3], f32)> {
+    let model = pkg.find_json(model_path).ok()??;
+    let material = pkg.find_json(model.get("material")?.as_str()?).ok()??;
+    let pass = material.get("passes")?.as_array()?.first()?;
+    let shader = pass.get("shader")?.as_str()?;
+    let versioned = pass.get("combos").and_then(|combos| combos.get("VERSION")).is_some();
+    if !(shader == "genericimage" || (shader == "genericimage2" && !versioned)) {
+        return None;
+    }
+    let constants = pass.get("constantshadervalues");
+    let constant = |key: &str| {
+        constants
+            .and_then(|values| values.get(key))
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+    };
+    let brightness = constant("Brightness").or_else(|| constant("Bright")).unwrap_or(1.0);
+    let alpha = constant("Alpha").unwrap_or(1.0).clamp(0.0, 1.0);
+    Some(([brightness; 3], alpha))
 }
 
 fn model_texture(pkg: &Package, path: &str) -> Option<String> {
@@ -427,6 +541,12 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
     );
     let clear = vec3(general.and_then(|top| top.get("clearcolor")), props)
         .map_or([0.0, 0.0, 0.0], |(r, g, b)| [r, g, b]);
+    let ambient = vec3(general.and_then(|top| top.get("ambientcolor")), props)
+        .map_or([0.3, 0.3, 0.3], |(r, g, b)| [r, g, b]);
+    let skylight = vec3(general.and_then(|top| top.get("skylightcolor")), props)
+        .map_or([0.3, 0.3, 0.3], |(r, g, b)| [r, g, b]);
+
+    let parallax = Parallax::of(&scene, canvas, props);
 
     let mut layers = Vec::new();
     let mut particles = Vec::new();
@@ -452,8 +572,26 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
         let id =
             object.get("id").and_then(id_of).unwrap_or_else(|| format!("@object-{object_index}"));
         let name = object.get("name").and_then(Value::as_str).unwrap_or("object").to_string();
-        let visible = truthy(object.get("visible"), props, true);
+        let visible = ancestor_chain(object, &by_id).iter().all(|node| {
+            truthy(node.get("visible"), props, true)
+                && !crate::dynamic_text::media_scripted(node.get("visible"))
+        });
         if !visible && !render_target_layer_ids.contains(&id) {
+            continue;
+        }
+        if object
+            .get("instance")
+            .and_then(|instance| instance.get("usertextures"))
+            .and_then(Value::as_array)
+            .is_some_and(|slots| {
+                slots.iter().any(|slot| {
+                    slot.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.starts_with("$media"))
+                })
+            })
+        {
+            skipped.push(format!("{name}: media thumbnail layer hidden without playback"));
             continue;
         }
         let Some(model_path) = object.get("image").and_then(Value::as_str) else {
@@ -461,7 +599,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                 match crate::particles::load(pkg, assets, object, path) {
                     Some(system) => {
                         if let Some(texture) = &system.texture {
-                            add_texture_bytes(&mut texture_bytes, texture.rgba.len())?;
+                            add_texture_bytes(&mut texture_bytes, texture.pixels.bytes())?;
                         }
                         particles.push(ParticleLayer {
                             depth: system.origin.2,
@@ -471,37 +609,80 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                     }
                     None => skipped.push(format!("{name}: particle {path} unsupported")),
                 }
-            } else if object.get("light").is_some() || object.get("text").is_some() {
+            } else if object.get("text").is_some() {
+                match crate::text::render(pkg, assets, object, props) {
+                    Some(rendered) => {
+                        let transform = resolve_transform(object, &by_id, props, parallax.as_ref());
+                        let (w, h) =
+                            (rendered.texture.width as f32, rendered.texture.height as f32);
+                        let color = vec3(object.get("color"), props)
+                            .map_or([1.0, 1.0, 1.0], |(r, g, b)| [r, g, b]);
+                        let alpha = layer_alpha(object, props);
+                        let color_blend =
+                            number(object.get("colorBlendMode"), props, 0.0).max(0.0) as u32;
+                        let (effects, effect_skips) =
+                            crate::effects::load_effects(pkg, assets, object);
+                        for skip in effect_skips {
+                            skipped.push(format!("{name}: {skip}"));
+                        }
+                        add_texture_bytes(&mut texture_bytes, rendered.texture.pixels.bytes())?;
+                        let (sx, sy) = transform.scale;
+                        let angle = -transform.angle;
+                        let (sin, cos) = angle.sin_cos();
+                        let (ox, oy) = (
+                            (rendered.offset.0 + w * 0.5 - 1.0) * sx,
+                            (rendered.offset.1 + h * 0.5 - 1.0) * sy,
+                        );
+                        let center = (
+                            transform.origin.0 + ox * cos - oy * sin,
+                            canvas.1 - transform.origin.1 + ox * sin + oy * cos,
+                        );
+                        layers.push(Layer {
+                            id,
+                            name,
+                            visible,
+                            live_text: rendered.live,
+                            texture: rendered.texture,
+                            puppet: None,
+                            center,
+                            size: (w * sx, h * sy),
+                            scale: transform.scale,
+                            depth: transform.origin.2,
+                            scene_order: object_index,
+                            alpha,
+                            angle,
+                            color,
+                            color_blend,
+                            passthrough: false,
+                            solid: false,
+                            effects,
+                        });
+                    }
+                    None => skipped.push(format!("{name}: text unsupported")),
+                }
+            } else if object.get("light").is_some() {
                 skipped.push(format!("{name}: unsupported object"));
             }
             continue;
         };
         let resolved = model_texture(pkg, model_path);
+        let util = if resolved.is_none() {
+            util_model(pkg, assets, model_path)
+        } else {
+            UtilModel::default()
+        };
+        let solid = resolved.is_none() && util.flat;
         let texture = if let Some(tex_path) = resolved {
-            let Some(texture) = load_texture(pkg, &tex_path) else {
+            let Some(texture) = load_texture_or_asset(pkg, assets, &tex_path) else {
                 skipped.push(format!("{name}: undecodable texture {tex_path}"));
                 continue;
             };
             texture
+        } else if util.passthrough || util.flat {
+            solid_texture()
         } else {
-            {
-                let model = asset_json(pkg, assets, model_path);
-                let passthrough = model
-                    .as_ref()
-                    .and_then(|model| model.get("passthrough"))
-                    .is_some_and(|value| value == &Value::Bool(true));
-                let flat = model
-                    .as_ref()
-                    .and_then(|model| model.get("material"))
-                    .and_then(Value::as_str)
-                    .and_then(|path| asset_json(pkg, assets, path))
-                    .is_some_and(|material| material_is_flat(&material));
-                if passthrough || !flat {
-                    skipped.push(format!("{name}: no texture in {model_path}"));
-                    continue;
-                }
-                solid_texture()
-            }
+            skipped.push(format!("{name}: no texture in {model_path}"));
+            continue;
         };
         let puppet_mesh = match model_puppet(pkg, model_path) {
             Ok(puppet) => puppet,
@@ -510,79 +691,166 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                 continue;
             }
         };
-        let transform = resolve_transform(object, &by_id, props);
-        let base = vec2_or(
-            object.get("size"),
-            props,
-            (texture.img_width as f32, texture.img_height as f32),
-        );
+        let transform = resolve_transform(object, &by_id, props, parallax.as_ref());
+        let fallback = if util.passthrough {
+            canvas
+        } else {
+            (texture.img_width as f32, texture.img_height as f32)
+        };
+        let base =
+            if util.fullscreen { canvas } else { vec2_or(object.get("size"), props, fallback) };
         let puppet = puppet_mesh.map(|mesh| Puppet {
             mesh,
             size: base,
             layers: puppet_animation_layers(object, props),
         });
-        let color = vec3(object.get("color"), props).map_or([1.0, 1.0, 1.0], |(r, g, b)| [r, g, b]);
-        let (effects, effect_skips) = crate::effects::load_effects(pkg, assets, object);
-        add_texture_bytes(&mut texture_bytes, texture.rgba.len())?;
+        let (color, alpha) = match legacy_material_tint(pkg, model_path) {
+            Some(tint) => tint,
+            None => (
+                vec3(object.get("color"), props).map_or([1.0, 1.0, 1.0], |(r, g, b)| [r, g, b]),
+                layer_alpha(object, props),
+            ),
+        };
+        let color_blend = number(object.get("colorBlendMode"), props, 0.0).max(0.0) as u32;
+        let (mut effects, effect_skips) = crate::effects::load_effects(pkg, assets, object);
+        if util.passthrough && effects.is_empty() {
+            continue;
+        }
+        if crate::effects::shader_blend(color_blend) {
+            let (blend_color, blend_alpha) =
+                if util.passthrough { (color, alpha) } else { ([1.0, 1.0, 1.0], 1.0) };
+            match crate::effects::color_blend_effect(
+                pkg,
+                assets,
+                color_blend,
+                blend_color,
+                blend_alpha,
+                Some(&id),
+            ) {
+                Some(effect) => effects.push(effect),
+                None => skipped.push(format!("{name}: colorBlendMode {color_blend} unavailable")),
+            }
+        }
+        add_texture_bytes(&mut texture_bytes, texture.pixels.bytes())?;
         for effect in &effects {
             for pass in &effect.passes {
                 for slot in pass.textures.iter().flatten() {
-                    add_texture_bytes(&mut texture_bytes, slot.rgba.len())?;
+                    add_texture_bytes(&mut texture_bytes, slot.pixels.bytes())?;
                 }
             }
         }
         for skip in effect_skips {
             skipped.push(format!("{name}: {skip}"));
         }
+        let (center, size, angle) = if util.fullscreen {
+            ((canvas.0 * 0.5, canvas.1 * 0.5), canvas, 0.0)
+        } else {
+            (
+                (transform.origin.0, canvas.1 - transform.origin.1),
+                (base.0 * transform.scale.0, base.1 * transform.scale.1),
+                -transform.angle,
+            )
+        };
         layers.push(Layer {
             id,
             name,
             visible,
+            live_text: None,
             texture,
             puppet,
-            center: (transform.origin.0, canvas.1 - transform.origin.1),
-            size: (base.0 * transform.scale.0, base.1 * transform.scale.1),
+            center,
+            size,
+            scale: transform.scale,
             depth: transform.origin.2,
             scene_order: object_index,
-            alpha: number(object.get("alpha"), props, 1.0).clamp(0.0, 1.0),
-            angle: -transform.angle.to_radians(),
+            alpha,
+            angle,
             color,
-            color_blend: number(object.get("colorBlendMode"), props, 0.0).max(0.0) as u32,
+            color_blend,
+            passthrough: util.passthrough,
+            solid,
             effects,
         });
     }
-    layers.sort_by(|a, b| {
-        a.depth.total_cmp(&b.depth).then_with(|| a.scene_order.cmp(&b.scene_order))
-    });
-    let mut unified_order: Vec<(f32, usize, bool, usize)> = layers
+    if truthy(general.and_then(|top| top.get("bloom")), props, false) {
+        let strength = number(general.and_then(|top| top.get("bloomstrength")), props, 2.0);
+        let threshold = number(general.and_then(|top| top.get("bloomthreshold")), props, 0.65);
+        let tint =
+            vec3(general.and_then(|top| top.get("bloomtint")), props).unwrap_or((1.0, 1.0, 1.0));
+        let object = serde_json::json!({
+            "id": "@bloom",
+            "name": "bloom",
+            "effects": [{
+                "file": crate::effects::BLOOM_LDR_EFFECT_FILE,
+                "passes": [{"constantshadervalues": {
+                    "bloomstrength": strength,
+                    "bloomthreshold": threshold,
+                    "bloomtint": format!("{} {} {}", tint.0, tint.1, tint.2)
+                }}]
+            }]
+        });
+        let (effects, effect_skips) = crate::effects::load_effects(pkg, assets, &object);
+        for skip in effect_skips {
+            skipped.push(format!("bloom: {skip}"));
+        }
+        if effects.iter().any(|effect| !effect.passes.is_empty()) {
+            layers.push(Layer {
+                id: "@bloom".to_string(),
+                name: "bloom".to_string(),
+                visible: true,
+                live_text: None,
+                texture: solid_texture(),
+                puppet: None,
+                center: (canvas.0 * 0.5, canvas.1 * 0.5),
+                size: canvas,
+                scale: (1.0, 1.0),
+                depth: 0.0,
+                scene_order: objects.len(),
+                alpha: 1.0,
+                angle: 0.0,
+                color: [1.0, 1.0, 1.0],
+                color_blend: 0,
+                passthrough: true,
+                solid: false,
+                effects,
+            });
+        } else {
+            skipped.push("bloom: engine bloom materials unavailable".to_string());
+        }
+    }
+    layers.sort_by_key(|layer| layer.scene_order);
+    let mut unified_order: Vec<(usize, bool, usize)> = layers
         .iter()
         .enumerate()
-        .map(|(index, layer)| (layer.depth, layer.scene_order, false, index))
+        .map(|(index, layer)| (layer.scene_order, false, index))
         .chain(
             particles
                 .iter()
                 .enumerate()
-                .map(|(index, particle)| (particle.depth, particle.scene_order, true, index)),
+                .map(|(index, particle)| (particle.scene_order, true, index)),
         )
         .collect();
-    unified_order
-        .sort_by(|left, right| left.0.total_cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    for (scene_order, (_, _, particle, index)) in unified_order.into_iter().enumerate() {
+    unified_order.sort_by_key(|entry| entry.0);
+    for (scene_order, (_, particle, index)) in unified_order.into_iter().enumerate() {
         if particle {
             particles[index].scene_order = scene_order;
         } else {
             layers[index].scene_order = scene_order;
         }
     }
-    Ok(SceneModel { canvas, clear, layers, particles, skipped })
+    Ok(SceneModel { canvas, clear, ambient, skylight, layers, particles, skipped })
 }
 
 fn add_texture_bytes(total: &mut usize, bytes: usize) -> Result<()> {
     *total = total.checked_add(bytes).ok_or_else(|| anyhow!("scene texture size overflow"))?;
     if *total > MAX_SCENE_TEXTURE_BYTES {
         return Err(anyhow!(
-            "decoded scene textures use {total} bytes; limit is {MAX_SCENE_TEXTURE_BYTES}"
+            "scene textures use {total} bytes; limit is {MAX_SCENE_TEXTURE_BYTES}"
         ));
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "model_tests.rs"]
+mod tests;

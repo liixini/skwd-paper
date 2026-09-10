@@ -1,6 +1,7 @@
 use crate::vk::Renderer;
 use anyhow::{Context, Result, anyhow};
 use ash::vk;
+use paper_scene::hlsl::{HlslPair, SAMPLER_BINDING_SHIFT, TEXTURE_BINDING_SHIFT};
 use paper_scene::shader::{Stage, Translated};
 
 const MAX_EFFECT_SAMPLERS: u32 = 16;
@@ -27,21 +28,120 @@ fn effect_caps(vertex: &Translated, fragment: &Translated) -> Result<(u32, usize
     Ok((sampler_count, ubo_size))
 }
 
+pub fn d3d_clip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SKWD_PAPER_D3D_CLIP").as_deref() != Ok("0"))
+}
+
+pub(crate) fn viewport(extent: vk::Extent2D, d3d_clip: bool) -> vk::Viewport {
+    let d3d_clip = d3d_clip && d3d_clip_enabled();
+    let height = extent.height as f32;
+    let (y, height) = if d3d_clip { (height, -height) } else { (0.0, height) };
+    vk::Viewport { x: 0.0, y, width: extent.width as f32, height, min_depth: 0.0, max_depth: 1.0 }
+}
+
 pub struct EffectPipeline {
-    pipeline: vk::Pipeline,
-    layout: vk::PipelineLayout,
+    pub(crate) pipeline: vk::Pipeline,
+    pub(crate) layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
-    set: vk::DescriptorSet,
+    pub(crate) set: vk::DescriptorSet,
     ubo: vk::Buffer,
     ubo_memory: vk::DeviceMemory,
     ubo_mapped: *mut u8,
     ubo_size: usize,
     pub sampler_count: u32,
+    pub hlsl: bool,
+}
+
+fn hlsl_skipped(label: &str) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SKIP.get_or_init(|| {
+        std::env::var("SKWD_PAPER_HLSL_SKIP")
+            .map(|list| list.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default()
+    })
+    .iter()
+    .any(|needle| label.contains(needle.as_str()))
+}
+
+fn compile_stages(
+    vertex: &Translated,
+    fragment: &Translated,
+    hlsl: Option<&HlslPair>,
+    label: &str,
+) -> Result<(Vec<u32>, Vec<u32>, bool)> {
+    if let Some(pair) = hlsl
+        && paper_scene::hlsl::available()
+        && !hlsl_skipped(label)
+    {
+        let compiled =
+            paper_scene::hlsl::compile(&pair.vertex, Stage::Vertex, label).and_then(|vert| {
+                paper_scene::hlsl::compile(&pair.fragment, Stage::Fragment, label)
+                    .map(|frag| (vert, frag))
+            });
+        match compiled {
+            Ok((vert, frag)) => return Ok((vert, frag, true)),
+            Err(err) => {
+                tracing::info!("skwd-wall-vk: hlsl path fell back to glsl for {label}: {err:#}")
+            }
+        }
+    }
+    let vert_words = paper_scene::shader::compile(&vertex.source, Stage::Vertex, label)?;
+    let frag_words = paper_scene::shader::compile(&fragment.source, Stage::Fragment, label)?;
+    Ok((vert_words, frag_words, false))
 }
 
 pub struct QuadBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+}
+
+pub struct DynBuffer {
+    pub buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    pub size: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PipelineKind {
+    Effect,
+    Particles(paper_scene::particles::ParticleBlend),
+}
+
+fn particle_blend_state(
+    blend: paper_scene::particles::ParticleBlend,
+) -> vk::PipelineColorBlendAttachmentState {
+    use paper_scene::particles::ParticleBlend;
+    let (src, dst, src_a, dst_a) = match blend {
+        ParticleBlend::Additive => (
+            vk::BlendFactor::SRC_ALPHA,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ZERO,
+            vk::BlendFactor::ONE,
+        ),
+        ParticleBlend::Translucent => (
+            vk::BlendFactor::SRC_ALPHA,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        ),
+        ParticleBlend::Normal => (
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ZERO,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ZERO,
+        ),
+    };
+    vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(true)
+        .src_color_blend_factor(src)
+        .dst_color_blend_factor(dst)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(src_a)
+        .dst_alpha_blend_factor(dst_a)
+        .alpha_blend_op(vk::BlendOp::ADD)
 }
 
 impl Renderer {
@@ -52,6 +152,15 @@ impl Renderer {
             w, h, 0.0, 1.0, 0.0, //
             0.0, 0.0, 0.0, 0.0, 1.0, //
             w, 0.0, 0.0, 1.0, 1.0,
+        ])
+    }
+
+    pub fn create_quad_buffer_ndc_d3d(&self) -> Result<QuadBuffer> {
+        self.upload_quad([
+            -1.0, 1.0, 0.0, 0.0, 0.0, //
+            1.0, 1.0, 0.0, 1.0, 0.0, //
+            -1.0, -1.0, 0.0, 0.0, 1.0, //
+            1.0, -1.0, 0.0, 1.0, 1.0,
         ])
     }
 
@@ -100,30 +209,147 @@ impl Renderer {
         &mut self,
         vertex: &Translated,
         fragment: &Translated,
+        hlsl: Option<&HlslPair>,
         label: &str,
+    ) -> Result<EffectPipeline> {
+        self.create_effect_pipeline_for(vertex, fragment, hlsl, label, vk::Format::R8G8B8A8_UNORM)
+    }
+
+    pub fn create_effect_pipeline_for(
+        &mut self,
+        vertex: &Translated,
+        fragment: &Translated,
+        hlsl: Option<&HlslPair>,
+        label: &str,
+        format: vk::Format,
+    ) -> Result<EffectPipeline> {
+        let render_pass = self.scene_pass_for(format)?;
+        self.create_pipeline_kind(vertex, fragment, hlsl, label, PipelineKind::Effect, render_pass)
+    }
+
+    pub fn create_particle_pipeline(
+        &mut self,
+        vertex: &Translated,
+        fragment: &Translated,
+        hlsl: Option<&HlslPair>,
+        label: &str,
+        blend: paper_scene::particles::ParticleBlend,
+    ) -> Result<EffectPipeline> {
+        self.ensure_scene_pipelines()?;
+        let render_pass = self.scene_pass;
+        self.create_pipeline_kind(
+            vertex,
+            fragment,
+            hlsl,
+            label,
+            PipelineKind::Particles(blend),
+            render_pass,
+        )
+    }
+
+    pub fn create_dyn_buffer(&self, size: usize, usage: vk::BufferUsageFlags) -> Result<DynBuffer> {
+        unsafe {
+            let buffer = self.device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size.max(4) as u64)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )?;
+            let reqs = self.device.get_buffer_memory_requirements(buffer);
+            let allocation = (|| -> Result<_> {
+                Ok(self.device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(reqs.size)
+                        .memory_type_index(self.host_visible_index(reqs)?),
+                    None,
+                )?)
+            })();
+            let memory = match allocation {
+                Ok(memory) => memory,
+                Err(error) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(error);
+                }
+            };
+            let mapping = self.device.bind_buffer_memory(buffer, memory, 0).and_then(|()| {
+                self.device.map_memory(memory, 0, size.max(4) as u64, vk::MemoryMapFlags::empty())
+            });
+            let ptr = match mapping {
+                Ok(ptr) => ptr.cast::<u8>(),
+                Err(error) => {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                    return Err(error.into());
+                }
+            };
+            Ok(DynBuffer { buffer, memory, ptr, size: size.max(4) })
+        }
+    }
+
+    pub fn write_dyn_buffer(&self, buffer: &DynBuffer, bytes: &[u8]) {
+        let len = bytes.len().min(buffer.size);
+        if len > 0 && !buffer.ptr.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.ptr, len) };
+        }
+    }
+
+    pub fn destroy_dyn_buffer(&self, buffer: DynBuffer) {
+        unsafe {
+            self.device.unmap_memory(buffer.memory);
+            self.device.destroy_buffer(buffer.buffer, None);
+            self.device.free_memory(buffer.memory, None);
+        }
+    }
+
+    fn create_pipeline_kind(
+        &mut self,
+        vertex: &Translated,
+        fragment: &Translated,
+        hlsl: Option<&HlslPair>,
+        label: &str,
+        kind: PipelineKind,
+        render_pass: vk::RenderPass,
     ) -> Result<EffectPipeline> {
         self.ensure_scene_pipelines()?;
         let pool = self.effect_pool()?;
-        let vert_words = paper_scene::shader::compile(&vertex.source, Stage::Vertex, label)?;
-        let frag_words = paper_scene::shader::compile(&fragment.source, Stage::Fragment, label)?;
+        let (vert_words, frag_words, hlsl) = compile_stages(vertex, fragment, hlsl, label)?;
         let (sampler_count, ubo_size) = effect_caps(vertex, fragment)?;
 
         unsafe {
+            let stages_all = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
             let mut bindings = vec![
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(0)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+                    .stage_flags(stages_all),
             ];
             for slot in 0..sampler_count {
-                bindings.push(
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(slot + 1)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
-                );
+                if hlsl {
+                    bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(slot + TEXTURE_BINDING_SHIFT)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .descriptor_count(1)
+                            .stage_flags(stages_all),
+                    );
+                    bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(slot + SAMPLER_BINDING_SHIFT)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .descriptor_count(1)
+                            .stage_flags(stages_all),
+                    );
+                } else {
+                    bindings.push(
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(slot + 1)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1)
+                            .stage_flags(stages_all),
+                    );
+                }
             }
             let set_layout = self.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -191,27 +417,43 @@ impl Renderer {
                     .module(frag_module)
                     .name(c"main"),
             ];
+            let stride = match kind {
+                PipelineKind::Effect => 20,
+                PipelineKind::Particles(_) => {
+                    4 * paper_scene::particles::SPRITE_FLOATS_PER_VERTEX as u32
+                }
+            };
             let bind_desc = [vk::VertexInputBindingDescription::default()
                 .binding(0)
-                .stride(20)
+                .stride(stride)
                 .input_rate(vk::VertexInputRate::VERTEX)];
-            let attrs = [
+            let attr = |location: u32, format: vk::Format, offset: u32| {
                 vk::VertexInputAttributeDescription::default()
-                    .location(0)
+                    .location(location)
                     .binding(0)
-                    .format(vk::Format::R32G32B32_SFLOAT)
-                    .offset(0),
-                vk::VertexInputAttributeDescription::default()
-                    .location(1)
-                    .binding(0)
-                    .format(vk::Format::R32G32_SFLOAT)
-                    .offset(12),
-            ];
+                    .format(format)
+                    .offset(offset)
+            };
+            let attrs: Vec<vk::VertexInputAttributeDescription> = match kind {
+                PipelineKind::Effect => vec![
+                    attr(0, vk::Format::R32G32B32_SFLOAT, 0),
+                    attr(1, vk::Format::R32G32_SFLOAT, 12),
+                ],
+                PipelineKind::Particles(_) => vec![
+                    attr(0, vk::Format::R32G32B32_SFLOAT, 0),
+                    attr(1, vk::Format::R32G32B32A32_SFLOAT, 12),
+                    attr(2, vk::Format::R32G32B32A32_SFLOAT, 28),
+                    attr(3, vk::Format::R32G32B32A32_SFLOAT, 44),
+                    attr(4, vk::Format::R32G32_SFLOAT, 60),
+                ],
+            };
             let vi = vk::PipelineVertexInputStateCreateInfo::default()
                 .vertex_binding_descriptions(&bind_desc)
                 .vertex_attribute_descriptions(&attrs);
-            let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
-                .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
+            let ia = vk::PipelineInputAssemblyStateCreateInfo::default().topology(match kind {
+                PipelineKind::Effect => vk::PrimitiveTopology::TRIANGLE_STRIP,
+                PipelineKind::Particles(_) => vk::PrimitiveTopology::TRIANGLE_LIST,
+            });
             let viewport = [vk::Viewport::default()];
             let scissor = [vk::Rect2D::default()];
             let vp = vk::PipelineViewportStateCreateInfo::default()
@@ -223,8 +465,11 @@ impl Renderer {
                 .line_width(1.0);
             let ms = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-            let att = [vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)];
+            let att = [match kind {
+                PipelineKind::Effect => vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::RGBA),
+                PipelineKind::Particles(blend) => particle_blend_state(blend),
+            }];
             let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&att);
             let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
@@ -242,7 +487,7 @@ impl Renderer {
                         .color_blend_state(&blend)
                         .dynamic_state(&dynamic)
                         .layout(layout)
-                        .render_pass(self.scene_pass)
+                        .render_pass(render_pass)
                         .subpass(0)],
                     None,
                 )
@@ -260,6 +505,7 @@ impl Renderer {
                 ubo_mapped: mapped,
                 ubo_size,
                 sampler_count,
+                hlsl,
             })
         }
     }
@@ -289,11 +535,9 @@ impl Renderer {
         self.submit_scene_batch().context("effect pass fence")
     }
 
-    pub fn record_effect_pass(
-        &mut self,
+    pub fn write_effect_inputs(
+        &self,
         pipe: &EffectPipeline,
-        quad: &QuadBuffer,
-        target: &crate::vk::SceneTarget,
         inputs: &[(vk::ImageView, vk::Sampler)],
         uniforms: &[u8],
     ) {
@@ -318,24 +562,53 @@ impl Renderer {
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]);
             }
             for (info, &slot) in infos.iter().zip(slots.iter()) {
-                writes.push(
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(pipe.set)
-                        .dst_binding(slot as u32 + 1)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(info),
-                );
+                if pipe.hlsl {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(pipe.set)
+                            .dst_binding(slot as u32 + TEXTURE_BINDING_SHIFT)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .image_info(info),
+                    );
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(pipe.set)
+                            .dst_binding(slot as u32 + SAMPLER_BINDING_SHIFT)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .image_info(info),
+                    );
+                } else {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(pipe.set)
+                            .dst_binding(slot as u32 + 1)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(info),
+                    );
+                }
             }
             if !writes.is_empty() {
                 self.device.update_descriptor_sets(&writes, &[]);
             }
+        }
+    }
 
+    pub fn record_effect_pass(
+        &mut self,
+        pipe: &EffectPipeline,
+        quad: &QuadBuffer,
+        target: &crate::vk::SceneTarget,
+        inputs: &[(vk::ImageView, vk::Sampler)],
+        uniforms: &[u8],
+    ) {
+        self.write_effect_inputs(pipe, inputs, uniforms);
+        unsafe {
             let clear =
                 [vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] } }];
             self.device.cmd_begin_render_pass(
                 self.cmd,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.scene_pass)
+                    .render_pass(target.render_pass)
                     .framebuffer(target.framebuffer())
                     .render_area(vk::Rect2D {
                         offset: vk::Offset2D { x: 0, y: 0 },
@@ -344,18 +617,7 @@ impl Renderer {
                     .clear_values(&clear),
                 vk::SubpassContents::INLINE,
             );
-            self.device.cmd_set_viewport(
-                self.cmd,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: target.extent.width as f32,
-                    height: target.extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
+            self.device.cmd_set_viewport(self.cmd, 0, &[viewport(target.extent, pipe.hlsl)]);
             self.device.cmd_set_scissor(
                 self.cmd,
                 0,

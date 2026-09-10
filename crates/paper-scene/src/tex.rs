@@ -48,6 +48,157 @@ impl TexFormat {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum PixelFormat {
+    #[default]
+    Rgba8,
+    Bc1,
+    Bc2,
+    Bc3,
+    R8,
+    Rg8,
+}
+
+impl PixelFormat {
+    fn of(format: TexFormat) -> Option<Self> {
+        match format {
+            TexFormat::Rgba8888 => Some(Self::Rgba8),
+            TexFormat::Dxt1 => Some(Self::Bc1),
+            TexFormat::Dxt3 => Some(Self::Bc2),
+            TexFormat::Dxt5 => Some(Self::Bc3),
+            TexFormat::R8 => Some(Self::R8),
+            TexFormat::Rg88 => Some(Self::Rg8),
+            TexFormat::Other(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn compressed(self) -> bool {
+        matches!(self, Self::Bc1 | Self::Bc2 | Self::Bc3)
+    }
+
+    #[must_use]
+    pub fn level_bytes(self, width: u32, height: u32) -> Option<usize> {
+        if width == 0 || height == 0 || width > MAX_TEXTURE_EDGE || height > MAX_TEXTURE_EDGE {
+            return None;
+        }
+        let (w, h) = (width as usize, height as usize);
+        let bytes = match self {
+            Self::Rgba8 => w.checked_mul(h)?.checked_mul(4)?,
+            Self::R8 => w.checked_mul(h)?,
+            Self::Rg8 => w.checked_mul(h)?.checked_mul(2)?,
+            Self::Bc1 => w.div_ceil(4).checked_mul(h.div_ceil(4))?.checked_mul(8)?,
+            Self::Bc2 | Self::Bc3 => w.div_ceil(4).checked_mul(h.div_ceil(4))?.checked_mul(16)?,
+        };
+        (bytes <= MAX_RGBA_BYTES).then_some(bytes)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct MipLevel {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Pixels {
+    pub format: PixelFormat,
+    pub levels: Vec<MipLevel>,
+}
+
+impl Pixels {
+    #[must_use]
+    pub fn rgba(width: u32, height: u32, data: Vec<u8>) -> Self {
+        Self { format: PixelFormat::Rgba8, levels: vec![MipLevel { width, height, data }] }
+    }
+
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.levels.first().map_or(0, |level| level.width)
+    }
+
+    #[must_use]
+    pub fn height(&self) -> u32 {
+        self.levels.first().map_or(0, |level| level.height)
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.levels.iter().map(|level| level.data.len()).sum()
+    }
+
+    #[must_use]
+    pub fn base_rgba(&self) -> Option<Vec<u8>> {
+        let level = self.levels.first()?;
+        level_rgba(self.format, level)
+    }
+
+    #[must_use]
+    pub fn decompressed(&self) -> Option<Self> {
+        if !self.format.compressed() {
+            return Some(self.clone());
+        }
+        let levels = self
+            .levels
+            .iter()
+            .map(|level| {
+                level_rgba(self.format, level).map(|data| MipLevel {
+                    width: level.width,
+                    height: level.height,
+                    data,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { format: PixelFormat::Rgba8, levels })
+    }
+}
+
+fn level_rgba(format: PixelFormat, level: &MipLevel) -> Option<Vec<u8>> {
+    let (width, height) = (level.width as usize, level.height as usize);
+    let rgba_bytes = rgba_len(level.width, level.height)?;
+    let pixels = rgba_bytes / 4;
+    match format {
+        PixelFormat::Rgba8 => {
+            (level.data.len() >= rgba_bytes).then(|| level.data[..rgba_bytes].to_vec())
+        }
+        PixelFormat::Bc1 | PixelFormat::Bc2 | PixelFormat::Bc3 => {
+            let fmt = match format {
+                PixelFormat::Bc1 => texpresso::Format::Bc1,
+                PixelFormat::Bc2 => texpresso::Format::Bc2,
+                _ => texpresso::Format::Bc3,
+            };
+            if level.data.len() < fmt.compressed_size(width, height) {
+                return None;
+            }
+            let mut out = vec![0u8; rgba_bytes];
+            fmt.decompress(&level.data, width, height, &mut out);
+            Some(out)
+        }
+        PixelFormat::R8 => {
+            if level.data.len() < pixels {
+                return None;
+            }
+            let mut out = Vec::with_capacity(rgba_bytes);
+            for &value in &level.data[..pixels] {
+                out.extend_from_slice(&[value, 0, 0, 255]);
+            }
+            Some(out)
+        }
+        PixelFormat::Rg8 => {
+            let encoded = pixels.checked_mul(2)?;
+            if level.data.len() < encoded {
+                return None;
+            }
+            let mut out = Vec::with_capacity(rgba_bytes);
+            for pair in level.data[..encoded].chunks_exact(2) {
+                out.extend_from_slice(&[pair[0], pair[1], 0, 255]);
+            }
+            Some(out)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TexMeta {
     pub format: TexFormat,
@@ -309,56 +460,43 @@ fn rgba_len(width: u32, height: u32) -> Option<usize> {
     (bytes <= MAX_RGBA_BYTES).then_some(bytes)
 }
 
-pub fn decode_rgba(tex: &Tex) -> Option<(u32, u32, Vec<u8>)> {
-    let mip = tex.images.first()?.first()?;
+pub fn take_pixels(tex: &mut Tex) -> Option<Pixels> {
+    let image = std::mem::take(tex.images.first_mut()?);
+    let base = image.first()?;
     if tex.meta.free_image_format.is_some_and(|format| format >= 0) {
-        return decode_free_image(mip);
+        let (width, height, data) = decode_free_image(base)?;
+        return Some(Pixels::rgba(width, height, data));
     }
-    let width = u32::try_from(mip.width).ok()?;
-    let height = u32::try_from(mip.height).ok()?;
-    let rgba_bytes = rgba_len(width, height)?;
-    let pixels = rgba_bytes / 4;
-    match tex.meta.format {
-        TexFormat::Rgba8888 => {
-            if mip.data.len() < rgba_bytes {
-                return None;
+    let format = PixelFormat::of(tex.meta.format)?;
+    let (mut base_width, mut base_height) = (0u32, 0u32);
+    let mut levels = Vec::new();
+    for (index, mut mip) in image.into_iter().enumerate() {
+        let Some((width, height)) =
+            u32::try_from(mip.width).ok().zip(u32::try_from(mip.height).ok())
+        else {
+            break;
+        };
+        if index == 0 {
+            (base_width, base_height) = (width, height);
+        } else {
+            let shift = index.min(31) as u32;
+            if width != (base_width >> shift).max(1) || height != (base_height >> shift).max(1) {
+                break;
             }
-            Some((width, height, mip.data[..rgba_bytes].to_vec()))
         }
-        TexFormat::Dxt1 | TexFormat::Dxt3 | TexFormat::Dxt5 => {
-            let fmt = match tex.meta.format {
-                TexFormat::Dxt1 => texpresso::Format::Bc1,
-                TexFormat::Dxt3 => texpresso::Format::Bc2,
-                _ => texpresso::Format::Bc3,
-            };
-            if mip.data.len() < fmt.compressed_size(width as usize, height as usize) {
-                return None;
-            }
-            let mut out = vec![0u8; rgba_bytes];
-            fmt.decompress(&mip.data, width as usize, height as usize, &mut out);
-            Some((width, height, out))
+        let Some(bytes) = format.level_bytes(width, height) else {
+            break;
+        };
+        if mip.data.len() < bytes {
+            break;
         }
-        TexFormat::R8 => {
-            if mip.data.len() < pixels {
-                return None;
-            }
-            let mut out = Vec::with_capacity(rgba_bytes);
-            for &value in &mip.data[..pixels] {
-                out.extend_from_slice(&[value, value, value, 255]);
-            }
-            Some((width, height, out))
-        }
-        TexFormat::Rg88 => {
-            let encoded_bytes = pixels.checked_mul(2)?;
-            if mip.data.len() < encoded_bytes {
-                return None;
-            }
-            let mut out = Vec::with_capacity(rgba_bytes);
-            for pair in mip.data[..encoded_bytes].chunks_exact(2) {
-                out.extend_from_slice(&[pair[0], pair[1], 0, 255]);
-            }
-            Some((width, height, out))
-        }
-        TexFormat::Other(_) => None,
+        mip.data.truncate(bytes);
+        levels.push(MipLevel { width, height, data: mip.data });
     }
+    (!levels.is_empty()).then_some(Pixels { format, levels })
+}
+
+pub fn decode_rgba(tex: &mut Tex) -> Option<(u32, u32, Vec<u8>)> {
+    let pixels = take_pixels(tex)?;
+    Some((pixels.width(), pixels.height(), pixels.base_rgba()?))
 }

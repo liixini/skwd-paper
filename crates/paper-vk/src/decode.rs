@@ -412,7 +412,7 @@ impl VaapiDecoder {
 
     pub fn next(&mut self) -> Result<(ff::frame::Video, f64)> {
         let (frame, pts) = self.next_hw_frame()?;
-        self.transfer_frame(frame, pts)
+        self.transfer_frame(&frame).map(|frame| (frame, pts))
     }
 
     pub fn next_hw_frame(&mut self) -> Result<(ff::frame::Video, f64)> {
@@ -425,9 +425,7 @@ impl VaapiDecoder {
     pub fn next_render(&mut self) -> Result<(RenderFrame, f64)> {
         let (frame, pts) = self.next_hw_frame()?;
         if !self.drm_prime {
-            return self
-                .transfer_frame(frame, pts)
-                .map(|(frame, pts)| (RenderFrame::plain(frame), pts));
+            return self.transfer_frame(&frame).map(|frame| (RenderFrame::plain(frame), pts));
         }
         match map_to_drm(&frame) {
             Ok(mapped) => Ok((RenderFrame::mapped(frame, mapped), pts)),
@@ -437,7 +435,7 @@ impl VaapiDecoder {
                     target: "skwd_wall::video_path",
                     "skwd-wall-vk: VAAPI DRM-PRIME mapping unavailable ({error:#}), using CPU transfer"
                 );
-                self.transfer_frame(frame, pts).map(|(frame, pts)| (RenderFrame::plain(frame), pts))
+                self.transfer_frame(&frame).map(|frame| (RenderFrame::plain(frame), pts))
             }
         }
     }
@@ -457,11 +455,7 @@ impl VaapiDecoder {
         Ok((frame, pts))
     }
 
-    fn transfer_frame(
-        &mut self,
-        frame: ff::frame::Video,
-        pts: f64,
-    ) -> Result<(ff::frame::Video, f64)> {
+    pub fn transfer_frame(&mut self, frame: &ff::frame::Video) -> Result<ff::frame::Video> {
         let mut transferred = ff::frame::Video::empty();
         let rc = unsafe {
             ff::ffi::av_hwframe_transfer_data(transferred.as_mut_ptr(), frame.as_ptr(), 0)
@@ -470,7 +464,7 @@ impl VaapiDecoder {
             return Err(anyhow!("VAAPI frame transfer failed ({rc})"));
         }
         if transferred.format() == ff::format::Pixel::NV12 {
-            return Ok((transferred, pts));
+            return Ok(transferred);
         }
         let scaler = match &mut self.scaler {
             Some(scaler) => scaler,
@@ -498,7 +492,7 @@ impl VaapiDecoder {
         if cloned.is_null() {
             return Err(anyhow!("av_frame_clone failed"));
         }
-        Ok((unsafe { ff::frame::Video::wrap(cloned) }, pts))
+        Ok(unsafe { ff::frame::Video::wrap(cloned) })
     }
 }
 

@@ -4,7 +4,7 @@
     {"id": "verify.repository", "expectedSkips": 0, "coverage": "external verifier self-tests and repository boundary"},
     {"id": "paper.native-deps", "expectedSkips": 0, "coverage": "dav1d and libyuv linker availability"},
     {"id": "paper.format", "expectedSkips": 0, "coverage": "Rust formatting"},
-    {"id": "paper.tests", "expectedSkips": 1, "coverage": "release workspace tests and one explicit real-audio-device test"},
+    {"id": "paper.tests", "expectedSkips": 2, "coverage": "release workspace tests; explicit real-audio-device test and manual freeze-frame benchmark remain opt-in"},
     {"id": "paper.clippy", "expectedSkips": 0, "coverage": "workspace all-target lint gate"},
     {"id": "paper.release", "expectedSkips": 0, "coverage": "release workspace build"},
     {"id": "paper.dependencies", "expectedSkips": 0, "coverage": "unused dependency scan"},

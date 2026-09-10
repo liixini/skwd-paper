@@ -72,3 +72,15 @@ fn classify_priority_order() {
     let swap = PaperCommand::swap_paper("/v/next.mp4", "sand-bloom", 700, true, 80);
     assert!(matches!(classify_command(swap), CommandClass::Swap(_)));
 }
+
+#[test]
+fn capture_round_trip_keeps_source_and_destination_without_pause() {
+    let command = PaperCommand::capture_scene("/scenes/42", "/cache/frame.png");
+    assert_eq!(round_trip(&command), command);
+    assert_eq!(command.pause, None);
+    assert_eq!(command.freeze, None);
+    assert_eq!(
+        command.capture.unwrap(),
+        crate::SceneCapture { source: "/scenes/42".into(), path: "/cache/frame.png".into() }
+    );
+}

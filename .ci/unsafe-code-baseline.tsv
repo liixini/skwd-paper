@@ -8,6 +8,8 @@
 5	crates/paper-runtime/src/seccomp.rs
 4	crates/paper-runtime/src/wake.rs
 5	crates/paper-runtime/src/wake/tests.rs
+3	crates/paper-scene/src/dynamic_text.rs
+3	crates/paper-scene/src/effects.rs
 4	crates/paper-scene/src/pkg.rs
 2	crates/paper-still/src/image_paper/buffer_set.rs
 5	crates/paper-still/src/image_paper/commands.rs
@@ -26,6 +28,7 @@
 3	crates/paper-vk/src/decode/tests.rs
 16	crates/paper-vk/src/ffmpeg_vulkan.rs
 2	crates/paper-vk/src/freeze.rs
+1	crates/paper-vk/src/main.rs
 2	crates/paper-vk/src/memory.rs
 13	crates/paper-vk/src/preview.rs
 1	crates/paper-vk/src/preview/gpu.rs
@@ -37,12 +40,12 @@
 1	crates/paper-vk/src/vk/draw/shared/avvk.rs
 18	crates/paper-vk/src/vk/draw/shared/targets.rs
 8	crates/paper-vk/src/vk/draw/shared/transfer.rs
-5	crates/paper-vk/src/vk/effect.rs
+9	crates/paper-vk/src/vk/effect.rs
 14	crates/paper-vk/src/vk/export.rs
 10	crates/paper-vk/src/vk/nv12.rs
-9	crates/paper-vk/src/vk/pipelines.rs
+10	crates/paper-vk/src/vk/pipelines.rs
 4	crates/paper-vk/src/vk/renderer.rs
-18	crates/paper-vk/src/vk/scene.rs
+20	crates/paper-vk/src/vk/scene.rs
 3	crates/paper-vk/src/vk/swapchain.rs
 6	crates/paper-vk/src/vk/upload.rs
 3	crates/paper-vk/src/wayland/protocol.rs

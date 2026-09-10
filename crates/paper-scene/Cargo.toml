@@ -16,6 +16,8 @@ shaderc = { version = "0.9", default-features = false }
 serde_json = { workspace = true }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
 texpresso = { workspace = true }
+hassle-rs = "0.12"
+fontdue = "0.9"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -134,10 +134,13 @@ fn write_rgba_ppm(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result
     }
     let parent = path.parent().ok_or_else(|| anyhow!("freeze-frame path has no parent"))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).context("create freeze frame")?;
-    write!(temporary, "P6\n{width} {height}\n255\n")?;
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, temporary.as_file_mut());
+    write!(writer, "P6\n{width} {height}\n255\n")?;
     for pixel in pixels[..expected].chunks_exact(4) {
-        temporary.write_all(&pixel[..3])?;
+        writer.write_all(&pixel[..3])?;
     }
+    writer.flush()?;
+    drop(writer);
     temporary.as_file_mut().sync_all()?;
     temporary.persist_noclobber(path).map_err(|error| error.error)?;
     Ok(())
@@ -150,6 +153,29 @@ fn write_error(path: &Path, message: &str) -> Result<()> {
     temporary.as_file_mut().sync_all()?;
     temporary.persist_noclobber(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+pub(crate) fn capture_scene(
+    capture: paper_control::SceneCapture,
+    frame: Result<(u32, u32, Vec<u8>)>,
+) {
+    std::thread::spawn(move || {
+        let result = frame.and_then(|(width, height, pixels)| {
+            let image = image::RgbaImage::from_raw(width, height, pixels)
+                .ok_or_else(|| anyhow!("invalid scene capture dimensions"))?;
+            let image = image::DynamicImage::ImageRgba8(image).thumbnail(1280, 720);
+            let path = Path::new(&capture.path);
+            let parent = path.parent().context("scene capture parent")?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            image.write_to(temporary.as_file_mut(), image::ImageFormat::Png)?;
+            temporary.persist_noclobber(path).map_err(|error| error.error)?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            let _ = write_error(Path::new(&format!("{}.error", capture.path)), &error.to_string());
+            tracing::warn!(source = capture.source, %error, "scene thumbnail capture failed");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -178,3 +204,10 @@ mod tests {
         assert_eq!(image.into_raw(), [255, 0, 0, 0, 255, 0]);
     }
 }
+
+#[cfg(test)]
+#[path = "capture_tests.rs"]
+mod capture_tests;
+
+#[cfg(test)]
+mod freeze_tests;

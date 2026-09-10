@@ -140,3 +140,77 @@ fn metadata_length_mismatch() {
         Err(TargetPlanError::MetadataLength { targets: 1, binds: 0, owners: 1 })
     );
 }
+
+#[test]
+fn fbo_names_tolerate_layer_uniquifier_suffixes() {
+    let names = ["_rt_FullCompoBuffer1", "_rt_FullCompoBuffer2"];
+    assert_eq!(resolve_fbo_index(names, "_rt_FullCompoBuffer1_fullscreen_90"), Some(0));
+    assert_eq!(resolve_fbo_index(names, "_rt_FullCompoBuffer2_12"), Some(1));
+    assert_eq!(resolve_fbo_index(names, "_rt_FullCompoBuffer1_fullscreen"), None);
+    assert_eq!(resolve_fbo_index(names, "_rt_FullCompoBuffer12"), None);
+}
+
+#[test]
+fn swap_marks_both_physical_buffers_loop_carried_and_remaps_later_reads() {
+    let names = strings(&["_rt_V1", "_rt_V2"]);
+    let plan = plan_targets_with(
+        &names,
+        &[None, None],
+        &[(Some(0), 0, 1)],
+        &[Some("_rt_V2".into()), None],
+        &[vec![named(1, "_rt_V1")], vec![named(1, "_rt_V1")]],
+        &[0, 0],
+    )
+    .unwrap();
+    assert_eq!(plan.passes[0].write, Target::Fbo(1));
+    assert!(plan.passes[0].reads.contains(&Target::Fbo(0)));
+    assert!(plan.passes[1].reads.contains(&Target::Fbo(1)), "{:?}", plan.passes[1]);
+    assert!(plan.lifetimes[Target::Fbo(0).index()].loop_carried);
+    assert!(plan.lifetimes[Target::Fbo(1).index()].loop_carried);
+    assert!(!plan.lifetimes[Target::Fbo(0).index()].scratch_eligible());
+    assert!(!plan.lifetimes[Target::Fbo(1).index()].scratch_eligible());
+}
+
+#[test]
+fn unique_fbos_resolve_within_their_owning_effect() {
+    let names = strings(&["_rt_H", "_rt_S", "_rt_H"]);
+    let owners = [Some(0), None, Some(1)];
+    assert_eq!(
+        resolve_fbo_scoped(names.iter().map(String::as_str), &owners, 1, "_rt_H_19_41"),
+        Some(2)
+    );
+    assert_eq!(resolve_fbo_scoped(names.iter().map(String::as_str), &owners, 0, "_rt_H"), Some(0));
+    assert_eq!(resolve_fbo_scoped(names.iter().map(String::as_str), &owners, 1, "_rt_S"), Some(1));
+    assert_eq!(resolve_fbo_scoped(names.iter().map(String::as_str), &owners, 2, "_rt_H"), None);
+    let plan = plan_targets_with(
+        &names,
+        &owners,
+        &[],
+        &[Some("_rt_H".into()), Some("_rt_H".into()), None],
+        &[vec![], vec![named(1, "_rt_S")], vec![named(1, "_rt_H_19_41")]],
+        &[0, 1, 1],
+    )
+    .unwrap();
+    assert_eq!(plan.passes[0].write, Target::Fbo(0));
+    assert_eq!(plan.passes[1].write, Target::Fbo(2));
+    assert!(plan.passes[1].reads.contains(&Target::Fbo(1)));
+    assert!(plan.passes[2].reads.contains(&Target::Fbo(2)), "{:?}", plan.passes[2]);
+    assert!(!plan.passes[2].reads.contains(&Target::Fbo(0)), "{:?}", plan.passes[2]);
+}
+
+#[test]
+fn swap_before_the_first_pass_applies_every_frame_start() {
+    let names = strings(&["_rt_A", "_rt_B"]);
+    let plan = plan_targets_with(
+        &names,
+        &[None, None],
+        &[(None, 0, 1)],
+        &[Some("_rt_A".into())],
+        &[vec![]],
+        &[0],
+    )
+    .unwrap();
+    assert_eq!(plan.passes[0].write, Target::Fbo(1));
+    assert!(plan.lifetimes[Target::Fbo(0).index()].loop_carried);
+    assert!(plan.lifetimes[Target::Fbo(1).index()].loop_carried);
+}

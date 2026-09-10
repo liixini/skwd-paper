@@ -23,6 +23,7 @@ pub struct LayerTargetNode<'a> {
     pub binds: &'a [Vec<(usize, EffectBind)>],
     pub dynamic: bool,
     pub prefix_dynamic: bool,
+    pub passthrough: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -114,6 +115,7 @@ pub fn plan_scene_targets(
     let mut passive_dynamic = vec![false; nodes.len()];
     let mut dependencies = Vec::new();
     for (consumer, node) in nodes.iter().enumerate() {
+        snapshots[consumer] = node.passthrough;
         for (_, binding) in node.binds.iter().flatten() {
             match binding {
                 EffectBind::Previous => {}
@@ -157,7 +159,7 @@ pub fn plan_scene_targets(
                         }
                     }
                 }
-                EffectBind::SceneSoFar => snapshots[consumer] = true,
+                EffectBind::SceneSoFar | EffectBind::SceneUnderLayer => snapshots[consumer] = true,
             }
         }
     }

@@ -13,6 +13,8 @@ pub struct PaperCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freeze: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<SceneCapture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shader: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -22,7 +24,19 @@ pub struct PaperCommand {
     pub properties: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneCapture {
+    pub source: String,
+    pub path: String,
+}
+
 impl PaperCommand {
+    pub fn capture_scene(source: &str, path: &str) -> Self {
+        let mut command = Self::audio(None, None);
+        command.capture = Some(SceneCapture { source: source.into(), path: path.into() });
+        command
+    }
+
     #[must_use]
     pub fn with_properties(
         mut self,
@@ -38,6 +52,7 @@ impl PaperCommand {
             mute: Some(mute),
             volume: Some(volume.min(100)),
             pause: None,
+            capture: None,
             freeze: None,
             shader: None,
             duration_ms: None,
@@ -52,6 +67,7 @@ impl PaperCommand {
             mute: Some(mute),
             volume: Some(volume.min(100)),
             pause: None,
+            capture: None,
             freeze: None,
             shader: Some(shader.to_string()),
             duration_ms: Some(duration_ms),
@@ -66,6 +82,7 @@ impl PaperCommand {
             mute,
             volume: volume.map(|value| value.min(100)),
             pause: None,
+            capture: None,
             freeze: None,
             shader: None,
             duration_ms: None,
@@ -86,6 +103,7 @@ impl PaperCommand {
             mute: None,
             volume: None,
             pause: Some(paused),
+            capture: None,
             freeze: None,
             shader: None,
             duration_ms: None,
@@ -100,6 +118,7 @@ impl PaperCommand {
             mute: None,
             volume: None,
             pause: None,
+            capture: None,
             freeze: Some(path.to_string()),
             shader: None,
             duration_ms: None,
@@ -114,6 +133,7 @@ impl PaperCommand {
             mute: None,
             volume: None,
             pause: None,
+            capture: None,
             freeze: None,
             shader: None,
             duration_ms: None,
