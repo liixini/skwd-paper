@@ -3,6 +3,8 @@ use crate::model::{Properties, Texture};
 use crate::pkg::Package;
 use serde_json::Value;
 
+mod font;
+
 pub const EM_PER_POINT: f32 = 300.0 / 72.0;
 pub const FALLBACK_FONT: &str = "fonts/NotoSans-Regular.ttf";
 const MAX_TEXT_EDGE: u32 = 8192;
@@ -140,19 +142,12 @@ fn font_bytes(pkg: &Package, assets: &Assets, name: &str) -> Option<Vec<u8>> {
 }
 
 pub struct Face {
-    font: fontdue::Font,
-    em: f32,
+    font: font::Font,
 }
 
 impl Face {
     pub fn parse(bytes: &[u8], em: f32) -> Option<Self> {
-        let settings = fontdue::FontSettings { scale: em, ..fontdue::FontSettings::default() };
-        let font = fontdue::Font::from_bytes(bytes, settings).ok()?;
-        Some(Self { font, em })
-    }
-
-    fn line_metrics(&self) -> Option<fontdue::LineMetrics> {
-        self.font.horizontal_line_metrics(self.em)
+        Some(Self { font: font::Font::parse(bytes, em)? })
     }
 
     fn line_box(&self, line: &str) -> (f32, f32) {
@@ -162,9 +157,9 @@ impl Face {
         let mut previous = None;
         for ch in line.chars() {
             if let Some(prev) = previous {
-                cursor += self.font.horizontal_kern(prev, ch, self.em).unwrap_or(0.0);
+                cursor += self.font.kern(prev, ch);
             }
-            let glyph = self.font.metrics(ch, self.em);
+            let glyph = self.font.metrics(ch);
             if glyph.width > 0 {
                 ink_min = ink_min.min(cursor + glyph.xmin as f32);
                 ink_max = ink_max.max(cursor + glyph.xmin as f32 + glyph.width as f32);
@@ -179,7 +174,7 @@ impl Face {
 
     #[must_use]
     pub fn measure(&self, text: &str) -> Option<Metrics> {
-        let line = self.line_metrics()?;
+        let line = self.font.line_metrics();
         let lines: Vec<&str> = text.split('\n').collect();
         let width = lines
             .iter()
@@ -222,9 +217,9 @@ impl Face {
             let mut previous = None;
             for ch in line.chars() {
                 if let Some(prev) = previous {
-                    cursor += self.font.horizontal_kern(prev, ch, self.em).unwrap_or(0.0);
+                    cursor += self.font.kern(prev, ch);
                 }
-                let (glyph, bitmap) = self.font.rasterize(ch, self.em);
+                let (glyph, bitmap) = self.font.rasterize(ch);
                 let x0 = (cursor + glyph.xmin as f32).round() as i64;
                 let y0 = (baseline - (glyph.ymin + glyph.height as i32) as f32).round() as i64;
                 for row in 0..glyph.height {

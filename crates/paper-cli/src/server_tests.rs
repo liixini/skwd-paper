@@ -24,14 +24,18 @@ fn parent_and_lock_private() {
     let socket = temp.path().join("skwd-paper-v2/paper.sock");
     let parent = prepare_parent(&socket).unwrap();
     assert_eq!(std::fs::symlink_metadata(&parent).unwrap().mode() & 0o777, 0o700);
-    let lock = acquire_lock(&parent).unwrap();
-    let contention = acquire_lock(&parent);
+    let lock = acquire_lock(&socket).unwrap();
+    assert_eq!(
+        lock.metadata().unwrap().ino(),
+        parent.join("manager.lock").metadata().unwrap().ino()
+    );
+    let contention = acquire_lock(&socket);
     assert!(contention.is_err());
     drop(contention);
     drop(lock);
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        match acquire_lock(&parent) {
+        match acquire_lock(&socket) {
             Ok(lock) => {
                 drop(lock);
                 break;
@@ -42,6 +46,108 @@ fn parent_and_lock_private() {
             Err(error) => panic!("Paper manager lock was not released: {error}"),
         }
     }
+}
+
+#[test]
+fn custom_socket_locks_are_private_independent_and_reusable() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("overview.sock");
+    let second = temp.path().join("overview.other");
+    let first_lock = acquire_lock(&first).unwrap();
+    let second_lock = acquire_lock(&second).unwrap();
+    assert_eq!(first_lock.metadata().unwrap().mode() & 0o777, 0o600);
+    assert_eq!(second_lock.metadata().unwrap().mode() & 0o777, 0o600);
+    assert!(acquire_lock(&first).is_err());
+    assert!(acquire_lock(&second).is_err());
+    drop(first_lock);
+    assert!(acquire_lock(&first).is_ok());
+    assert!(acquire_lock(&second).is_err());
+}
+
+#[test]
+fn custom_socket_lock_rejects_symlinks_and_shared_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("overview-backdrop.sock");
+    let lock = temp.path().join("overview-backdrop.sock.manager.lock");
+    let target = temp.path().join("target");
+    std::fs::write(&target, "preserve").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(&target, &lock).unwrap();
+    assert!(acquire_lock(&socket).is_err());
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::hard_link(&target, &lock).unwrap();
+    assert!(acquire_lock(&socket).is_err());
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::write(&lock, "").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(acquire_lock(&socket).is_err());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "preserve");
+}
+
+#[test]
+fn overview_and_default_controllers_coexist_in_either_start_order() {
+    for names in
+        [["paper.sock", "overview-backdrop.sock"], ["overview-backdrop.sock", "paper.sock"]]
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let sockets = names.map(|name| temp.path().join("runtime").join(name));
+        let mut servers = Vec::new();
+        for socket in &sockets {
+            let path = socket.clone();
+            servers.push(std::thread::spawn(move || run_at(&path).unwrap()));
+            wait_for_socket(socket);
+            let inode = socket.metadata().unwrap().ino();
+            assert!(
+                run_at(socket).unwrap_err().to_string().contains("already starting or running")
+            );
+            assert_eq!(socket.metadata().unwrap().ino(), inode);
+        }
+        let pause = serde_json::to_value(request(
+            &sockets[0],
+            &Request::new(1, RequestParams::Pause(PauseRequest { paused: true })),
+        ))
+        .unwrap();
+        assert_eq!(pause["result"]["paused"], true);
+        let status = serde_json::to_value(request(
+            &sockets[1],
+            &Request::new(2, RequestParams::Status(StatusRequest {})),
+        ))
+        .unwrap();
+        assert_eq!(status["result"]["paused"], false);
+        for socket in &sockets {
+            request(socket, &Request::new(3, RequestParams::Stop(StopRequest::default())));
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
+        for socket in &sockets {
+            assert!(!socket.exists());
+            assert!(acquire_lock(socket).is_ok());
+        }
+    }
+}
+
+#[test]
+fn custom_controller_recovers_stale_socket_without_replacing_regular_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("runtime/overview-backdrop.sock");
+    prepare_parent(&socket).unwrap();
+    drop(StdUnixListener::bind(&socket).unwrap());
+    let path = socket.clone();
+    let server = std::thread::spawn(move || run_at(&path).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if StdUnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "stale socket was not recovered");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    request(&socket, &Request::new(1, RequestParams::Stop(StopRequest::default())));
+    server.join().unwrap();
+    std::fs::write(&socket, "preserve").unwrap();
+    assert!(run_at(&socket).unwrap_err().to_string().contains("refusing to replace non-socket"));
+    assert_eq!(std::fs::read_to_string(socket).unwrap(), "preserve");
 }
 
 #[test]

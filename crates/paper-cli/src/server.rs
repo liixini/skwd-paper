@@ -58,8 +58,8 @@ fn run_at(path: &Path) -> Result<()> {
 }
 
 fn run_with_manager(path: &Path, manager: Manager) -> Result<()> {
-    let parent = prepare_parent(path)?;
-    let _lock = acquire_lock(&parent)?;
+    prepare_parent(path)?;
+    let _lock = acquire_lock(path)?;
     let listener = bind(path)?;
     let _guard = SocketGuard::new(path)?;
     listener.set_nonblocking(true).context("set Paper listener nonblocking")?;
@@ -439,8 +439,15 @@ fn prepare_parent(path: &Path) -> Result<std::path::PathBuf> {
     Ok(parent.to_path_buf())
 }
 
-fn acquire_lock(parent: &Path) -> Result<std::fs::File> {
-    let path = parent.join("manager.lock");
+fn acquire_lock(socket: &Path) -> Result<std::fs::File> {
+    let name = socket.file_name().context("Paper socket has no file name")?;
+    let path = if name == "paper.sock" {
+        socket.with_file_name("manager.lock")
+    } else {
+        let mut name = name.to_os_string();
+        name.push(".manager.lock");
+        socket.with_file_name(name)
+    };
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

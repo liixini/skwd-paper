@@ -15,3 +15,4 @@ __pycache__/
 /perf-sweep-latest.json
 experiments/*/build/
 experiments/*/target/
+/scripts/golden/preview_baseline.csv

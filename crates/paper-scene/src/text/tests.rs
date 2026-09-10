@@ -1,5 +1,36 @@
 use super::*;
 
+#[test]
+fn malformed_fonts_and_invalid_sizes_are_rejected() {
+    for bytes in [&[][..], &[0, 1, 0, 0][..], b"not a font".as_slice()] {
+        assert!(Face::parse(bytes, 200.0).is_none());
+    }
+    let assets = crate::effects::Assets::discover(None);
+    if let Some(bytes) = assets.read_bytes(FALLBACK_FONT) {
+        for em in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(Face::parse(&bytes, em).is_none());
+        }
+    }
+}
+
+#[test]
+fn repeated_text_rendering_preserves_pixels_and_multiline_spacing() {
+    let assets = crate::effects::Assets::discover(None);
+    let Some(bytes) = assets.read_bytes(FALLBACK_FONT) else {
+        return;
+    };
+    let face = Face::parse(&bytes, 200.0).expect("font parses");
+    let single = face.measure("J H").expect("single-line metrics");
+    for align in [HAlign::Left, HAlign::Center, HAlign::Right] {
+        let (metrics, first) = face.rasterize("J H\n12:34", align).expect("rasterizes");
+        let (_, second) = face.rasterize("J H\n12:34", align).expect("rasterizes again");
+        assert_eq!(metrics.lines, 2);
+        assert!((metrics.height() - single.height() - single.line_height).abs() < 0.001);
+        assert_eq!(first.pixels.levels[0].data, second.pixels.levels[0].data);
+        assert!(first.pixels.levels[0].data.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+}
+
 fn noto_like() -> Metrics {
     Metrics { width: 148.0, ascent: 213.8, descent: 58.6, line_height: 272.4, lines: 1 }
 }
