@@ -32,3 +32,18 @@ fn parallax_settles_and_stops_changing() {
 fn arbitrary_pointer_script_does_not_become_a_clock() {
     assert!(Clock3d::from_text(&serde_json::json!({"script":"export function update() { return input.cursorWorldPosition.x; }"}), [0.0; 2]).is_none());
 }
+
+#[test]
+fn depth_parallax_uses_normalized_influence_with_zero_camera_amount() {
+    let config = Parallax { amount: 0.0, influence: -0.2, delay: 2.0 };
+    for (pointer, expected) in [([0.25; 2], [0.45; 2]), ([0.75; 2], [0.55; 2])] {
+        let mut position = [0.5; 2];
+        for _ in 0..300 {
+            position = config.position(pointer, position, 1.0 / 30.0);
+        }
+        assert_eq!(position, expected);
+        assert_eq!(config.position(pointer, position, 1.0 / 30.0), position);
+        assert_eq!(config.displacement(pointer, [0.0; 2], 1.0), [0.0; 2]);
+    }
+    assert_eq!(Parallax { influence: 0.0, ..config }.position([0.0; 2], [0.5; 2], 1.0), [0.5; 2]);
+}

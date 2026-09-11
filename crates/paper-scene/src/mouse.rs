@@ -8,6 +8,15 @@ pub struct Parallax {
 }
 
 impl Parallax {
+    pub fn position(self, pointer: [f32; 2], previous: [f32; 2], dt: f32) -> [f32; 2] {
+        let blend = (self.delay * dt).clamp(0.0, 1.0);
+        std::array::from_fn(|axis| {
+            let target = 0.5 - (pointer[axis] - 0.5) * self.influence;
+            let next = previous[axis] + (target - previous[axis]) * blend;
+            if (target - next).abs() < 0.00001 { target } else { next }
+        })
+    }
+
     pub fn displacement(self, pointer: [f32; 2], previous: [f32; 2], dt: f32) -> [f32; 2] {
         let blend = (self.delay * dt).clamp(0.0, 1.0);
         std::array::from_fn(|axis| {

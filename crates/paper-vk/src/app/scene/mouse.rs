@@ -9,6 +9,7 @@ pub(super) struct SceneMouse {
     previous: [f32; 2],
     buttons: [bool; 3],
     displacement: [f32; 2],
+    parallax_position: Option<[f32; 2]>,
     revision: u64,
     dirty: bool,
     settling: bool,
@@ -42,6 +43,13 @@ impl SceneMouse {
             previous: [0.5; 2],
             buttons: [false; 3],
             displacement: [0.0; 2],
+            parallax_position: model
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.effects)
+                .flat_map(|effect| &effect.passes)
+                .any(|pass| pass.fragment.uniforms.iter().any(|u| u.name == "g_ParallaxPosition"))
+                .then_some([0.5; 2]),
             revision: 0,
             dirty: enabled,
             settling: false,
@@ -139,7 +147,7 @@ fn write_uniforms(values: &mut std::collections::BTreeMap<String, Vec<f32>>, mou
     for (name, value) in [
         ("g_PointerPosition", mouse.position.as_slice()),
         ("g_PointerPositionLast", mouse.previous.as_slice()),
-        ("g_ParallaxPosition", mouse.displacement.as_slice()),
+        ("g_ParallaxPosition", mouse.parallax_position.as_ref().unwrap_or(&[0.5; 2]).as_slice()),
         ("g_PointerState", buttons.as_slice()),
     ] {
         if let Some(existing) = values.get_mut(name) {
@@ -160,6 +168,11 @@ impl Group {
         let before = mouse.displacement;
         mouse.displacement = mouse.config.displacement(mouse.position, before, dt);
         mouse.settling = mouse.displacement != before;
+        if let Some(position) = &mut mouse.parallax_position {
+            let before = *position;
+            *position = mouse.config.position(mouse.position, before, dt);
+            mouse.settling |= *position != before;
+        }
         for (index, (layer, base)) in mouse.layers.iter().enumerate() {
             let quad = &mut self.quads[index];
             quad.rect = *base;

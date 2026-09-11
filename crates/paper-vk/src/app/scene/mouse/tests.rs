@@ -9,6 +9,7 @@ fn mouse() -> SceneMouse {
         previous: [0.5; 2],
         buttons: [false; 3],
         displacement: [0.0; 2],
+        parallax_position: None,
         revision: 0,
         dirty: false,
         settling: false,
@@ -256,5 +257,71 @@ fn cherry_blossom_particles_follow_pointer_in_a_particle_only_scene() {
         }
     }
     assert!(centers[0] < 120.0 && centers[1] > 200.0, "particle centers: {centers:?}");
+    group.destroy();
+}
+
+#[test]
+#[ignore = "requires Vulkan, Wallpaper Engine assets, and SKWD_WE_CLOCK_LIBRARY"]
+fn depth_parallax_moves_with_zero_camera_amount_and_settles() {
+    let dir = std::path::PathBuf::from(std::env::var("SKWD_WE_CLOCK_LIBRARY").unwrap())
+        .join("3016047975");
+    let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
+    let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
+    model.layers.retain(|layer| layer.id == "13");
+    model.particles.clear();
+    assert_eq!(model.mouse.amount, 0.0);
+    assert_eq!(model.mouse.influence, -0.2);
+    model.layers[0]
+        .effects
+        .retain(|effect| effect.passes.iter().any(|pass| pass.name.contains("depthparallax")));
+    assert_eq!(model.layers[0].effects.len(), 1);
+    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let mut group =
+        super::super::build_group(&sd, &mut model, true, &[(640, 360)], paper_geom::FillMode::Fit)
+            .unwrap();
+    assert!(group.mouse.enabled);
+    assert_eq!(group.mouse.parallax_position, Some([0.5; 2]));
+    assert!(!group.frozen);
+    assert!(!group.animated());
+    assert_eq!(group.fx.len(), 1);
+    let mut frames = Vec::new();
+    for (index, x) in [0.25, 0.75, 0.25].into_iter().enumerate() {
+        group.mouse.update(
+            index as u64 + 1,
+            [x, 0.5],
+            [false; 3],
+            (640, 360),
+            paper_geom::FillMode::Fit,
+        );
+        for _ in 0..100 {
+            group.compose(0.0, 0.1).unwrap();
+            if !group.mouse.pending() {
+                break;
+            }
+        }
+        assert!(!group.mouse.pending());
+        assert_eq!(group.mouse.displacement, [0.0; 2]);
+        let expected = if x < 0.5 { 0.45 } else { 0.55 };
+        assert_eq!(group.scene_uniforms["g_ParallaxPosition"], [expected, 0.5]);
+        let (width, height, rgba) = group.read_canvas().unwrap();
+        if let Ok(evidence) = std::env::var("SKWD_WE_CLOCK_EVIDENCE") {
+            image::save_buffer(
+                std::path::Path::new(&evidence).join(format!("depth-gpu-{index}.png")),
+                &rgba,
+                width,
+                height,
+                image::ColorType::Rgba8,
+            )
+            .unwrap();
+        }
+        frames.push(rgba);
+    }
+    let changed = frames[0]
+        .chunks_exact(4)
+        .zip(frames[1].chunks_exact(4))
+        .filter(|(a, b)| a[..3].iter().zip(&b[..3]).any(|(x, y)| x.abs_diff(*y) > 10))
+        .count();
+    assert!(changed > 1000, "depth effect changed only {changed} pixels");
+    assert_eq!(frames[0], frames[2]);
     group.destroy();
 }

@@ -607,11 +607,11 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
     let parallax = Parallax::of(&scene, canvas, props);
     let mouse = crate::mouse::Parallax {
         amount: parallax.as_ref().map_or(0.0, |p| p.amount),
-        influence: number(
-            general.and_then(|top| top.get("cameraparallaxmouseinfluence")),
-            props,
-            1.0,
-        ),
+        influence: if parallax.is_some() {
+            number(general.and_then(|top| top.get("cameraparallaxmouseinfluence")), props, 1.0)
+        } else {
+            0.0
+        },
         delay: number(general.and_then(|top| top.get("cameraparallaxdelay")), props, 1.0),
     };
 
