@@ -9,6 +9,9 @@ layout(push_constant) uniform PC {
     vec2 canvas;
     float angle;
     float pad;
+    vec4 projection_x;
+    vec4 projection_y;
+    vec4 projection_w;
 } pc;
 void main() {
     vec2 scaled = a_position * pc.rect.zw;

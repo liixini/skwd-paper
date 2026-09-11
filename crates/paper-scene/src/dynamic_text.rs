@@ -1,3 +1,7 @@
+pub mod clock;
+pub mod date;
+mod settings;
+
 use serde_json::Value;
 use std::fmt::Write;
 
@@ -447,6 +451,12 @@ pub fn resolve(text: Option<&Value>, now: LocalTime) -> Option<String> {
     let script = map.get("script")?.as_str().unwrap_or_default();
     if media_bound(script) {
         return Some(String::new());
+    }
+    if let Some(clock) = clock::Clock::from_text(text?) {
+        return Some(clock.value(now));
+    }
+    if let Some(date) = date::Date::from_text(text?) {
+        return Some(date.value(now));
     }
     let placeholder = crate::text::text_value(map.get("value"))?;
     let table = weekday_table(script);

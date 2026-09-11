@@ -1,4 +1,6 @@
-use wayland_client::protocol::{wl_compositor, wl_output, wl_region, wl_seat, wl_shm, wl_surface};
+use wayland_client::protocol::{
+    wl_compositor, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface,
+};
 use wayland_client::{Connection, EventQueue};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
 use wayland_protocols::wp::content_type::v1::client::{
@@ -75,6 +77,11 @@ pub struct App {
     pub(super) presentation: Option<WpPresentation>,
     pub(super) idle_notifier: Option<ExtIdleNotifierV1>,
     pub(super) seat: Option<wl_seat::WlSeat>,
+    pub(super) pointer: Option<wl_pointer::WlPointer>,
+    pub(super) pointer_enabled: bool,
+    pub(super) pointer_capable: bool,
+    pub(super) pointer_focus: Option<usize>,
+    pub mouse: super::pointer::Mouse,
     pub idle: bool,
     pub shm_formats: Vec<wl_shm::Format>,
     pub probe_result: Option<bool>,

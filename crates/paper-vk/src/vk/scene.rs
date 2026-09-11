@@ -48,6 +48,8 @@ pub struct SceneQuad {
     pub uv: [f32; 4],
     pub tint: [f32; 4],
     pub angle: f32,
+    pub projection: Option<[[f32; 4]; 3]>,
+    pub order_bias: i8,
     pub texture: usize,
     pub blend: SceneBlend,
 }
@@ -69,6 +71,7 @@ struct LayerPush {
     canvas: [f32; 2],
     angle: f32,
     pad: f32,
+    projection: [[f32; 4]; 3],
 }
 
 fn timestamp_delta_ns(start: u64, end: u64, valid_bits: u32, period: f64) -> u64 {
@@ -251,13 +254,17 @@ impl Renderer {
                 canvas,
                 angle: 0.0,
                 pad: 0.0,
+                projection: [[0.0; 4]; 3],
             };
             self.device.cmd_push_constants(
                 self.cmd,
                 self.pipeline_layout_layer,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
-                std::slice::from_raw_parts((&raw const push).cast(), 64),
+                std::slice::from_raw_parts(
+                    (&raw const push).cast(),
+                    std::mem::size_of::<LayerPush>(),
+                ),
             );
             self.device.cmd_draw_indexed(self.cmd, mesh.index_count, 1, 0, 0, 0);
             self.device.cmd_end_render_pass(self.cmd);
@@ -1129,13 +1136,17 @@ impl Renderer {
                     canvas,
                     angle: quad.angle,
                     pad: if quad.blend == SceneBlend::Screen { 1.0 } else { 0.0 },
+                    projection: quad.projection.unwrap_or([[0.0; 4]; 3]),
                 };
                 self.device.cmd_push_constants(
                     self.cmd,
                     self.pipeline_layout_layer,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
-                    std::slice::from_raw_parts((&raw const push).cast(), 64),
+                    std::slice::from_raw_parts(
+                        (&raw const push).cast(),
+                        std::mem::size_of::<LayerPush>(),
+                    ),
                 );
                 self.device.cmd_draw(self.cmd, 4, 1, 0, 0);
             }

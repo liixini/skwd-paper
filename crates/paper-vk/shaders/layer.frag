@@ -8,6 +8,9 @@ layout(push_constant) uniform PC {
     vec2 canvas;
     float angle;
     float pad;
+    vec4 projection_x;
+    vec4 projection_y;
+    vec4 projection_w;
 } pc;
 layout(binding = 0) uniform sampler2D tex;
 void main() {

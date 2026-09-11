@@ -6,6 +6,7 @@ pub mod effects;
 pub mod hlsl;
 pub mod json;
 pub mod model;
+pub mod mouse;
 pub mod particles;
 pub mod pkg;
 pub mod puppet;

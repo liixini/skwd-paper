@@ -1,3 +1,4 @@
+mod mouse;
 mod video;
 
 use super::dmabuf_helpers::{create_buffers, init_free_buffers, monotonic_ns};
@@ -62,6 +63,8 @@ struct LayerFx {
     passes: Vec<paper_scene::effects::PassMeta>,
     output: Option<FxTargetId>,
     source_dynamic: bool,
+    source_clock: bool,
+    source_pointer: bool,
     dependency_dynamic: bool,
     retain_targets: bool,
     snapshot: bool,
@@ -352,7 +355,10 @@ impl LayerFx {
     }
 
     fn frame_state_dependent(&self) -> bool {
-        self.intrinsic_dynamic() || self.dependency_dynamic
+        self.source_clock
+            || self.source_pointer
+            || self.intrinsic_dynamic()
+            || self.dependency_dynamic
     }
 }
 
@@ -793,6 +799,8 @@ struct Group {
     bands: paper_audio::Bands,
     live_text: Vec<LiveText>,
     live_text_due: f32,
+    effects_animated: bool,
+    mouse: mouse::SceneMouse,
     scene_uniforms: std::collections::BTreeMap<String, Vec<f32>>,
     fixed_daytime: Option<f32>,
     canvas: (f32, f32),
@@ -988,6 +996,7 @@ impl Presenter {
 impl Group {
     fn scene_target_plan(
         &self,
+        include_clocks: bool,
     ) -> Result<SceneTargetPlan, paper_scene::scene_targets::SceneTargetPlanError> {
         let local_targets: Vec<Vec<String>> = self.fx.iter().map(LayerFx::fbo_names).collect();
         let nodes: Vec<LayerTargetNode<'_>> = self
@@ -999,7 +1008,8 @@ impl Group {
                 scene_order: fx.scene_order,
                 local_targets: &local_targets[index],
                 binds: &fx.binds,
-                dynamic: fx.intrinsic_dynamic(),
+                dynamic: fx.intrinsic_dynamic()
+                    || (include_clocks && (fx.source_clock || fx.source_pointer)),
                 passthrough: fx.passthrough,
                 prefix_dynamic: self
                     .particles
@@ -1075,8 +1085,12 @@ impl Group {
 
     fn configure_scene_targets(&mut self, strict: bool) -> Result<()> {
         loop {
-            match self.scene_target_plan() {
-                Ok(plan) => return self.apply_scene_target_plan(plan),
+            match self.scene_target_plan(true) {
+                Ok(plan) => {
+                    let animation = self.scene_target_plan(false)?;
+                    self.effects_animated = animation.dynamic.iter().any(|dynamic| *dynamic);
+                    return self.apply_scene_target_plan(plan);
+                }
                 Err(error) if strict => {
                     return Err(anyhow!("[native-scene-gap:scene-render-targets] {error}"));
                 }
@@ -1129,7 +1143,7 @@ impl Group {
             || !self.particles.is_empty()
             || self.puppets.iter().any(PuppetGroup::animated)
             || self.fx.iter().flat_map(|fx| &fx.passes).any(|pass| pass.time_dependent())
-            || self.fx.iter().any(LayerFx::frame_state_dependent)
+            || self.effects_animated
             || self.audio.is_some()
     }
 
@@ -1152,6 +1166,10 @@ impl Group {
             .min()
             .unwrap_or(paper_scene::dynamic_text::Cadence::Day);
         self.live_text_due = time + paper_scene::dynamic_text::seconds_until_next(cadence, now);
+        self.refresh_live_text(now)
+    }
+
+    fn refresh_live_text(&mut self, now: paper_scene::dynamic_text::LocalTime) -> Result<()> {
         for index in 0..self.live_text.len() {
             let wanted = self.live_text[index].prepared.value(now);
             if wanted == self.live_text[index].shown {
@@ -1198,6 +1216,10 @@ impl Group {
         let screen = (self.target.extent.width, self.target.extent.height);
         let canvas = self.canvas;
         for (group_index, group) in self.particles.iter_mut().enumerate() {
+            group.sim.set_pointer([
+                self.mouse.position[0] * canvas.0,
+                (1.0 - self.mouse.position[1]) * canvas.1,
+            ]);
             group.sim.step(&group.system, dt);
             if let Some(engine) = group.engine.as_mut() {
                 let system = &group.system;
@@ -1316,6 +1338,8 @@ impl Group {
                         out.push(OrderedParticleQuad {
                             scene_order: group.scene_order,
                             quad: vk::SceneQuad {
+                                projection: None,
+                                order_bias: 0,
                                 rect: [
                                     (ax + bx) * 0.5,
                                     self.canvas.1 - (ay + by) * 0.5,
@@ -1372,6 +1396,8 @@ impl Group {
                 out.push(OrderedParticleQuad {
                     scene_order: group.scene_order,
                     quad: vk::SceneQuad {
+                        projection: None,
+                        order_bias: 0,
                         rect,
                         uv: sample.uv,
                         tint: [tint[0], tint[1], tint[2], tint[3] * (1.0 - fade)],
@@ -1384,6 +1410,8 @@ impl Group {
                     out.push(OrderedParticleQuad {
                         scene_order: group.scene_order,
                         quad: vk::SceneQuad {
+                            projection: None,
+                            order_bias: 0,
                             rect,
                             uv,
                             tint: [tint[0], tint[1], tint[2], tint[3] * mix],
@@ -1437,6 +1465,7 @@ impl Group {
         self.advance_layer_animations(time);
         self.advance_live_text(time)?;
         self.advance_audio(dt);
+        self.advance_mouse(dt);
         let debug_fx = std::env::var("SKWD_VK_FX_DEBUG").is_ok();
         let batched = !debug_fx && (!self.fx.is_empty() || !self.puppets.is_empty());
         if batched {
@@ -2029,6 +2058,8 @@ fn quads(model: &SceneModel, layer_slots: &[usize]) -> Vec<vk::SceneQuad> {
         .map(|(idx, layer)| {
             let (uvw, uvh) = layer.texture.uv_scale();
             vk::SceneQuad {
+                projection: None,
+                order_bias: 0,
                 rect: [layer.center.0, layer.center.1, layer.size.0, layer.size.1],
                 uv: [0.0, 0.0, uvw, uvh],
                 tint: if !layer.passthrough && !layer.effects.is_empty() {
@@ -2121,7 +2152,7 @@ fn ordered_scene_quads(
             .filter(|(_, entry)| before.is_none_or(|limit| entry.scene_order < limit))
             .map(|(serial, entry)| (entry.scene_order, offset + serial, entry.quad.clone())),
     );
-    ordered.sort_by_key(|(order, serial, _)| (*order, *serial));
+    ordered.sort_by_key(|(order, serial, quad)| (*order, quad.order_bias, *serial));
     ordered.into_iter().map(|(_, _, quad)| quad).collect()
 }
 
@@ -2154,6 +2185,8 @@ fn passive_target_quad(
 ) -> vk::SceneQuad {
     let (uvw, uvh) = layer.texture.uv_scale();
     vk::SceneQuad {
+        projection: None,
+        order_bias: 0,
         rect: [
             extent.width as f32 * 0.5,
             extent.height as f32 * 0.5,
@@ -2254,11 +2287,28 @@ fn scene_dimensions_for_outputs(
     SceneDimensions { logical, raster: (raster_w, raster_h) }
 }
 
+fn layer_effect_dimensions(
+    layer: &paper_scene::model::Layer,
+    dimensions: SceneDimensions,
+) -> (u32, u32) {
+    if layer.is_text {
+        return bounded_effect_dimensions(
+            f64::from(layer.texture.width),
+            f64::from(layer.texture.height),
+        );
+    }
+    effect_dimensions_for(layer.size, dimensions)
+}
+
 fn effect_dimensions_for(size: (f32, f32), dimensions: SceneDimensions) -> (u32, u32) {
     let scale_x = f64::from(dimensions.raster.0) / f64::from(dimensions.logical[0]);
     let scale_y = f64::from(dimensions.raster.1) / f64::from(dimensions.logical[1]);
     let raw_w = (f64::from(size.0.abs()) * scale_x).max(1.0);
     let raw_h = (f64::from(size.1.abs()) * scale_y).max(1.0);
+    bounded_effect_dimensions(raw_w, raw_h)
+}
+
+fn bounded_effect_dimensions(raw_w: f64, raw_h: f64) -> (u32, u32) {
     let shrink = (2048.0 / raw_w.max(raw_h)).min(1.0);
     let width = ((raw_w * shrink).round() as u32).clamp(16, 2048);
     let height = ((raw_h * shrink).round() as u32).clamp(16, 2048);
@@ -2391,7 +2441,7 @@ fn create_puppets(
         let Some(puppet) = layer.puppet.take() else {
             continue;
         };
-        let (width, height) = effect_dimensions_for(layer.size, dimensions);
+        let (width, height) = layer_effect_dimensions(layer, dimensions);
         let texture = layer_slots[index];
         if textures.get(texture).is_none() {
             return Err(anyhow!("puppet atlas slot missing for {}", layer.name));
@@ -2537,12 +2587,21 @@ fn build_group(
         .unwrap_or(512)
         .saturating_mul(1024 * 1024);
     let scene_lights = (model.ambient, model.skylight);
+    let pointer_scene = model.mouse.amount != 0.0
+        || model.layers.iter().any(|layer| {
+            layer.mouse.clock.is_some()
+                || layer
+                    .effects
+                    .iter()
+                    .flat_map(|effect| &effect.passes)
+                    .any(|pass| paper_scene::effects::PassMeta::of(pass).pointer_dependent())
+        });
     for (index, layer) in model.layers.iter_mut().enumerate() {
         if !layer.visible || layer.effects.is_empty() {
             continue;
         }
 
-        let (fx_w, fx_h) = effect_dimensions_for(layer.size, dimensions);
+        let (fx_w, fx_h) = layer_effect_dimensions(layer, dimensions);
         let mut pipelines = Vec::new();
         let mut inputs = Vec::new();
         let mut metas = Vec::new();
@@ -2757,6 +2816,8 @@ fn build_group(
         };
         let full_rect = [fx_w as f32 / 2.0, fx_h as f32 / 2.0, fx_w as f32, fx_h as f32];
         let base_quad = vk::SceneQuad {
+            projection: None,
+            order_bias: 0,
             rect: full_rect,
             uv: base_uv,
             tint: if layer.passthrough {
@@ -2780,6 +2841,8 @@ fn build_group(
             None
         };
         let crop_quad = snapshot_slot.filter(|_| needs_crop).map(|slot| vk::SceneQuad {
+            projection: None,
+            order_bias: 0,
             rect: full_rect,
             uv: passthrough_uv(layer, canvas),
             tint: [1.0, 1.0, 1.0, 1.0],
@@ -2820,6 +2883,13 @@ fn build_group(
             passes: metas,
             output: None,
             source_dynamic,
+            source_clock: layer.live_text.is_some(),
+            source_pointer: layer
+                .effects
+                .iter()
+                .flat_map(|effect| &effect.passes)
+                .any(|pass| paper_scene::effects::PassMeta::of(pass).pointer_dependent())
+                || (needs_crop || layer.passthrough) && pointer_scene,
             dependency_dynamic: false,
             retain_targets: false,
             snapshot: false,
@@ -2832,9 +2902,11 @@ fn build_group(
             uniforms: layer_uniforms(layer, canvas, scene_lights),
         });
     }
+    let mut mouse = mouse::SceneMouse::new(model);
     let mut particles = Vec::new();
     for (index, layer) in std::mem::take(&mut model.particles).into_iter().enumerate() {
         let mut system = layer.system;
+        mouse.enabled |= system.follows_mouse();
         let Some(mut texture) = system.texture.take() else {
             continue;
         };
@@ -2971,7 +3043,7 @@ fn build_group(
             });
             continue;
         }
-        let (width, height) = effect_dimensions_for(layer.size, dimensions);
+        let (width, height) = layer_effect_dimensions(layer, dimensions);
         let target = if layer.texture.clamp {
             renderer.create_scene_target(width, height)?
         } else {
@@ -3095,6 +3167,8 @@ fn build_group(
         bands: paper_audio::Bands::default(),
         live_text,
         live_text_due: 0.0,
+        effects_animated: false,
+        mouse,
         scene_uniforms: std::collections::BTreeMap::from([
             ("g_LightAmbientColor".to_string(), model.ambient.to_vec()),
             ("g_LightSkylightColor".to_string(), model.skylight.to_vec()),
@@ -3116,7 +3190,7 @@ fn build_group(
     group.compose(0.0, 1.0 / 30.0)?;
     let effect_layers = group.fx.len();
     let effect_target_bytes_before = group.effect_target_allocation_bytes();
-    let was_animated = group.animated() || !group.live_text.is_empty();
+    let was_animated = group.animated() || !group.live_text.is_empty() || group.mouse.enabled;
     let memory = if was_animated {
         group.bake_static_effects()?
     } else {
@@ -3721,8 +3795,10 @@ pub(super) fn run_scene(
     target.ctl_fd = ctl.wake_fd();
     let mut active_dir = dir.to_string();
     let mut active_properties = properties.clone();
+    target.enable_pointer();
     let mut presented = false;
     let mut committed_outputs = vec![false; n_surf];
+    let mut render_pending = vec![true; n_surf];
     let mut fade_start: Option<Instant> = fading_enabled.then(Instant::now);
     let mut fade_first_frame = fading_enabled;
     let mut fade_first_outputs = vec![false; n_surf];
@@ -3830,6 +3906,7 @@ pub(super) fn run_scene(
             fade_commits.fill(0);
             presented = false;
             committed_outputs.fill(false);
+            render_pending.fill(true);
             animated = group.animated();
             epoch = now;
             next_frame = epoch;
@@ -3890,7 +3967,26 @@ pub(super) fn run_scene(
             next_frame = now;
             last_sim = now;
         }
-        let frame_driven = animated || fade_start.is_some();
+        for (pending, surface) in render_pending.iter_mut().zip(&target.app.surfaces) {
+            if surface.closed {
+                *pending = false;
+            }
+        }
+        let pointer = target.app.mouse;
+        if let Some(surface) = pointer.surface.and_then(|index| target.app.surfaces.get(index)) {
+            group.mouse.update(
+                pointer.revision,
+                pointer.position,
+                pointer.buttons,
+                (
+                    surface.width * surface.scale.max(1) as u32,
+                    surface.height * surface.scale.max(1) as u32,
+                ),
+                mode,
+            );
+        }
+        let mouse_driven = group.mouse.pending();
+        let frame_driven = animated || fade_start.is_some() || mouse_driven;
         if frame_driven {
             let now = Instant::now();
             if now < next_frame {
@@ -3898,18 +3994,24 @@ pub(super) fn run_scene(
                 continue;
             }
             next_frame = now + frame_gap;
-            if animated {
+            if animated || mouse_driven {
                 let time = epoch.elapsed().as_secs_f32();
                 let dt = now.duration_since(last_sim).as_secs_f32().clamp(1.0 / 240.0, 0.1);
                 last_sim = now;
                 group.compose(time, dt)?;
+                render_pending.fill(true);
             }
         }
         let fade_step = scene_fade_step(
             fade_start.map(|started| started.elapsed().as_secs_f32() * 1000.0 / fade_ms as f32),
             fade_first_frame,
         );
-        if presented && fade_start.is_none() && !animated {
+        if presented
+            && fade_start.is_none()
+            && !animated
+            && !mouse_driven
+            && !render_pending.iter().any(|pending| *pending)
+        {
             let elapsed = epoch.elapsed().as_secs_f32();
             let wait = group.live_text_wait(elapsed);
             if wait.is_none_or(|seconds| seconds > 0.0) {
@@ -3921,6 +4023,7 @@ pub(super) fn run_scene(
             let dt = now.duration_since(last_sim).as_secs_f32().clamp(1.0 / 240.0, 0.1);
             last_sim = now;
             group.compose(elapsed, dt)?;
+            render_pending.fill(true);
         }
 
         let mut committed = false;
@@ -3990,6 +4093,7 @@ pub(super) fn run_scene(
             target.request_presentation_feedback_at(si);
             target.commit_at(si);
             committed_outputs[si] = true;
+            render_pending[si] = false;
             if fade_step.render_transition {
                 fade_commits[si] += 1;
                 if fade_first_frame {
@@ -4042,6 +4146,9 @@ pub(super) fn run_scene(
                 if fade_start.is_some() { " (transition started)" } else { "" }
             );
             signal_ready();
+        }
+        if !committed && render_pending.iter().any(|pending| *pending) {
+            target.dispatch_wait_events(Instant::now() + frame_gap)?;
         }
     }
 

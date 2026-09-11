@@ -85,8 +85,28 @@ fn num_of(value: Option<&Value>, fallback: f32) -> f32 {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct ControlPoint {
+    pub flags: u32,
+    pub offset: [f32; 3],
+}
+
+fn control_points(doc: &Value) -> [ControlPoint; 8] {
+    let mut points = [ControlPoint::default(); 8];
+    for entry in doc.get("controlpoint").and_then(Value::as_array).into_iter().flatten() {
+        if let Some(point) =
+            entry.get("id").and_then(Value::as_u64).and_then(|id| points.get_mut(id as usize))
+        {
+            point.flags = num_of(entry.get("flags"), 0.0) as u32;
+            point.offset = vec3_of(entry.get("offset"), [0.0; 3]);
+        }
+    }
+    points
+}
+
 pub enum Emitter {
     Sphere {
+        control_point: Option<usize>,
         origin: [f32; 3],
         directions: [f32; 3],
         sign: [f32; 3],
@@ -96,6 +116,7 @@ pub enum Emitter {
         instantaneous: u32,
     },
     Box {
+        control_point: Option<usize>,
         origin: [f32; 3],
         extent: [f32; 3],
         rate: f32,
@@ -104,6 +125,12 @@ pub enum Emitter {
 }
 
 impl Emitter {
+    fn control_point(&self) -> Option<usize> {
+        match self {
+            Self::Sphere { control_point, .. } | Self::Box { control_point, .. } => *control_point,
+        }
+    }
+
     fn rate(&self) -> f32 {
         match self {
             Self::Sphere { rate, .. } | Self::Box { rate, .. } => *rate,
@@ -190,7 +217,7 @@ pub enum Operator {
     OscillateSize(Oscillator),
     AngularMovement { force: f32, drag: f32 },
     Turbulence { scale: f32, speed: (f32, f32), time_scale: f32, mask: [f32; 3] },
-    ControlPointAttract { origin: [f32; 3], scale: f32, threshold: f32 },
+    ControlPointAttract { control_point: usize, origin: [f32; 3], scale: f32, threshold: f32 },
 }
 
 fn oscillator(entry: &Value, scale_fallback: f32) -> Oscillator {
@@ -272,6 +299,7 @@ pub struct ParticleSystem {
     pub sequence_multiplier: f32,
     pub max_count: usize,
     pub start_time: f32,
+    pub control_points: [ControlPoint; 8],
     pub emitters: Vec<Emitter>,
     pub initializers: Vec<Initializer>,
     pub operators: Vec<Operator>,
@@ -293,6 +321,11 @@ pub struct ParticleSystem {
 }
 
 impl ParticleSystem {
+    #[must_use]
+    pub fn follows_mouse(&self) -> bool {
+        self.control_points.iter().any(|point| point.flags & 1 != 0)
+    }
+
     #[must_use]
     pub fn draw_scale(&self) -> f32 {
         if self.world { 1.0 } else { self.scale }
@@ -395,6 +428,11 @@ fn parse_emitter(entry: &Value) -> Option<Emitter> {
     let instantaneous = num_of(entry.get("instantaneous"), 0.0).clamp(0.0, 100_000.0) as u32;
     match name.as_str() {
         "sphererandom" => Some(Emitter::Sphere {
+            control_point: entry
+                .get("controlpoint")
+                .and_then(Value::as_u64)
+                .filter(|id| *id < 8)
+                .map(|id| id as usize),
             origin,
             directions: vec3_of(entry.get("directions"), [1.0, 1.0, 1.0]),
             sign: vec3_of(entry.get("sign"), [0.0, 0.0, 0.0]),
@@ -404,6 +442,11 @@ fn parse_emitter(entry: &Value) -> Option<Emitter> {
             instantaneous,
         }),
         "boxrandom" => Some(Emitter::Box {
+            control_point: entry
+                .get("controlpoint")
+                .and_then(Value::as_u64)
+                .filter(|id| *id < 8)
+                .map(|id| id as usize),
             origin,
             extent: vec3_of(entry.get("distancemax"), [0.0, 0.0, 0.0]),
             rate,
@@ -499,6 +542,7 @@ fn parse_operator(entry: &Value) -> Option<Operator> {
             })
         }
         "controlpointattract" => Some(Operator::ControlPointAttract {
+            control_point: num_of(entry.get("controlpoint"), 0.0).clamp(0.0, 7.0) as usize,
             origin: vec3_of(entry.get("origin"), [0.0, 0.0, 0.0]),
             scale: num_of(entry.get("scale"), 0.0),
             threshold: num_of(entry.get("threshold"), 0.0).max(1.0),
@@ -735,6 +779,7 @@ pub fn load(
         max_count: (num_of(doc.get("maxcount"), 100.0) * count_scale).round().clamp(1.0, 100_000.0)
             as usize,
         start_time: num_of(doc.get("starttime"), 0.0).clamp(0.0, 300.0),
+        control_points: control_points(&doc),
         emitters,
         initializers,
         operators,
@@ -766,6 +811,8 @@ pub fn load(
 
 pub struct Sim {
     pub particles: Vec<Particle>,
+    control_points: [[f32; 3]; 8],
+    pointer: Option<[f32; 2]>,
     burst_done: bool,
     pub history: Vec<[[f32; 2]; TRAIL_POINTS]>,
     rng: Rng,
@@ -782,9 +829,37 @@ impl Sim {
             history: Vec::new(),
             rng: Rng::new(seed),
             pending: 1.0,
+            control_points: [[0.0; 3]; 8],
+            pointer: None,
             burst_done: false,
             time: 0.0,
             ribbon: false,
+        }
+    }
+
+    pub fn set_pointer(&mut self, pointer: [f32; 2]) {
+        self.pointer = Some(pointer);
+    }
+
+    fn update_control_points(&mut self, system: &ParticleSystem) {
+        let (sin, cos) = system.angle.sin_cos();
+        let scale = system.draw_scale3();
+        for (position, point) in self.control_points.iter_mut().zip(&system.control_points) {
+            *position = point.offset;
+            if point.flags & 1 != 0 {
+                let pointer = self.pointer.unwrap_or([system.origin.0, system.origin.1]);
+                position[0] += pointer[0];
+                position[1] += pointer[1];
+            }
+            if point.flags & 3 != 0 {
+                let x = position[0] - system.origin.0;
+                let y = position[1] - system.origin.1;
+                *position = [
+                    (x * cos + y * sin) / scale[0],
+                    (-x * sin + y * cos) / scale[1],
+                    (position[2] - system.origin.2) / scale[2],
+                ];
+            }
         }
     }
 
@@ -824,6 +899,14 @@ impl Sim {
                 particle.pos.iter_mut().zip(origin.iter()).zip(system.scale3.iter())
             {
                 *pos = base + (*pos - base) * scale;
+            }
+        }
+        let control = emitter
+            .control_point()
+            .or_else(|| (system.control_points[0].flags & 1 != 0).then_some(0));
+        if let Some(position) = control.and_then(|index| self.control_points.get(index)) {
+            for (value, offset) in particle.pos.iter_mut().zip(position) {
+                *value += offset;
             }
         }
         for init in &system.initializers {
@@ -881,6 +964,7 @@ impl Sim {
 
     pub fn step(&mut self, system: &ParticleSystem, dt: f32) {
         let dt = dt.clamp(0.0, 0.25);
+        self.update_control_points(system);
         self.ribbon = system.renderer == Renderer::Ribbon;
         self.time += dt;
         let capacity = Self::capacity(system);
@@ -980,9 +1064,11 @@ impl Sim {
                         particle.pos[0] += dx * strength * mask[0] * dt;
                         particle.pos[1] += dy * strength * mask[1] * dt;
                     }
-                    Operator::ControlPointAttract { origin, scale, threshold } => {
-                        let dx = origin[0] - particle.pos[0];
-                        let dy = origin[1] - particle.pos[1];
+                    Operator::ControlPointAttract { control_point, origin, scale, threshold } => {
+                        let point =
+                            self.control_points.get(*control_point).copied().unwrap_or([0.0; 3]);
+                        let dx = point[0] + origin[0] - particle.pos[0];
+                        let dy = point[1] + origin[1] - particle.pos[1];
                         let distance = dx.hypot(dy);
                         if distance > 1.0e-4 {
                             let falloff = (1.0 - distance / threshold).clamp(0.0, 1.0);

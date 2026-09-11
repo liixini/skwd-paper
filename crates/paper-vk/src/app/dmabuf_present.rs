@@ -231,9 +231,8 @@ fn confirm_presentation(
     checkpoint: &[u64],
     label: &str,
 ) -> Result<()> {
-    if target.layer
-        == wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer::Background
-    {
+    use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+    if matches!(target.layer, Layer::Background | Layer::Bottom) {
         return Ok(());
     }
     let confirmed = target

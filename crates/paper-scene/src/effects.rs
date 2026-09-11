@@ -844,6 +844,18 @@ impl PassMeta {
     }
 
     #[must_use]
+    pub fn pointer_dependent(&self) -> bool {
+        self.uniforms.iter().any(|uniform| {
+            matches!(
+                uniform.name.as_str(),
+                "g_PointerPosition"
+                    | "g_PointerPositionLast"
+                    | "g_PointerState"
+                    | "g_ParallaxPosition"
+            )
+        })
+    }
+
     pub fn audio_dependent(&self) -> bool {
         self.uniforms.iter().any(|uniform| uniform.name.starts_with(AUDIO_PREFIX))
     }

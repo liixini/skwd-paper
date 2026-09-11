@@ -137,3 +137,102 @@ fn resolve_only_touches_scripted_text_and_only_when_the_value_actually_changes()
     let already = json!({"script": "x", "value": "14:07"});
     assert_eq!(resolve(Some(&already), now()), None, "an unchanged value stays the placeholder");
 }
+
+fn clock_script() -> &'static str {
+    "let delimiter = ':';\nlet showSeconds = true;\nlet use24hFormat = true;\n\
+     export function update(value) { let time = new Date();\n\
+     let hours = time.getHours(); let minutes = time.getMinutes();\n\
+     value = hours + delimiter + minutes; value += ' ' + suffix; return value; }"
+}
+
+#[test]
+fn scripted_clock_uses_its_format_instead_of_the_editor_placeholder() {
+    for placeholder in ["<3D Clock>", "12:34"] {
+        let text = json!({"script": clock_script(), "value": placeholder});
+        let clock = super::clock::Clock::from_text(&text).unwrap();
+        assert_eq!(clock.cadence(), super::Cadence::Second);
+        assert_eq!(resolve(Some(&text), now()).as_deref(), Some("14:07:09"));
+        let boundary = LocalTime { hour: 20, minute: 44, second: 59, ..now() };
+        assert_eq!(clock.value(boundary), "20:44:59");
+        assert_eq!(clock.value(LocalTime { minute: 45, second: 0, ..boundary }), "20:45:00");
+    }
+}
+
+#[test]
+fn scripted_clock_honors_saved_settings_and_twelve_hour_boundaries() {
+    let text = json!({"script": clock_script(), "value": "<3D Clock>",
+        "scriptproperties": {"delimiter": " / ", "showSeconds": false, "use24hFormat": false}});
+    let clock = super::clock::Clock::from_text(&text).unwrap();
+    assert_eq!(clock.cadence(), super::Cadence::Minute);
+    assert_eq!(clock.value(LocalTime { hour: 0, minute: 0, ..now() }), "12 / 00 AM");
+    assert_eq!(clock.value(LocalTime { hour: 12, minute: 0, ..now() }), "12 / 00 PM");
+    assert_eq!(clock.value(now()), "2 / 07 PM");
+}
+
+#[test]
+fn clock_property_builder_defaults_apply_without_saved_overrides() {
+    let script = "export var scriptProperties = createScriptProperties()\n\
+        .addCheckbox({name: 'use24hFormat', value: true})\n\
+        .addCheckbox({name: 'showSeconds', value: false})\n\
+        .addText({name: 'delimiter', value: ':'}).finish();\n\
+        export function update(value) { let time = new Date();\n\
+        let hours = time.getHours(); let minutes = time.getMinutes();\n\
+        return hours + scriptProperties.delimiter + minutes; }";
+    let text = json!({"script": script, "value": "12:34"});
+    assert_eq!(resolve(Some(&text), now()).as_deref(), Some("14:07"));
+    let text = json!({"script": script, "value": "12:34", "scriptproperties": {
+        "use24hFormat": false, "showSeconds": true, "delimiter": "."}});
+    assert_eq!(resolve(Some(&text), now()).as_deref(), Some("02.07.09"));
+}
+
+#[test]
+fn naming_static_text_clock_does_not_make_it_a_clock() {
+    for text in [
+        json!("<3D Clock>"),
+        json!({"value": "<3D Clock>",
+        "script": "export function update(value) { return value; }"}),
+    ] {
+        assert!(super::clock::Clock::from_text(&text).is_none());
+        assert!(resolve(Some(&text), now()).is_none());
+    }
+}
+
+fn date_text() -> serde_json::Value {
+    json!({"value": "- Date -", "script": "let currentLocale = 'fr-FR';\n\
+        function getLocaleData(locale) { let lang = String(locale).toLowerCase();\n\
+        if (lang.indexOf('fr') === 0) { return {\n\
+        monthsAbbr: ['janv','févr','mars','avr','mai','juin','juil','août','sept','oct','nov','déc'],\n\
+        monthsFull: ['janvier','février','mars','avril','mai','juin','juillet','août','septembre','octobre','novembre','décembre'],\n\
+        daysAbbr: ['dim','lun','mar','mer','jeu','ven','sam'],\n\
+        daysFull: ['dimanche','lundi','mardi','mercredi','jeudi','vendredi','samedi'] }; } }\n\
+        export function update(value) { let localeData = getLocaleData(currentLocale);\n\
+        let dayText = formatSpaced(dayText); return date.getDate() + date.getFullYear(); }",
+        "scriptproperties": {"monthFormat": "3", "dayFormat": "2", "showDay": false,
+            "alignVertical": false, "useDelimiter": true, "addDelimiter": "."}})
+}
+
+#[test]
+fn localized_date_uses_the_scripts_own_month_names_and_saved_delimiter() {
+    let text = date_text();
+    let date = super::date::Date::from_text(&text).unwrap();
+    assert_eq!(date.value(LocalTime { day: 11, ..now() }), "11.septembre.2026");
+    assert_eq!(date.value(LocalTime { month: 2, day: 1, ..now() }), "1.février.2026");
+    assert_eq!(resolve(Some(&text), now()).as_deref(), Some("8.septembre.2026"));
+    assert_eq!(date.value(LocalTime { day: 1, month: 1, year: 2027, ..now() }), "1.janvier.2027");
+}
+
+#[test]
+fn localized_date_preserves_numeric_abbreviated_and_weekday_formats() {
+    let mut text = date_text();
+    text["scriptproperties"]["monthFormat"] = json!("1");
+    assert_eq!(resolve(Some(&text), now()).as_deref(), Some("8.9.2026"));
+    text["scriptproperties"]["monthFormat"] = json!("2");
+    text["scriptproperties"]["useDelimiter"] = json!(false);
+    assert_eq!(resolve(Some(&text), now()).as_deref(), Some("8 sept 2026"));
+    text["scriptproperties"]["showDay"] = json!(true);
+    text["scriptproperties"]["alignVertical"] = json!(true);
+    assert_eq!(resolve(Some(&text), now()).as_deref(), Some("| M A R D I |\n"));
+    text["scriptproperties"]["dayFormat"] = json!("1");
+    text["scriptproperties"]["alignVertical"] = json!(false);
+    assert_eq!(resolve(Some(&text), now()).as_deref(), Some("M A R"));
+}
