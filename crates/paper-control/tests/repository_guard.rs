@@ -262,7 +262,7 @@ fn private_ci_pins_system_verifier_checkout() {
     assert_private_checkout(
         &workflow,
         "liixini/skwd-verify",
-        "bf9f7f4b86c2e5ac8fcef7f2abcdc3a6e5b2cc15",
+        "3c7ce77170ee148fda7a2b6661099aa8b699bcb9",
         ".ci/checkouts/skwd-verify",
     );
     assert_eq!(workflow.matches("token: ${{ secrets.SKWD_SUITE_READ_TOKEN }}").count(), 1);
