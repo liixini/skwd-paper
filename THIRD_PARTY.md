@@ -5,3 +5,5 @@ Mouse coordinate mapping and parallax response in `crates/paper-scene/src/mouse.
 Upstream files: `src/WallpaperEngine/Input/Drivers/WaylandMouseInput.cpp`, `src/WallpaperEngine/Render/Drivers/WaylandOpenGLDriver.cpp`, `src/WallpaperEngine/Render/Wallpapers/CScene.cpp`, and `src/WallpaperEngine/Render/Objects/CImage.cpp`.
 
 The upstream code is licensed under GNU GPL version 3. The license text is provided in [LICENSE](LICENSE). The Rust adaptation uses Wayland events, retains the last pointer position on focus loss, and schedules redraws only while input or parallax changes. It does not include the upstream Hyprland cursor polling fallback.
+
+Particle control-point cursor binding in `crates/paper-scene/src/particles.rs` is adapted from the same revision of `src/WallpaperEngine/Render/Objects/CParticle.cpp`. The Rust implementation converts world coordinates into the particle simulation coordinates and applies updated control points to new particles and attraction forces.

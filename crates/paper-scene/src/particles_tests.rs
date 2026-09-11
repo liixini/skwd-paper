@@ -8,7 +8,9 @@ fn system() -> ParticleSystem {
         trail: Trail { length: 0.0, min_length: 0.0, max_length: 100.0, fade_alpha: true },
         max_count: 64,
         start_time: 0.0,
+        control_points: [ControlPoint::default(); 8],
         emitters: vec![Emitter::Box {
+            control_point: None,
             instantaneous: 0,
             origin: [0.0, 0.0, 0.0],
             extent: [10.0, 10.0, 0.0],
@@ -67,6 +69,7 @@ fn particles_expire_after_lifetime() {
 fn alpha_fades_late() {
     let mut sys = system();
     sys.emitters = vec![Emitter::Box {
+        control_point: None,
         instantaneous: 0,
         origin: [0.0, 0.0, 0.0],
         extent: [1.0, 1.0, 0.0],
@@ -88,6 +91,7 @@ fn alpha_fades_late() {
 fn single(op: Operator) -> ParticleSystem {
     let mut sys = system();
     sys.emitters = vec![Emitter::Box {
+        control_point: None,
         instantaneous: 0,
         origin: [0.0, 0.0, 0.0],
         extent: [0.0, 0.0, 0.0],
@@ -129,6 +133,7 @@ fn turbulence_displaces_particle() {
 #[test]
 fn attract_pulls_to_origin() {
     let sys = single(Operator::ControlPointAttract {
+        control_point: 0,
         origin: [100.0, 0.0, 0.0],
         scale: 5000.0,
         threshold: 500.0,
@@ -182,6 +187,7 @@ fn engine_sprite_stream_follows_the_thick_vertex_layout() {
         sequence_multiplier: 1.0,
         max_count: 4,
         start_time: 0.0,
+        control_points: [ControlPoint::default(); 8],
         emitters: Vec::new(),
         initializers: Vec::new(),
         operators: Vec::new(),
@@ -303,6 +309,7 @@ fn color_random_lerps_all_channels_with_one_parameter() {
 fn sphere_emitter_renormalises_scaled_directions_and_honours_sign() {
     let mut sys = system();
     sys.emitters = vec![Emitter::Sphere {
+        control_point: None,
         instantaneous: 0,
         origin: [0.0, 0.0, 0.0],
         directions: [1.0, 0.0, 0.0],
@@ -321,6 +328,7 @@ fn sphere_emitter_renormalises_scaled_directions_and_honours_sign() {
             && sim.particles.iter().any(|p| p.pos[0] < 0.0)
     );
     sys.emitters = vec![Emitter::Sphere {
+        control_point: None,
         instantaneous: 0,
         origin: [0.0, 0.0, 0.0],
         directions: [1.0, 1.0, 1.0],
@@ -355,8 +363,13 @@ fn emitter_rate_and_capacity_cover_engine_downpours() {
 #[test]
 fn a_system_emits_its_first_particle_on_the_first_step_regardless_of_rate() {
     let mut sys = system();
-    sys.emitters =
-        vec![Emitter::Box { instantaneous: 0, origin: [0.0; 3], extent: [0.0; 3], rate: 0.001 }];
+    sys.emitters = vec![Emitter::Box {
+        control_point: None,
+        instantaneous: 0,
+        origin: [0.0; 3],
+        extent: [0.0; 3],
+        rate: 0.001,
+    }];
     sys.initializers = vec![Initializer::Lifetime { exponent: 1.0, min: 10.0, max: 10.0 }];
     let mut sim = Sim::new(9);
     sim.step(&sys, 1.0 / 30.0);
@@ -372,6 +385,7 @@ fn sphere_emitter_distance_follows_the_scaled_ball_length() {
     let mut sys = system();
     sys.max_count = 4000;
     sys.emitters = vec![Emitter::Sphere {
+        control_point: None,
         instantaneous: 0,
         origin: [0.0; 3],
         directions: [1.0, 1.0, 0.0],
@@ -421,6 +435,7 @@ fn world_space_systems_keep_object_scale_off_positions_and_sizes_but_on_velocity
     assert!((sim.particles[0].vel[0] - 600.0).abs() < 1e-3, "{:?}", sim.particles[0].vel);
     let mut shell = system;
     shell.emitters = vec![Emitter::Sphere {
+        control_point: None,
         instantaneous: 0,
         origin: [100.0, 0.0, 0.0],
         directions: [1.0, 0.0, 0.0],
@@ -452,8 +467,13 @@ fn world_space_systems_keep_object_scale_off_positions_and_sizes_but_on_velocity
 fn initializer_exponent_biases_toward_min_or_max_and_bursts_spawn_instantly() {
     let mut sys = system();
     sys.max_count = 2000;
-    sys.emitters =
-        vec![Emitter::Box { origin: [0.0; 3], extent: [0.0; 3], rate: 0.0, instantaneous: 1500 }];
+    sys.emitters = vec![Emitter::Box {
+        control_point: None,
+        origin: [0.0; 3],
+        extent: [0.0; 3],
+        rate: 0.0,
+        instantaneous: 1500,
+    }];
     sys.initializers = vec![
         Initializer::Lifetime { min: 100.0, max: 100.0, exponent: 1.0 },
         Initializer::Size { min: 20.0, max: 200.0, exponent: 30.0 },
@@ -475,8 +495,13 @@ fn initializer_exponent_biases_toward_min_or_max_and_bursts_spawn_instantly() {
 fn oscillate_position_integrates_a_radians_per_second_wave_on_particle_age_with_no_spawn_offset() {
     let mut sys = system();
     sys.max_count = 1;
-    sys.emitters =
-        vec![Emitter::Box { origin: [0.0; 3], extent: [0.0; 3], rate: 1.0, instantaneous: 0 }];
+    sys.emitters = vec![Emitter::Box {
+        control_point: None,
+        origin: [0.0; 3],
+        extent: [0.0; 3],
+        rate: 1.0,
+        instantaneous: 0,
+    }];
     sys.initializers = vec![Initializer::Lifetime { min: 40.0, max: 40.0, exponent: 1.0 }];
     let osc = |frequency: f32, phase: f32| {
         vec![Operator::OscillatePosition(Oscillator {
@@ -520,4 +545,70 @@ fn oscillate_position_integrates_a_radians_per_second_wave_on_particle_age_with_
     }
     let x = sim.particles[0].pos[0];
     assert!((x - 600.0).abs() < 12.0, "world-space systems scale the movement per axis: {x}");
+}
+
+#[test]
+fn cursor_control_point_spawns_a_trail_without_moving_existing_particles() {
+    let doc = br#"{"controlpoint":[{"id":0,"flags":1,"offset":"4 6 0"},{"id":80,"flags":1}],"emitter":[{"name":"boxrandom","rate":10}],"initializer":[{"name":"lifetimerandom","min":10,"max":10}]}"#;
+    let pkg = crate::pkg::Package::parse(crate::tests::build_pkg(&[("p.json", doc)])).unwrap();
+    let assets = crate::effects::Assets::discover(Some("/nonexistent"));
+    let object = serde_json::json!({"origin":"100 200 0","scale":"2 3 1"});
+    let sys = load(&pkg, &assets, &object, "p.json").unwrap();
+    assert!(sys.follows_mouse());
+    let mut sim = Sim::new(1);
+    sim.set_pointer([120.0, 230.0]);
+    sim.step(&sys, 0.01);
+    assert_eq!(sim.particles[0].pos, [12.0, 12.0, 0.0]);
+    sim.set_pointer([320.0, 530.0]);
+    sim.step(&sys, 0.1);
+    assert_eq!(sim.particles[0].pos, [12.0, 12.0, 0.0]);
+    assert_eq!(sim.particles[1].pos, [112.0, 112.0, 0.0]);
+}
+
+#[test]
+fn explicit_control_points_respect_rotation_world_space_and_static_offsets() {
+    let mut sys = system();
+    sys.origin = (100.0, 200.0, 0.0);
+    sys.scale3 = [2.0, 3.0, 1.0];
+    sys.angle = std::f32::consts::FRAC_PI_2;
+    sys.control_points[1] = ControlPoint { flags: 1, offset: [0.0; 3] };
+    sys.control_points[2] = ControlPoint { flags: 2, offset: [120.0, 230.0, 0.0] };
+    sys.control_points[3] = ControlPoint { flags: 0, offset: [4.0, 5.0, 0.0] };
+    sys.emitters = vec![Emitter::Box {
+        control_point: Some(1),
+        origin: [0.0; 3],
+        extent: [0.0; 3],
+        rate: 0.0,
+        instantaneous: 0,
+    }];
+    let mut sim = Sim::new(2);
+    sim.set_pointer([120.0, 230.0]);
+    sim.step(&sys, 0.01);
+    assert!((sim.particles[0].pos[0] - 15.0).abs() < 1e-4);
+    assert!((sim.particles[0].pos[1] + 20.0 / 3.0).abs() < 1e-4);
+    assert_eq!(sim.control_points[1], sim.control_points[2]);
+    assert_eq!(sim.control_points[3], [4.0, 5.0, 0.0]);
+    sys.world = true;
+    sim.step(&sys, 0.01);
+    assert!((sim.control_points[1][0] - 30.0).abs() < 1e-4);
+    assert!((sim.control_points[1][1] + 20.0).abs() < 1e-4);
+}
+
+#[test]
+fn attraction_tracks_its_selected_mouse_control_point() {
+    let mut sys = single(Operator::ControlPointAttract {
+        control_point: 1,
+        origin: [0.0; 3],
+        scale: 100.0,
+        threshold: 1000.0,
+    });
+    sys.control_points[1] = ControlPoint { flags: 1, offset: [0.0; 3] };
+    let mut sim = Sim::new(3);
+    sim.set_pointer([100.0, 0.0]);
+    sim.step(&sys, 0.01);
+    assert!(sim.particles[0].vel[0] > 0.0);
+    sim.particles[0].vel = [0.0; 3];
+    sim.set_pointer([-100.0, 0.0]);
+    sim.step(&sys, 0.01);
+    assert!(sim.particles[0].vel[0] < 0.0);
 }

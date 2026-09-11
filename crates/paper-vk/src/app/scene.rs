@@ -1216,6 +1216,10 @@ impl Group {
         let screen = (self.target.extent.width, self.target.extent.height);
         let canvas = self.canvas;
         for (group_index, group) in self.particles.iter_mut().enumerate() {
+            group.sim.set_pointer([
+                self.mouse.position[0] * canvas.0,
+                (1.0 - self.mouse.position[1]) * canvas.1,
+            ]);
             group.sim.step(&group.system, dt);
             if let Some(engine) = group.engine.as_mut() {
                 let system = &group.system;
@@ -2898,9 +2902,11 @@ fn build_group(
             uniforms: layer_uniforms(layer, canvas, scene_lights),
         });
     }
+    let mut mouse = mouse::SceneMouse::new(model);
     let mut particles = Vec::new();
     for (index, layer) in std::mem::take(&mut model.particles).into_iter().enumerate() {
         let mut system = layer.system;
+        mouse.enabled |= system.follows_mouse();
         let Some(mut texture) = system.texture.take() else {
             continue;
         };
@@ -3162,7 +3168,7 @@ fn build_group(
         live_text,
         live_text_due: 0.0,
         effects_animated: false,
-        mouse: mouse::SceneMouse::new(model),
+        mouse,
         scene_uniforms: std::collections::BTreeMap::from([
             ("g_LightAmbientColor".to_string(), model.ambient.to_vec()),
             ("g_LightSkylightColor".to_string(), model.skylight.to_vec()),

@@ -206,3 +206,55 @@ fn positive_engine_roll_is_clockwise_in_world_coordinates() {
     assert!(point[0].abs() < 0.00001);
     assert_eq!(point[1], -1.0);
 }
+
+#[test]
+#[ignore = "requires Vulkan, Wallpaper Engine assets, and SKWD_WE_CLOCK_LIBRARY"]
+fn cherry_blossom_particles_follow_pointer_in_a_particle_only_scene() {
+    let dir = std::path::PathBuf::from(std::env::var("SKWD_WE_CLOCK_LIBRARY").unwrap())
+        .join("3735385298");
+    let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
+    let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
+    model.layers.clear();
+    model.particles.retain(|layer| layer.system.follows_mouse());
+    assert_eq!(model.particles.len(), 1);
+    model.clear = [0.0; 3];
+    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let mut group =
+        super::super::build_group(&sd, &mut model, true, &[(320, 180)], paper_geom::FillMode::Fit)
+            .unwrap();
+    assert!(group.mouse.enabled);
+    let mut centers = Vec::new();
+    for (index, pointer) in [[0.25, 0.5], [0.75, 0.5]].into_iter().enumerate() {
+        group.mouse.update(
+            index as u64 + 1,
+            pointer,
+            [false; 3],
+            (320, 180),
+            paper_geom::FillMode::Fit,
+        );
+        for step in 0..30 {
+            group.compose((index * 30 + step) as f32 * 0.1, 0.1).unwrap();
+        }
+        let (width, height, rgba) = group.read_canvas().unwrap();
+        let lit: Vec<usize> = rgba
+            .chunks_exact(4)
+            .enumerate()
+            .filter_map(|(i, p)| (p[0] > 15 || p[1] > 15 || p[2] > 15).then_some(i))
+            .collect();
+        assert!(lit.len() > 10, "particle frame should have visible pixels");
+        centers
+            .push(lit.iter().map(|i| (i % width as usize) as f32).sum::<f32>() / lit.len() as f32);
+        if let Ok(evidence) = std::env::var("SKWD_WE_CLOCK_EVIDENCE") {
+            image::save_buffer(
+                std::path::Path::new(&evidence).join(format!("particle-mouse-{index}.png")),
+                &rgba,
+                width,
+                height,
+                image::ColorType::Rgba8,
+            )
+            .unwrap();
+        }
+    }
+    assert!(centers[0] < 120.0 && centers[1] > 200.0, "particle centers: {centers:?}");
+    group.destroy();
+}
