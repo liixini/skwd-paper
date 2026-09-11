@@ -564,18 +564,6 @@ impl Dispatch<WpViewport, ()> for App {
     }
 }
 
-impl Dispatch<wl_seat::WlSeat, ()> for App {
-    fn event(
-        _: &mut Self,
-        _: &wl_seat::WlSeat,
-        _: wl_seat::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
 impl Dispatch<ExtIdleNotifierV1, ()> for App {
     fn event(
         _: &mut Self,

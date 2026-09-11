@@ -8,6 +8,8 @@ pub const MAX_SCENE_OBJECTS: usize = 16_384;
 
 pub struct SceneModel {
     pub canvas: (f32, f32),
+    pub mouse: crate::mouse::Parallax,
+    pub camera_fov: f32,
     pub clear: [f32; 3],
     pub ambient: [f32; 3],
     pub skylight: [f32; 3],
@@ -35,6 +37,7 @@ pub struct Layer {
     pub solid: bool,
     pub live_text: Option<crate::text::Prepared>,
     pub is_text: bool,
+    pub mouse: crate::mouse::LayerMouse,
     pub effects: Vec<crate::effects::Effect>,
 }
 
@@ -157,6 +160,36 @@ fn resolve_transform<'a>(
         out.origin.1 += dy;
     }
     out
+}
+
+fn layer_mouse(
+    object: &Value,
+    by_id: &std::collections::HashMap<String, &Value>,
+    props: &Properties,
+    parallax: crate::mouse::Parallax,
+    transform: Transform,
+    text: bool,
+) -> crate::mouse::LayerMouse {
+    let chain = ancestor_chain(object, by_id);
+    let root = chain.last().copied().unwrap_or(object);
+    let depth = vec2_or(root.get("parallaxDepth"), props, (0.0, 0.0));
+    crate::mouse::LayerMouse {
+        parallax: if parallax.amount != 0.0 && parallax.influence != 0.0 {
+            [depth.0 + parallax.amount, depth.1 + parallax.amount]
+        } else {
+            [0.0; 2]
+        },
+        clock: text
+            .then(|| {
+                object.get("text").and_then(|value| {
+                    crate::mouse::Clock3d::from_text(
+                        value,
+                        [transform.origin.0, transform.origin.1],
+                    )
+                })
+            })
+            .flatten(),
+    }
 }
 
 fn id_of(value: &Value) -> Option<String> {
@@ -572,6 +605,15 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
         .map_or([0.3, 0.3, 0.3], |(r, g, b)| [r, g, b]);
 
     let parallax = Parallax::of(&scene, canvas, props);
+    let mouse = crate::mouse::Parallax {
+        amount: parallax.as_ref().map_or(0.0, |p| p.amount),
+        influence: number(
+            general.and_then(|top| top.get("cameraparallaxmouseinfluence")),
+            props,
+            1.0,
+        ),
+        delay: number(general.and_then(|top| top.get("cameraparallaxdelay")), props, 1.0),
+    };
 
     let mut layers = Vec::new();
     let mut particles = Vec::new();
@@ -668,6 +710,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                             visible,
                             live_text: rendered.live,
                             is_text: true,
+                            mouse: layer_mouse(object, &by_id, props, mouse, transform, true),
                             texture: rendered.texture,
                             puppet: None,
                             center,
@@ -783,6 +826,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
             visible,
             live_text: None,
             is_text: false,
+            mouse: layer_mouse(object, &by_id, props, mouse, transform, false),
             texture,
             puppet,
             center,
@@ -827,6 +871,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                 visible: true,
                 live_text: None,
                 is_text: false,
+                mouse: crate::mouse::LayerMouse::default(),
                 texture: solid_texture(),
                 puppet: None,
                 center: (canvas.0 * 0.5, canvas.1 * 0.5),
@@ -866,7 +911,17 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
             layers[index].scene_order = scene_order;
         }
     }
-    Ok(SceneModel { canvas, clear, ambient, skylight, layers, particles, skipped })
+    Ok(SceneModel {
+        canvas,
+        mouse,
+        camera_fov: number(general.and_then(|top| top.get("fov")), props, 50.0).clamp(1.0, 179.0),
+        clear,
+        ambient,
+        skylight,
+        layers,
+        particles,
+        skipped,
+    })
 }
 
 fn add_texture_bytes(total: &mut usize, bytes: usize) -> Result<()> {

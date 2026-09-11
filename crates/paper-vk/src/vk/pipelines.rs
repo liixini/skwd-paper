@@ -374,7 +374,7 @@ impl Renderer {
             let layouts = [self.desc_layout];
             let push = [vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-                .size(64)];
+                .size(112)];
             self.pipeline_layout_layer = device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&layouts)

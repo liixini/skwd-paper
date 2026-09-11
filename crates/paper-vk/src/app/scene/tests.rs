@@ -288,6 +288,7 @@ fn passive_target_quad_crops_padded_texture_at_layer_extent() {
     let layer = paper_scene::model::Layer {
         live_text: None,
         is_text: false,
+        mouse: paper_scene::mouse::LayerMouse::default(),
         id: "producer".into(),
         name: "producer".into(),
         visible: true,
@@ -319,6 +320,7 @@ fn active_and_passive_duplicate_ids_remain_ambiguous() {
     let layer = |name: &str| paper_scene::model::Layer {
         live_text: None,
         is_text: false,
+        mouse: paper_scene::mouse::LayerMouse::default(),
         id: "duplicate".into(),
         name: name.into(),
         visible: true,
@@ -381,6 +383,8 @@ fn active_and_passive_duplicate_ids_remain_ambiguous() {
 #[test]
 fn full_frame_prefix_merges_lower_particles_in_unified_order() {
     let image = |texture| vk::SceneQuad {
+        projection: None,
+        order_bias: 0,
         rect: [0.0; 4],
         uv: [0.0; 4],
         tint: [1.0; 4],
@@ -621,6 +625,7 @@ fn layer_model_matrix_composes_origin_rotation_and_scale_without_size() {
     let mut layer = paper_scene::model::Layer {
         live_text: None,
         is_text: false,
+        mouse: paper_scene::mouse::LayerMouse::default(),
         id: "1".into(),
         name: "L".into(),
         visible: true,
@@ -670,6 +675,7 @@ fn clock_effects_refresh_pixels_across_a_minute_without_continuous_animation() {
         model.clear = [0.5; 3];
         model.layers[0].center = (512.0, 256.0);
         model.layers[0].visible = true;
+        model.layers[0].mouse = paper_scene::mouse::LayerMouse::default();
         assert_eq!(!model.layers[0].effects.is_empty(), has_effect);
         assert!(model.layers[0].live_text.is_some());
         let raster =
