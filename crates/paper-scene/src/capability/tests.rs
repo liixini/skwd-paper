@@ -42,7 +42,6 @@ fn gap_codes_stable() {
             "puppet",
             "animated-image-textures",
             "audio-reactive",
-            "video-textures",
             "unknown-texture-formats",
             "texture-parse-failures",
             "json-parse-failures",

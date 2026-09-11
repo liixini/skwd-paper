@@ -1,3 +1,5 @@
+mod video;
+
 use super::dmabuf_helpers::{create_buffers, init_free_buffers, monotonic_ns};
 use super::model::StartFade;
 use super::readiness::{signal_ready, signal_swap_failure};
@@ -379,14 +381,16 @@ impl TextureKey {
     }
 }
 
-#[derive(Default)]
-struct TextureInterner {
+struct TextureInterner<'a> {
+    device: &'a shared::SharedDevice,
+    videos: Vec<video::VideoTexture>,
+    video_slots: HashMap<(std::sync::Arc<[u8]>, bool, bool), usize>,
     slots: HashMap<TextureKey, usize>,
     reused: usize,
     reused_bytes: usize,
 }
 
-impl TextureInterner {
+impl TextureInterner<'_> {
     fn intern_key(
         &mut self,
         renderer: &mut vk::Renderer,
@@ -415,6 +419,23 @@ impl TextureInterner {
         textures: &mut Vec<vk::SceneTexture>,
         texture: &mut paper_scene::model::Texture,
     ) -> Result<usize> {
+        if let Some(payload) = &texture.video {
+            let key = (payload.clone(), texture.clamp, texture.nearest);
+            if let Some(&slot) = self.video_slots.get(&key) {
+                return Ok(slot);
+            }
+            let video =
+                video::VideoTexture::open(self.device, payload, texture.clamp, texture.nearest)?;
+            let mut texture_slot = renderer.create_view_slot()?;
+            texture_slot.view = video.target().view;
+            texture_slot.sampler = video.target().sampler;
+            renderer.point_slot_at(&texture_slot, video.target().view);
+            let slot = textures.len();
+            textures.push(texture_slot);
+            self.videos.push(video);
+            self.video_slots.insert(key, slot);
+            return Ok(slot);
+        }
         let key = TextureKey::take(texture);
         match self.intern_key(renderer, textures, key) {
             Ok(slot) => Ok(slot),
@@ -755,6 +776,8 @@ struct Group {
     quads: Vec<vk::SceneQuad>,
     quad_scene_order: Vec<usize>,
     textures: Vec<vk::SceneTexture>,
+    videos: Vec<video::VideoTexture>,
+    passive_video_targets: Vec<(usize, vk::SceneQuad)>,
     base_scene_targets: Vec<BaseLayerTarget>,
     passive_scene_targets: Vec<vk::SceneTarget>,
     fx: Vec<LayerFx>,
@@ -1101,7 +1124,8 @@ impl Group {
     }
 
     fn animated(&self) -> bool {
-        !self.animations.is_empty()
+        !self.videos.is_empty()
+            || !self.animations.is_empty()
             || !self.particles.is_empty()
             || self.puppets.iter().any(PuppetGroup::animated)
             || self.fx.iter().flat_map(|fx| &fx.passes).any(|pass| pass.time_dependent())
@@ -1399,6 +1423,17 @@ impl Group {
         let logical_canvas = [self.canvas.0.max(1.0), self.canvas.1.max(1.0)];
         let clock = self.frame_clock(time, dt);
         let screen = (self.target.extent.width, self.target.extent.height);
+        for video in &mut self.videos {
+            video.advance(f64::from(time))?;
+        }
+        for (index, quad) in &self.passive_video_targets {
+            self.renderer.render_scene(
+                &self.passive_scene_targets[*index],
+                [0.0; 4],
+                std::slice::from_ref(quad),
+                &self.textures,
+            )?;
+        }
         self.advance_layer_animations(time);
         self.advance_live_text(time)?;
         self.advance_audio(dt);
@@ -1959,6 +1994,8 @@ impl Group {
         for texture in std::mem::take(&mut self.textures) {
             self.renderer.destroy_scene_texture(texture);
         }
+        self.videos.clear();
+        self.passive_video_targets.clear();
         self.quads.clear();
         self.quad_scene_order.clear();
         self.particles.clear();
@@ -2268,10 +2305,12 @@ fn release_model_texture_payloads(model: &mut SceneModel) -> usize {
     let mut released = 0;
     for layer in &mut model.layers {
         released += std::mem::take(&mut layer.texture.pixels).bytes();
+        released += layer.texture.video.take().map_or(0, |payload| payload.len());
         for effect in &mut layer.effects {
             for pass in &mut effect.passes {
                 for texture in pass.textures.iter_mut().flatten() {
                     released += std::mem::take(&mut texture.pixels).bytes();
+                    released += texture.video.take().map_or(0, |payload| payload.len());
                 }
             }
         }
@@ -2438,7 +2477,14 @@ fn build_group(
     renderer.ensure_scene_pool(sets.max(1) as u32)?;
     let target = renderer.create_scene_target(canvas_w, canvas_h).context("scene target")?;
     let mut textures = Vec::with_capacity(model.layers.len());
-    let mut texture_interner = TextureInterner::default();
+    let mut texture_interner = TextureInterner {
+        device: sd,
+        videos: Vec::new(),
+        video_slots: HashMap::new(),
+        slots: HashMap::new(),
+        reused: 0,
+        reused_bytes: 0,
+    };
     let mut layer_slots = Vec::with_capacity(model.layers.len());
     let mut hidden_target_texture = None;
     for layer in &mut model.layers {
@@ -2744,6 +2790,12 @@ fn build_group(
         let slot_texture = renderer.create_view_slot()?;
         let slot = textures.len();
         textures.push(slot_texture);
+        let source_dynamic = layer.texture.video.is_some()
+            || inputs.iter().flatten().any(|slot| {
+                texture_interner.video_slots.values().any(|video_slot| video_slot == slot)
+            })
+            || atlas.is_some()
+            || puppets.iter().any(|puppet| puppet.layer == index && puppet.animated());
         fx.push(LayerFx {
             layer_id: layer.id.clone(),
             quad: index,
@@ -2767,8 +2819,7 @@ fn build_group(
             owner: pass_owner,
             passes: metas,
             output: None,
-            source_dynamic: atlas.is_some()
-                || puppets.iter().any(|puppet| puppet.layer == index && puppet.animated()),
+            source_dynamic,
             dependency_dynamic: false,
             retain_targets: false,
             snapshot: false,
@@ -2906,6 +2957,7 @@ fn build_group(
         .collect();
     let active_layers: BTreeSet<usize> = fx.iter().map(|layer| layer.quad).collect();
     let mut passive_scene_targets = Vec::new();
+    let mut passive_video_targets = Vec::new();
     let mut base_scene_targets = Vec::new();
     for index in passive_provider_indices(&model.layers, &active_layers, &referenced) {
         let layer = &model.layers[index];
@@ -2931,12 +2983,17 @@ fn build_group(
             .into_iter()
             .collect::<Vec<_>>();
         renderer.render_scene(&target, [0.0; 4], &target_quads, &textures)?;
+        if layer.texture.video.is_some()
+            && let Some(quad) = target_quads.first()
+        {
+            passive_video_targets.push((passive_scene_targets.len(), quad.clone()));
+        }
         base_scene_targets.push(BaseLayerTarget {
             layer_id: layer.id.clone(),
             view: target.view,
             sampler: target.sampler,
             extent: target.extent,
-            dynamic: false,
+            dynamic: layer.texture.video.is_some(),
         });
         passive_scene_targets.push(target);
     }
@@ -2945,6 +3002,7 @@ fn build_group(
     let reused_payload_bytes = texture_interner.reused_bytes;
     let uploaded_payload_bytes =
         texture_interner.slots.keys().map(|key| key.pixels.bytes()).sum::<usize>();
+    let videos = std::mem::take(&mut texture_interner.videos);
     drop(texture_interner);
     let unused_payload_bytes = release_model_texture_payloads(model);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -3020,6 +3078,8 @@ fn build_group(
         quads,
         quad_scene_order,
         textures,
+        videos,
+        passive_video_targets,
         base_scene_targets,
         passive_scene_targets,
         fx,

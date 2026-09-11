@@ -682,6 +682,23 @@ impl Renderer {
         }
     }
 
+    pub fn create_video_texture_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        clamp: bool,
+        nearest: bool,
+    ) -> Result<SceneTarget> {
+        let mut target = self.create_scene_target_fmt(width, height, !clamp, self.format)?;
+        target.sampler = match (clamp, nearest) {
+            (true, false) => self.sampler,
+            (false, false) => self.sampler_repeat,
+            (true, true) => self.sampler_nearest,
+            (false, true) => self.sampler_nearest_repeat,
+        };
+        Ok(target)
+    }
+
     pub fn create_view_slot(&mut self) -> Result<SceneTexture> {
         let layouts = [self.desc_layout];
         let set = unsafe {

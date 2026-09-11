@@ -249,6 +249,7 @@ impl Face {
 
     fn texture_of(width: u32, height: u32, data: Vec<u8>) -> Texture {
         Texture {
+            video: None,
             width,
             height,
             img_width: width,

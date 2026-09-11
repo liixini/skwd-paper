@@ -6,6 +6,54 @@ use ash::vk;
 use ash::vk::Handle;
 
 impl Renderer {
+    #[cfg(feature = "shared-device")]
+    pub fn render_video_texture(
+        &mut self,
+        target: &crate::vk::SceneTarget,
+        src: &Src,
+    ) -> Result<()> {
+        if target.extent != self.extent || target.format != self.format {
+            return Err(anyhow!("scene video target does not match its renderer"));
+        }
+        self.wait_frame_complete()?;
+        let avf = Self::resolve_src(src)?;
+        let mut waits = WaitSems::new();
+        if let Some(avf) = &avf {
+            avf.push_wait_sems(&mut waits);
+        }
+        self.begin_frame_cmd()?;
+        self.acquire_imports(&[src]);
+        self.bind_src(self.desc_set, src, &avf)?;
+        if let Some(avf) = &avf {
+            self.sample_barrier(&[avf.read_barrier()], vk::PipelineStageFlags::FRAGMENT_SHADER);
+        }
+        let clear =
+            [vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } }];
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                self.cmd,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(target.render_pass)
+                    .framebuffer(target.framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent: target.extent,
+                    })
+                    .clear_values(&clear),
+                vk::SubpassContents::INLINE,
+            );
+        }
+        self.draw_fullscreen(self.pipeline, self.desc_set, &src.texture_uv([1.0, 1.0, 0.0, 0.0]));
+        unsafe { self.device.cmd_end_render_pass(self.cmd) };
+        self.release_imports(&[src]);
+        self.end_and_submit(&waits)?;
+        Self::note_imports(&[src]);
+        if let Some(avf) = avf {
+            avf.commit_sampled();
+        }
+        Ok(())
+    }
+
     pub fn wait_frame_complete(&self) -> Result<()> {
         unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
         Ok(())

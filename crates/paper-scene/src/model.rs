@@ -212,6 +212,7 @@ pub struct Texture {
     pub img_width: u32,
     pub img_height: u32,
     pub pixels: tex::Pixels,
+    pub video: Option<std::sync::Arc<[u8]>>,
     pub frames: Vec<SpriteFrame>,
     pub clamp: bool,
     pub nearest: bool,
@@ -241,6 +242,10 @@ fn sprite_frames(parsed: &tex::Tex, width: u32, height: u32) -> Vec<SpriteFrame>
 }
 
 impl Texture {
+    pub fn payload_bytes(&self) -> usize {
+        self.pixels.bytes() + self.video.as_ref().map_or(0, |payload| payload.len())
+    }
+
     #[must_use]
     pub fn we_format(&self) -> i64 {
         match self.format {
@@ -317,8 +322,25 @@ pub fn load_texture_bytes(bytes: &[u8]) -> Option<Texture> {
     let mut parsed = tex::parse(bytes).ok()?;
     let img_width = u32::try_from(parsed.meta.img_width).unwrap_or(0);
     let img_height = u32::try_from(parsed.meta.img_height).unwrap_or(0);
-    let pixels = tex::take_pixels(&mut parsed)?;
-    let (width, height) = (pixels.width(), pixels.height());
+    let video = if parsed.meta.flags & tex::FLAG_IS_VIDEO != 0 {
+        let mip = parsed.images.first_mut()?.first_mut()?;
+        if mip.data.is_empty() {
+            return None;
+        }
+        Some(std::sync::Arc::from(std::mem::take(&mut mip.data)))
+    } else {
+        None
+    };
+    let pixels =
+        if video.is_some() { tex::Pixels::default() } else { tex::take_pixels(&mut parsed)? };
+    let (width, height) = if video.is_some() {
+        let width = u32::try_from(parsed.meta.tex_width).ok()?;
+        let height = u32::try_from(parsed.meta.tex_height).ok()?;
+        tex::PixelFormat::Rgba8.level_bytes(width, height)?;
+        (width, height)
+    } else {
+        (pixels.width(), pixels.height())
+    };
     let img_width = if img_width == 0 { width } else { img_width.min(width) };
     let img_height = if img_height == 0 { height } else { img_height.min(height) };
     let frames = sprite_frames(&parsed, width, height);
@@ -328,6 +350,7 @@ pub fn load_texture_bytes(bytes: &[u8]) -> Option<Texture> {
         img_width,
         img_height,
         pixels,
+        video,
         frames,
         clamp: parsed.meta.flags & tex::FLAG_CLAMP_UVS != 0,
         nearest: parsed.meta.flags & tex::FLAG_NO_INTERPOLATION != 0,
@@ -384,6 +407,7 @@ pub fn solid_texture() -> Texture {
         img_width: 1,
         img_height: 1,
         pixels: tex::Pixels::rgba(1, 1, vec![255, 255, 255, 255]),
+        video: None,
         frames: Vec::new(),
         clamp: true,
         nearest: false,
@@ -599,7 +623,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                 match crate::particles::load(pkg, assets, object, path) {
                     Some(system) => {
                         if let Some(texture) = &system.texture {
-                            add_texture_bytes(&mut texture_bytes, texture.pixels.bytes())?;
+                            add_texture_bytes(&mut texture_bytes, texture.payload_bytes())?;
                         }
                         particles.push(ParticleLayer {
                             depth: system.origin.2,
@@ -625,7 +649,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                         for skip in effect_skips {
                             skipped.push(format!("{name}: {skip}"));
                         }
-                        add_texture_bytes(&mut texture_bytes, rendered.texture.pixels.bytes())?;
+                        add_texture_bytes(&mut texture_bytes, rendered.texture.payload_bytes())?;
                         let (sx, sy) = transform.scale;
                         let angle = -transform.angle;
                         let (sin, cos) = angle.sin_cos();
@@ -731,11 +755,11 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                 None => skipped.push(format!("{name}: colorBlendMode {color_blend} unavailable")),
             }
         }
-        add_texture_bytes(&mut texture_bytes, texture.pixels.bytes())?;
+        add_texture_bytes(&mut texture_bytes, texture.payload_bytes())?;
         for effect in &effects {
             for pass in &effect.passes {
                 for slot in pass.textures.iter().flatten() {
-                    add_texture_bytes(&mut texture_bytes, slot.pixels.bytes())?;
+                    add_texture_bytes(&mut texture_bytes, slot.payload_bytes())?;
                 }
             }
         }

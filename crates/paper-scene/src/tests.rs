@@ -1387,3 +1387,18 @@ fn passes_whose_vertex_shader_ignores_the_projection_draw_an_ndc_quad() {
     assert!(!effects::PassMeta::of(&effects[0].passes[0]).ndc());
     assert!(effects::PassMeta::of(&effects[1].passes[0]).ndc());
 }
+
+#[test]
+fn video_texture_payload_is_never_accepted_as_rgba() {
+    let mut payload = vec![93_u8; 256];
+    payload[..12].copy_from_slice(b"\x00\x00\x00\x20ftypisom");
+    let bytes = build_tex("TEXB0003", 0, tex::FLAG_IS_VIDEO as i32, &payload, false, None);
+    let mut parsed = tex::parse(&bytes).unwrap();
+    assert!(tex::take_pixels(&mut parsed).is_none());
+    assert!(tex::decode_rgba(&mut parsed).is_none());
+    let texture = model::load_texture_bytes(&bytes).unwrap();
+    assert_eq!(texture.video.as_deref(), Some(payload.as_slice()));
+    assert_eq!((texture.width, texture.height), (4, 4));
+    assert_eq!(texture.pixels.bytes(), 0);
+    assert!(texture.frames.is_empty());
+}

@@ -114,9 +114,6 @@ pub fn assess_native(features: &SceneFeatures) -> NativeCompatibility {
     if features.audio {
         gaps.push(NativeGap::AudioReactive);
     }
-    if features.tex_video > 0 {
-        gaps.push(NativeGap::VideoTextures(features.tex_video));
-    }
     if !features.tex_other_format.is_empty() {
         gaps.push(NativeGap::UnknownTextureFormats(
             features.tex_other_format.iter().cloned().collect(),
