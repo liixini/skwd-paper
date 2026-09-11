@@ -62,6 +62,7 @@ struct LayerFx {
     passes: Vec<paper_scene::effects::PassMeta>,
     output: Option<FxTargetId>,
     source_dynamic: bool,
+    source_clock: bool,
     dependency_dynamic: bool,
     retain_targets: bool,
     snapshot: bool,
@@ -352,7 +353,7 @@ impl LayerFx {
     }
 
     fn frame_state_dependent(&self) -> bool {
-        self.intrinsic_dynamic() || self.dependency_dynamic
+        self.source_clock || self.intrinsic_dynamic() || self.dependency_dynamic
     }
 }
 
@@ -793,6 +794,7 @@ struct Group {
     bands: paper_audio::Bands,
     live_text: Vec<LiveText>,
     live_text_due: f32,
+    effects_animated: bool,
     scene_uniforms: std::collections::BTreeMap<String, Vec<f32>>,
     fixed_daytime: Option<f32>,
     canvas: (f32, f32),
@@ -988,6 +990,7 @@ impl Presenter {
 impl Group {
     fn scene_target_plan(
         &self,
+        include_clocks: bool,
     ) -> Result<SceneTargetPlan, paper_scene::scene_targets::SceneTargetPlanError> {
         let local_targets: Vec<Vec<String>> = self.fx.iter().map(LayerFx::fbo_names).collect();
         let nodes: Vec<LayerTargetNode<'_>> = self
@@ -999,7 +1002,7 @@ impl Group {
                 scene_order: fx.scene_order,
                 local_targets: &local_targets[index],
                 binds: &fx.binds,
-                dynamic: fx.intrinsic_dynamic(),
+                dynamic: fx.intrinsic_dynamic() || (include_clocks && fx.source_clock),
                 passthrough: fx.passthrough,
                 prefix_dynamic: self
                     .particles
@@ -1075,8 +1078,12 @@ impl Group {
 
     fn configure_scene_targets(&mut self, strict: bool) -> Result<()> {
         loop {
-            match self.scene_target_plan() {
-                Ok(plan) => return self.apply_scene_target_plan(plan),
+            match self.scene_target_plan(true) {
+                Ok(plan) => {
+                    let animation = self.scene_target_plan(false)?;
+                    self.effects_animated = animation.dynamic.iter().any(|dynamic| *dynamic);
+                    return self.apply_scene_target_plan(plan);
+                }
                 Err(error) if strict => {
                     return Err(anyhow!("[native-scene-gap:scene-render-targets] {error}"));
                 }
@@ -1129,7 +1136,7 @@ impl Group {
             || !self.particles.is_empty()
             || self.puppets.iter().any(PuppetGroup::animated)
             || self.fx.iter().flat_map(|fx| &fx.passes).any(|pass| pass.time_dependent())
-            || self.fx.iter().any(LayerFx::frame_state_dependent)
+            || self.effects_animated
             || self.audio.is_some()
     }
 
@@ -1152,6 +1159,10 @@ impl Group {
             .min()
             .unwrap_or(paper_scene::dynamic_text::Cadence::Day);
         self.live_text_due = time + paper_scene::dynamic_text::seconds_until_next(cadence, now);
+        self.refresh_live_text(now)
+    }
+
+    fn refresh_live_text(&mut self, now: paper_scene::dynamic_text::LocalTime) -> Result<()> {
         for index in 0..self.live_text.len() {
             let wanted = self.live_text[index].prepared.value(now);
             if wanted == self.live_text[index].shown {
@@ -2254,11 +2265,28 @@ fn scene_dimensions_for_outputs(
     SceneDimensions { logical, raster: (raster_w, raster_h) }
 }
 
+fn layer_effect_dimensions(
+    layer: &paper_scene::model::Layer,
+    dimensions: SceneDimensions,
+) -> (u32, u32) {
+    if layer.is_text {
+        return bounded_effect_dimensions(
+            f64::from(layer.texture.width),
+            f64::from(layer.texture.height),
+        );
+    }
+    effect_dimensions_for(layer.size, dimensions)
+}
+
 fn effect_dimensions_for(size: (f32, f32), dimensions: SceneDimensions) -> (u32, u32) {
     let scale_x = f64::from(dimensions.raster.0) / f64::from(dimensions.logical[0]);
     let scale_y = f64::from(dimensions.raster.1) / f64::from(dimensions.logical[1]);
     let raw_w = (f64::from(size.0.abs()) * scale_x).max(1.0);
     let raw_h = (f64::from(size.1.abs()) * scale_y).max(1.0);
+    bounded_effect_dimensions(raw_w, raw_h)
+}
+
+fn bounded_effect_dimensions(raw_w: f64, raw_h: f64) -> (u32, u32) {
     let shrink = (2048.0 / raw_w.max(raw_h)).min(1.0);
     let width = ((raw_w * shrink).round() as u32).clamp(16, 2048);
     let height = ((raw_h * shrink).round() as u32).clamp(16, 2048);
@@ -2391,7 +2419,7 @@ fn create_puppets(
         let Some(puppet) = layer.puppet.take() else {
             continue;
         };
-        let (width, height) = effect_dimensions_for(layer.size, dimensions);
+        let (width, height) = layer_effect_dimensions(layer, dimensions);
         let texture = layer_slots[index];
         if textures.get(texture).is_none() {
             return Err(anyhow!("puppet atlas slot missing for {}", layer.name));
@@ -2542,7 +2570,7 @@ fn build_group(
             continue;
         }
 
-        let (fx_w, fx_h) = effect_dimensions_for(layer.size, dimensions);
+        let (fx_w, fx_h) = layer_effect_dimensions(layer, dimensions);
         let mut pipelines = Vec::new();
         let mut inputs = Vec::new();
         let mut metas = Vec::new();
@@ -2820,6 +2848,7 @@ fn build_group(
             passes: metas,
             output: None,
             source_dynamic,
+            source_clock: layer.live_text.is_some(),
             dependency_dynamic: false,
             retain_targets: false,
             snapshot: false,
@@ -2971,7 +3000,7 @@ fn build_group(
             });
             continue;
         }
-        let (width, height) = effect_dimensions_for(layer.size, dimensions);
+        let (width, height) = layer_effect_dimensions(layer, dimensions);
         let target = if layer.texture.clamp {
             renderer.create_scene_target(width, height)?
         } else {
@@ -3095,6 +3124,7 @@ fn build_group(
         bands: paper_audio::Bands::default(),
         live_text,
         live_text_due: 0.0,
+        effects_animated: false,
         scene_uniforms: std::collections::BTreeMap::from([
             ("g_LightAmbientColor".to_string(), model.ambient.to_vec()),
             ("g_LightSkylightColor".to_string(), model.skylight.to_vec()),

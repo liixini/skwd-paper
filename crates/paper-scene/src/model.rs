@@ -34,6 +34,7 @@ pub struct Layer {
     pub passthrough: bool,
     pub solid: bool,
     pub live_text: Option<crate::text::Prepared>,
+    pub is_text: bool,
     pub effects: Vec<crate::effects::Effect>,
 }
 
@@ -666,6 +667,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                             name,
                             visible,
                             live_text: rendered.live,
+                            is_text: true,
                             texture: rendered.texture,
                             puppet: None,
                             center,
@@ -780,6 +782,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
             name,
             visible,
             live_text: None,
+            is_text: false,
             texture,
             puppet,
             center,
@@ -823,6 +826,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                 name: "bloom".to_string(),
                 visible: true,
                 live_text: None,
+                is_text: false,
                 texture: solid_texture(),
                 puppet: None,
                 center: (canvas.0 * 0.5, canvas.1 * 0.5),

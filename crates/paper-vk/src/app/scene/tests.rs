@@ -287,6 +287,7 @@ fn passive_target_quad_crops_padded_texture_at_layer_extent() {
     texture.img_height = 5;
     let layer = paper_scene::model::Layer {
         live_text: None,
+        is_text: false,
         id: "producer".into(),
         name: "producer".into(),
         visible: true,
@@ -317,6 +318,7 @@ fn passive_target_quad_crops_padded_texture_at_layer_extent() {
 fn active_and_passive_duplicate_ids_remain_ambiguous() {
     let layer = |name: &str| paper_scene::model::Layer {
         live_text: None,
+        is_text: false,
         id: "duplicate".into(),
         name: name.into(),
         visible: true,
@@ -618,6 +620,7 @@ fn sprite_grid_reports_engine_render_var() {
 fn layer_model_matrix_composes_origin_rotation_and_scale_without_size() {
     let mut layer = paper_scene::model::Layer {
         live_text: None,
+        is_text: false,
         id: "1".into(),
         name: "L".into(),
         visible: true,
@@ -646,4 +649,85 @@ fn layer_model_matrix_composes_origin_rotation_and_scale_without_size() {
     let (m, _) = layer_model_matrix(&layer, (1920.0, 1080.0));
     assert!((m[0] - 7.375).abs() < 1e-6 && (m[5] - 1.15).abs() < 1e-6);
     assert_ne!(m[0], 944.0);
+}
+
+#[test]
+#[ignore = "requires Vulkan, Wallpaper Engine assets, and SKWD_WE_CLOCK_LIBRARY"]
+fn clock_effects_refresh_pixels_across_a_minute_without_continuous_animation() {
+    let root = std::env::var("SKWD_WE_CLOCK_LIBRARY").expect("Workshop library path");
+    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    for (item, layer_id, has_effect) in
+        [("3735385298", "66", true), ("2138975215", "67", false), ("3735385298", "58", true)]
+    {
+        let dir = std::path::Path::new(&root).join(item);
+        let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
+        let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
+        model.layers.retain(|layer| layer.id == layer_id);
+        model.particles.clear();
+        model.skipped.clear();
+        assert_eq!(model.layers.len(), 1);
+        model.canvas = (1024.0, 512.0);
+        model.clear = [0.5; 3];
+        model.layers[0].center = (512.0, 256.0);
+        model.layers[0].visible = true;
+        assert_eq!(!model.layers[0].effects.is_empty(), has_effect);
+        assert!(model.layers[0].live_text.is_some());
+        let raster =
+            layer_effect_dimensions(&model.layers[0], scene_dimensions_for(model.canvas, 4096));
+        assert_eq!(raster, (model.layers[0].texture.width, model.layers[0].texture.height));
+        let mut group = build_group(&sd, &mut model, true, &[(1024, 512)], FillMode::Fit).unwrap();
+        assert!(!group.animated(), "clock effects must sleep between clock ticks");
+        assert_eq!(!group.fx.is_empty(), has_effect, "live effects must survive static baking");
+        group.live_text_due = f32::INFINITY;
+        let now = paper_scene::dynamic_text::LocalTime {
+            hour: 20,
+            minute: 44,
+            second: 59,
+            day: 11,
+            month: 9,
+            year: 2026,
+            weekday: 5,
+        };
+        let mut frames = Vec::new();
+        for (index, instant) in [
+            now,
+            paper_scene::dynamic_text::LocalTime {
+                minute: 45,
+                second: 0,
+                day: 12,
+                weekday: 6,
+                ..now
+            },
+            now,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            group.refresh_live_text(instant).unwrap();
+            group.compose(index as f32, 1.0 / 60.0).unwrap();
+            let expected = if layer_id == "58" {
+                if index == 1 { "12.septembre.2026" } else { "11.septembre.2026" }
+            } else if index == 1 {
+                "20:45:00"
+            } else {
+                "20:44:59"
+            };
+            assert_eq!(group.live_text[0].shown, expected);
+            let (w, h, pixels) = group.read_canvas().unwrap();
+            if let Ok(evidence) = std::env::var("SKWD_WE_CLOCK_EVIDENCE") {
+                image::save_buffer(
+                    std::path::Path::new(&evidence).join(format!("{item}-{layer_id}-{index}.png")),
+                    &pixels,
+                    w,
+                    h,
+                    image::ColorType::Rgba8,
+                )
+                .unwrap();
+            }
+            frames.push(pixels);
+        }
+        assert_ne!(frames[0], frames[1], "composed clock pixels must change");
+        assert_eq!(frames[0], frames[2], "only the requested clock value should change the frame");
+        group.destroy();
+    }
 }

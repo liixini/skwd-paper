@@ -70,18 +70,29 @@ pub struct Prepared {
     height: u32,
     placeholder: String,
     weekday: Option<Vec<String>>,
+    clock: Option<crate::dynamic_text::clock::Clock>,
+    date: Option<crate::dynamic_text::date::Date>,
 }
 
 impl Prepared {
     #[must_use]
     pub fn value(&self, now: crate::dynamic_text::LocalTime) -> String {
+        if let Some(clock) = &self.clock {
+            return clock.value(now);
+        }
+        if let Some(date) = &self.date {
+            return date.value(now);
+        }
         crate::dynamic_text::substitute_with(&self.placeholder, now, self.weekday.as_deref())
             .unwrap_or_else(|| self.placeholder.clone())
     }
 
     #[must_use]
     pub fn cadence(&self) -> crate::dynamic_text::Cadence {
-        crate::dynamic_text::cadence(&self.placeholder)
+        self.clock.as_ref().map_or_else(
+            || crate::dynamic_text::cadence(&self.placeholder),
+            crate::dynamic_text::clock::Clock::cadence,
+        )
     }
 
     #[must_use]
@@ -100,7 +111,14 @@ fn dynamic_placeholder(object: &Value) -> Option<String> {
     map.get("script")?;
     let placeholder = text_value(map.get("value"))?;
     let now = crate::dynamic_text::local_now()?;
-    crate::dynamic_text::substitute(&placeholder, now).map(|_| placeholder)
+    crate::dynamic_text::clock::Clock::from_text(object.get("text")?)
+        .map(|clock| clock.value(now))
+        .or_else(|| {
+            crate::dynamic_text::date::Date::from_text(object.get("text")?)
+                .map(|date| date.value(now))
+        })
+        .or_else(|| crate::dynamic_text::substitute(&placeholder, now))
+        .map(|_| placeholder)
 }
 
 fn halign_of(value: Option<&Value>) -> HAlign {
@@ -326,8 +344,19 @@ pub fn render(
         .and_then(|text| text.get("script"))
         .and_then(Value::as_str)
         .and_then(crate::dynamic_text::weekday_table);
-    let live =
-        Prepared { font: bytes, em, halign, width, height: texture.height, placeholder, weekday };
+    let clock = object.get("text").and_then(crate::dynamic_text::clock::Clock::from_text);
+    let date = object.get("text").and_then(crate::dynamic_text::date::Date::from_text);
+    let live = Prepared {
+        font: bytes,
+        em,
+        halign,
+        width,
+        height: texture.height,
+        placeholder,
+        weekday,
+        clock,
+        date,
+    };
     let Some(padded) = live.rasterize(&text) else {
         return Some(Rendered { texture, metrics, offset, live: None });
     };
