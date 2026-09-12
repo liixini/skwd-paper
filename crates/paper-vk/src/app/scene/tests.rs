@@ -741,3 +741,22 @@ fn clock_effects_refresh_pixels_across_a_minute_without_continuous_animation() {
         group.destroy();
     }
 }
+
+#[test]
+fn pointer_unprojection_uses_centered_layer_coordinates() {
+    let canvas = (1920.0, 1080.0);
+    let centered =
+        layer_projection_inverse(&model_inverse((960.0, 540.0, 0.0), [1.0; 3], 0.0), canvas);
+    assert_eq!([centered[12], centered[13]], [0.0, 0.0]);
+    assert_eq!([centered[0], centered[5]], [960.0, 540.0]);
+    let shifted =
+        layer_projection_inverse(&model_inverse((480.0, 270.0, 0.0), [2.0, 3.0, 1.0], 0.0), canvas);
+    assert_eq!([shifted[12], shifted[13]], [240.0, 90.0]);
+    assert_eq!([shifted[0], shifted[5]], [480.0, 180.0]);
+    let rotated = layer_projection_inverse(
+        &model_inverse((960.0, 540.0, 0.0), [1.0; 3], std::f32::consts::FRAC_PI_2),
+        canvas,
+    );
+    assert!((rotated[1] + 960.0).abs() < 0.001);
+    assert!((rotated[4] - 540.0).abs() < 0.001);
+}

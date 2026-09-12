@@ -14,6 +14,7 @@ pub struct Frame {
     pub rect: [f32; 4],
     pub angle: f32,
     pub tint: [f32; 4],
+    pub source_tint: [f32; 4],
     pub scale: [f32; 2],
     pub depth: f32,
     pub text: Option<String>,
@@ -70,8 +71,7 @@ pub fn frames(
                 .iter()
                 .all(|o| truthy(o.get("visible"), props, true));
             let color = vec3(object.get("color"), props).unwrap_or((1.0, 1.0, 1.0));
-            let alpha =
-                if visible { number(object.get("alpha"), props, 1.0).clamp(0.0, 1.0) } else { 0.0 };
+            let alpha = number(object.get("alpha"), props, 1.0).clamp(0.0, 1.0);
             let (sin, cos) = (-t.angle).sin_cos();
             let ox = layout.offset[0] * t.scale.0;
             let oy = layout.offset[1] * t.scale.1;
@@ -83,7 +83,8 @@ pub fn frames(
                     layout.size[1] * t.scale.1,
                 ],
                 angle: -t.angle,
-                tint: [color.0, color.1, color.2, alpha],
+                tint: [color.0, color.1, color.2, if visible { alpha } else { 0.0 }],
+                source_tint: [color.0, color.1, color.2, alpha],
                 scale: [t.scale.0, t.scale.1],
                 depth: t.origin.2,
                 text: layout

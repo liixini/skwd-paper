@@ -100,3 +100,26 @@ fn animated_texture_retains_pages_and_uses_each_pages_dimensions() {
     assert_eq!(frames[1].image, 1);
     assert_eq!(texture.pages[0].base_rgba().unwrap(), [0, 255, 0, 255].repeat(4));
 }
+
+#[test]
+fn hidden_script_layer_preserves_effect_source_alpha() {
+    let mut scene = json!({"objects":[{"id":1,"visible":false},{"id":2,"parent":1,"color":"0.2 0.4 0.6","alpha":0.5}]});
+    let layout =
+        super::script::Layout { id: "2".into(), size: [64.0; 2], offset: [0.0; 2], text: false };
+    let frame = super::script::frames(
+        &scene,
+        std::slice::from_ref(&layout),
+        (64.0, 64.0),
+        &Properties::new(),
+    )
+    .remove(0)
+    .unwrap();
+    assert_eq!(frame.tint, [0.2, 0.4, 0.6, 0.0]);
+    assert_eq!(frame.source_tint, [0.2, 0.4, 0.6, 0.5]);
+    scene["objects"][0]["visible"] = json!(true);
+    let shown = super::script::frames(&scene, &[layout], (64.0, 64.0), &Properties::new())
+        .remove(0)
+        .unwrap();
+    assert_eq!(shown.tint, frame.source_tint);
+    assert_eq!(shown.source_tint, frame.source_tint);
+}

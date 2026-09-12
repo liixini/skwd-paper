@@ -612,6 +612,12 @@ fn layer_model_matrix(layer: &paper_scene::model::Layer, canvas: (f32, f32)) -> 
     (model, inverse)
 }
 
+fn layer_projection_inverse(inverse: &Mat4, canvas: (f32, f32)) -> Mat4 {
+    let (w, h) = (canvas.0 * 0.5, canvas.1 * 0.5);
+    let projection = [w, 0.0, 0.0, 0.0, 0.0, h, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, w, h, 0.0, 1.0];
+    mat4_mul(inverse, &projection)
+}
+
 fn layer_uniforms(
     layer: &paper_scene::model::Layer,
     canvas: (f32, f32),
@@ -622,6 +628,10 @@ fn layer_uniforms(
         ("g_LayerModelMatrix".to_string(), matrix.to_vec()),
         ("g_ModelMatrix".to_string(), matrix.to_vec()),
         ("g_ModelMatrixInverse".to_string(), inverse.to_vec()),
+        (
+            "g_ModelViewProjectionMatrixInverse".to_string(),
+            layer_projection_inverse(&inverse, canvas).to_vec(),
+        ),
         ("g_LightAmbientColor".to_string(), lights.0.to_vec()),
         ("g_LightSkylightColor".to_string(), lights.1.to_vec()),
     ])
