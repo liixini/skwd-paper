@@ -175,7 +175,7 @@ fn layer_mouse(
     let depth = vec2_or(root.get("parallaxDepth"), props, (0.0, 0.0));
     crate::mouse::LayerMouse {
         parallax: if parallax.amount != 0.0 && parallax.influence != 0.0 {
-            [depth.0 + parallax.amount, depth.1 + parallax.amount]
+            [depth.0, depth.1]
         } else {
             [0.0; 2]
         },
@@ -608,11 +608,14 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
     let mouse = crate::mouse::Parallax {
         amount: parallax.as_ref().map_or(0.0, |p| p.amount),
         influence: if parallax.is_some() {
-            number(general.and_then(|top| top.get("cameraparallaxmouseinfluence")), props, 1.0)
+            number(general.and_then(|top| top.get("cameraparallaxmouseinfluence")), props, 0.5)
         } else {
             0.0
         },
-        delay: number(general.and_then(|top| top.get("cameraparallaxdelay")), props, 1.0),
+        delay: number(general.and_then(|top| top.get("cameraparallaxdelay")), props, 0.1),
+        camera_offset: parallax
+            .as_ref()
+            .map_or([0.0; 2], |p| [p.focus.0 / canvas.0 - 0.5, p.focus.1 / canvas.1 - 0.5]),
     };
 
     let mut layers = Vec::new();

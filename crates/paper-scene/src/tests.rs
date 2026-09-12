@@ -1402,3 +1402,32 @@ fn video_texture_payload_is_never_accepted_as_rgba() {
     assert_eq!(texture.pixels.bytes(), 0);
     assert!(texture.frames.is_empty());
 }
+
+#[test]
+fn parallax_model_keeps_zero_depth_and_inherits_root_depth_with_engine_defaults() {
+    let scene = br#"{
+        "camera":{"eye":"-44.4 6 0"},
+        "general":{"cameraparallax":true,"orthogonalprojection":{"width":1920,"height":1080}},
+        "objects":[
+            {"id":1,"image":"models/flat.json","origin":"960 540 0","size":"1920 1080","parallaxDepth":"0 0"},
+            {"id":2,"image":"models/flat.json","origin":"960 540 0","size":"100 100","parallaxDepth":"1 0.5"},
+            {"id":3,"parent":2,"image":"models/flat.json","origin":"0 0 0","size":"10 10","parallaxDepth":"9 9"}
+        ]
+    }"#;
+    let package = pkg::Package::parse(build_pkg(&[
+        ("scene.json", scene),
+        ("models/flat.json", br#"{"material":"materials/flat.json"}"#),
+        ("materials/flat.json", br#"{"passes":[{"shader":"flat"}]}"#),
+    ]))
+    .unwrap();
+    let model = model::load(&package).unwrap();
+    assert_eq!(model.layers.len(), 3);
+    assert_eq!(model.mouse.amount, 0.5);
+    assert_eq!(model.mouse.influence, 0.5);
+    assert_eq!(model.mouse.delay, 0.1);
+    assert!((model.mouse.camera_offset[0] + 44.4 / 1920.0).abs() < 0.000001);
+    assert!((model.mouse.camera_offset[1] - 6.0 / 1080.0).abs() < 0.000001);
+    assert_eq!(model.layers[0].mouse.parallax, [0.0; 2]);
+    assert_eq!(model.layers[1].mouse.parallax, [1.0, 0.5]);
+    assert_eq!(model.layers[2].mouse.parallax, [1.0, 0.5]);
+}
