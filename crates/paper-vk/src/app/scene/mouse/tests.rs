@@ -268,6 +268,7 @@ fn depth_parallax_moves_with_zero_camera_amount_and_settles() {
     let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
     let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
     model.layers.retain(|layer| layer.id == "13");
+    model.scripts = None;
     model.particles.clear();
     assert_eq!(model.mouse.amount, 0.0);
     assert_eq!(model.mouse.influence, -0.2);
@@ -301,7 +302,7 @@ fn depth_parallax_moves_with_zero_camera_amount_and_settles() {
         }
         assert!(!group.mouse.pending());
         assert_eq!(group.mouse.displacement, [0.0; 2]);
-        let expected = if x < 0.5 { 0.45 } else { 0.55 };
+        let expected = if x < 0.5 { 0.55 } else { 0.45 };
         assert_eq!(group.scene_uniforms["g_ParallaxPosition"], [expected, 0.5]);
         let (width, height, rgba) = group.read_canvas().unwrap();
         if let Ok(evidence) = std::env::var("SKWD_WE_CLOCK_EVIDENCE") {
@@ -324,4 +325,84 @@ fn depth_parallax_moves_with_zero_camera_amount_and_settles() {
     assert!(changed > 1000, "depth effect changed only {changed} pixels");
     assert_eq!(frames[0], frames[2]);
     group.destroy();
+}
+
+#[test]
+fn parallax_uniform_clamps_after_camera_smoothing() {
+    let mut mouse = mouse();
+    mouse.parallax_position = Some([-0.1, 1.2]);
+    let mut uniforms = std::collections::BTreeMap::new();
+    write_uniforms(&mut uniforms, &mouse);
+    assert_eq!(uniforms["g_ParallaxPosition"], [0.0, 1.0]);
+    assert_eq!(mouse.parallax_position, Some([-0.1, 1.2]));
+}
+
+#[test]
+#[ignore = "requires Vulkan, Wallpaper Engine assets, and SKWD_WE_CLOCK_LIBRARY"]
+fn parallax_layer_translation_matches_proton_and_zero_depth_pixels_stay_fixed() {
+    let dir = std::path::PathBuf::from(std::env::var("SKWD_WE_CLOCK_LIBRARY").unwrap())
+        .join("3016047975");
+    let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
+    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    for (width, height) in [(1366, 768), (1920, 1080), (2560, 1440)] {
+        for depth in [0.0, 1.0] {
+            let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
+            model.layers.retain(|layer| layer.id == "13");
+            model.scripts = None;
+            model.particles.clear();
+            model.canvas = (width as f32, height as f32);
+            model.clear = [0.7; 3];
+            model.mouse =
+                Parallax { amount: 0.5, influence: 0.5, delay: 0.0, ..Default::default() };
+            let layer = &mut model.layers[0];
+            layer.effects.clear();
+            layer.texture = paper_scene::model::solid_texture();
+            layer.center = (width as f32 * 0.5, height as f32 * 0.5);
+            layer.size = (width as f32, height as f32);
+            layer.mouse = LayerMouse { parallax: [depth; 2], clock: None };
+            let mut group = super::super::build_group(
+                &sd,
+                &mut model,
+                true,
+                &[(width, height)],
+                paper_geom::FillMode::Fit,
+            )
+            .unwrap();
+            group.compose(0.0, 1.0 / 30.0).unwrap();
+            let (_, _, before) = group.read_canvas().unwrap();
+            let base = [width as f32 * 0.5, height as f32 * 0.5];
+            group.mouse.update(
+                1,
+                [1900.0 / 1920.0, 20.0 / 1080.0],
+                [false; 3],
+                (width, height),
+                paper_geom::FillMode::Fit,
+            );
+            group.compose(0.0, 1.0 / 30.0).unwrap();
+            let (_, _, after) = group.read_canvas().unwrap();
+            if depth == 0.0 {
+                assert_eq!(before, after);
+            } else {
+                let dx = group.quads[0].rect[0] - base[0];
+                let dy = group.quads[0].rect[1] - base[1];
+                assert!((dx + 235.0 * width as f32 / 1920.0).abs() < 0.001);
+                assert!((dy - 130.0 * height as f32 / 1080.0).abs() < 0.001);
+                assert_ne!(before, after);
+            }
+            group.compose(0.0, 1.0 / 30.0).unwrap();
+            assert!(!group.mouse.pending());
+            if let Ok(evidence) = std::env::var("SKWD_WE_CLOCK_EVIDENCE") {
+                image::save_buffer(
+                    std::path::Path::new(&evidence)
+                        .join(format!("parallax-{width}x{height}-depth{depth}.png")),
+                    &after,
+                    width,
+                    height,
+                    image::ColorType::Rgba8,
+                )
+                .unwrap();
+            }
+            group.destroy();
+        }
+    }
 }

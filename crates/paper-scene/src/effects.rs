@@ -804,6 +804,11 @@ pub struct PassMeta {
 }
 
 impl PassMeta {
+    pub fn apply_script_values(&mut self, values: &Value, props: &BTreeMap<String, Vec<f32>>) {
+        let values = constants_of(Some(values), props);
+        self.constants.extend(resolve_material_names(&values, &self.uniforms));
+    }
+
     #[must_use]
     pub fn of(pass: &EffectPass) -> Self {
         let resolutions = pass

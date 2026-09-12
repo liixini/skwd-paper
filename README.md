@@ -114,6 +114,16 @@ Repository for the wayland wallpaper daemon Skwd-paper, which can be used comple
 | Default video engine | `--engine default` | Normal video playback, audio and transitions |
 | Tinier video engine | `--engine tinier --frame-rate 30000/1001` | AV1 IVF; explicit monitor names, background layer, fill mode only; no audio or transitions |
 
+## SceneScript
+
+Wallpaper Engine scenes load a QuickJS runtime only when they contain scripts that need it. Scenes without scripts allocate no JavaScript heap. Exact matches for the clock and date scripts already supported by Paper keep their native update path.
+
+The current support covers property `init` and `update` functions, saved script properties, vectors, timers, audio buffers, and pointer callbacks. Scripts can change text, layer position, scale, rotation, colour, opacity, visibility, and effect constants. Text textures refresh when their content changes.
+
+Compatibility is partial. Dynamic layer creation, timeline control, media callbacks, local storage, sound control, and scripted particle settings are not implemented. Some helper modules and layer APIs are also incomplete.
+
+Each scripted scene has a 32 MiB JavaScript heap limit. Update callbacks share a 4 ms execution budget per frame. Initialization, cursor callbacks, and transferring changed properties have separate limits. Failed updates are disabled and logged; a runtime-wide failure stops scripting while the renderer keeps its last accepted state. Scripted scenes can retain hidden layers and effect passes so that scripts can change them later, which can increase RAM and GPU memory use.
+
 ## Layers
 
 | Layer | Option | Placement |

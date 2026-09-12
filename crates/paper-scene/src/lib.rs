@@ -13,6 +13,7 @@ pub mod puppet;
 mod read;
 pub mod scene;
 pub mod scene_targets;
+pub mod script;
 pub mod shader;
 pub mod sound;
 pub mod tex;

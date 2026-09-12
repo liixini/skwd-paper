@@ -4,6 +4,7 @@ use crate::pkg::Package;
 use serde_json::Value;
 
 mod font;
+pub mod script;
 
 pub const EM_PER_POINT: f32 = 300.0 / 72.0;
 pub const FALLBACK_FONT: &str = "fonts/NotoSans-Regular.ttf";

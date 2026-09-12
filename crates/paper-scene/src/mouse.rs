@@ -5,22 +5,30 @@ pub struct Parallax {
     pub amount: f32,
     pub influence: f32,
     pub delay: f32,
+    pub camera_offset: [f32; 2],
 }
 
 impl Parallax {
+    fn blend(self, dt: f32) -> f32 {
+        if self.delay > 0.0 { ((1.0 - self.delay / 3.0) * 10.0 * dt).min(1.0) } else { 1.0 }
+    }
+
     pub fn position(self, pointer: [f32; 2], previous: [f32; 2], dt: f32) -> [f32; 2] {
-        let blend = (self.delay * dt).clamp(0.0, 1.0);
+        let blend = self.blend(dt);
         std::array::from_fn(|axis| {
-            let target = 0.5 - (pointer[axis] - 0.5) * self.influence;
+            let direction = if axis == 0 { 1.0 } else { -1.0 };
+            let target = self.camera_offset[axis]
+                + 0.5
+                + direction * (pointer[axis].clamp(0.0, 1.0) - 0.5) * self.influence;
             let next = previous[axis] + (target - previous[axis]) * blend;
             if (target - next).abs() < 0.00001 { target } else { next }
         })
     }
 
     pub fn displacement(self, pointer: [f32; 2], previous: [f32; 2], dt: f32) -> [f32; 2] {
-        let blend = (self.delay * dt).clamp(0.0, 1.0);
+        let blend = self.blend(dt);
         std::array::from_fn(|axis| {
-            let target = (pointer[axis] - 0.5) * self.amount * self.influence;
+            let target = -(pointer[axis].clamp(0.0, 1.0) - 0.5) * self.amount * self.influence;
             let next = previous[axis] + (target - previous[axis]) * blend;
             if (target - next).abs() < 0.00001 { target } else { next }
         })

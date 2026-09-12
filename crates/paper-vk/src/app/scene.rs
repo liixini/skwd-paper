@@ -1,4 +1,5 @@
 mod mouse;
+mod script;
 mod video;
 
 use super::dmabuf_helpers::{create_buffers, init_free_buffers, monotonic_ns};
@@ -773,6 +774,7 @@ enum TransitionStyle {
 }
 
 struct Group {
+    scripts: Option<script::Scripts>,
     renderer: vk::Renderer,
     target: vk::SceneTarget,
     scene_snapshot: Option<vk::SceneTarget>,
@@ -1138,7 +1140,8 @@ impl Group {
     }
 
     fn animated(&self) -> bool {
-        !self.videos.is_empty()
+        self.scripts.as_ref().is_some_and(|s| s.host.animated())
+            || !self.videos.is_empty()
             || !self.animations.is_empty()
             || !self.particles.is_empty()
             || self.puppets.iter().any(PuppetGroup::animated)
@@ -1465,6 +1468,7 @@ impl Group {
         self.advance_layer_animations(time);
         self.advance_live_text(time)?;
         self.advance_audio(dt);
+        self.advance_scripts(time, dt)?;
         self.advance_mouse(dt);
         let debug_fx = std::env::var("SKWD_VK_FX_DEBUG").is_ok();
         let batched = !debug_fx && (!self.fx.is_empty() || !self.puppets.is_empty());
@@ -2492,6 +2496,7 @@ fn build_group(
     mode: FillMode,
 ) -> Result<Group> {
     let _compilation = paper_scene::shader::CompilationSession::new()?;
+    let scripted = model.scripts.is_some();
     let dimensions = scene_dimensions(model, outputs, mode);
     let (canvas_w, canvas_h) = dimensions.raster;
     let mut renderer =
@@ -2539,7 +2544,7 @@ fn build_group(
     let mut layer_slots = Vec::with_capacity(model.layers.len());
     let mut hidden_target_texture = None;
     for layer in &mut model.layers {
-        if !layer.visible {
+        if !layer.visible && !scripted {
             let slot = if let Some(slot) = hidden_target_texture {
                 slot
             } else {
@@ -2550,6 +2555,13 @@ fn build_group(
                 slot
             };
             layer_slots.push(slot);
+            continue;
+        }
+        if layer.script_text.is_some() {
+            let texture =
+                renderer.create_scene_texture_pixels(&layer.texture.pixels, true, false, false)?;
+            layer_slots.push(textures.len());
+            textures.push(texture);
             continue;
         }
         layer_slots.push(
@@ -2598,7 +2610,7 @@ fn build_group(
                     .any(|pass| paper_scene::effects::PassMeta::of(pass).pointer_dependent())
         });
     for (index, layer) in model.layers.iter_mut().enumerate() {
-        if !layer.visible || layer.effects.is_empty() {
+        if (!layer.visible && !scripted) || layer.effects.is_empty() {
             continue;
         }
 
@@ -2854,7 +2866,8 @@ fn build_group(
         let slot_texture = renderer.create_view_slot()?;
         let slot = textures.len();
         textures.push(slot_texture);
-        let source_dynamic = layer.texture.video.is_some()
+        let source_dynamic = scripted
+            || layer.texture.video.is_some()
             || inputs.iter().flatten().any(|slot| {
                 texture_interner.video_slots.values().any(|video_slot| video_slot == slot)
             })
@@ -3132,7 +3145,11 @@ fn build_group(
         })
         .map(|(index, _)| index)
         .collect();
-    let audio = start_audio(&audio_fx);
+    let audio = if model.scripts.as_ref().is_some_and(|s| s.needs_audio()) {
+        start_audio(&[0])
+    } else {
+        start_audio(&audio_fx)
+    };
     if audio.is_some() {
         for index in &audio_fx {
             if let Some(layer) = fx.get_mut(*index) {
@@ -3141,7 +3158,9 @@ fn build_group(
         }
     }
 
+    let scripts = script::Scripts::take(model, &layer_slots);
     let mut group = Group {
+        scripts,
         renderer,
         target,
         scene_snapshot: None,
@@ -3191,7 +3210,10 @@ fn build_group(
     group.compose(0.0, 1.0 / 30.0)?;
     let effect_layers = group.fx.len();
     let effect_target_bytes_before = group.effect_target_allocation_bytes();
-    let was_animated = group.animated() || !group.live_text.is_empty() || group.mouse.enabled;
+    let was_animated = group.animated()
+        || !group.live_text.is_empty()
+        || group.mouse.enabled
+        || group.scripts.is_some();
     let memory = if was_animated {
         group.bake_static_effects()?
     } else {
@@ -4223,6 +4245,9 @@ pub(super) fn dump_scene(
         "particle_systems": group.particles.len(),
         "animated": group.animated(),
         "skipped": skipped,
+        "script_runtime": group.scripts.is_some(),
+        "script_heap_bytes": group.scripts.as_ref().map_or(0, |s| s.host.heap_bytes()),
+        "script_diagnostics": group.scripts.as_ref().map(|s| &s.host.diagnostics),
         "render_ms": started.elapsed().as_secs_f64() * 1000.0,
     });
     std::fs::write(out_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;

@@ -7,7 +7,7 @@ pub(super) struct SceneMouse {
     layers: Vec<(LayerMouse, [f32; 4])>,
     pub position: [f32; 2],
     previous: [f32; 2],
-    buttons: [bool; 3],
+    pub(super) buttons: [bool; 3],
     displacement: [f32; 2],
     parallax_position: Option<[f32; 2]>,
     revision: u64,
@@ -20,15 +20,15 @@ pub(super) struct SceneMouse {
 
 impl SceneMouse {
     pub fn new(model: &paper_scene::model::SceneModel) -> Self {
-        let enabled = model.layers.iter().any(|layer| {
-            layer.mouse.clock.is_some()
-                || layer.mouse.parallax != [0.0; 2]
-                || layer
-                    .effects
-                    .iter()
-                    .flat_map(|effect| &effect.passes)
-                    .any(|pass| paper_scene::effects::PassMeta::of(pass).pointer_dependent())
-        });
+        let enabled =
+            model.scripts.is_some()
+                || model.layers.iter().any(|layer| {
+                    layer.mouse.clock.is_some()
+                        || layer.mouse.parallax != [0.0; 2]
+                        || layer.effects.iter().flat_map(|effect| &effect.passes).any(|pass| {
+                            paper_scene::effects::PassMeta::of(pass).pointer_dependent()
+                        })
+                });
         Self {
             enabled,
             config: model.mouse,
@@ -48,8 +48,14 @@ impl SceneMouse {
                 .iter()
                 .flat_map(|layer| &layer.effects)
                 .flat_map(|effect| &effect.passes)
-                .any(|pass| pass.fragment.uniforms.iter().any(|u| u.name == "g_ParallaxPosition"))
-                .then_some([0.5; 2]),
+                .any(|pass| {
+                    pass.fragment
+                        .uniforms
+                        .iter()
+                        .chain(&pass.vertex.uniforms)
+                        .any(|u| u.name == "g_ParallaxPosition")
+                })
+                .then_some(model.mouse.camera_offset.map(|offset| 0.5 + offset)),
             revision: 0,
             dirty: enabled,
             settling: false,
@@ -88,6 +94,12 @@ impl SceneMouse {
         });
         self.buttons = buttons;
         self.dirty = true;
+    }
+
+    pub fn set_script_rect(&mut self, index: usize, rect: [f32; 4]) {
+        if let Some((_, base)) = self.layers.get_mut(index) {
+            *base = rect;
+        }
     }
 
     pub fn pending(&self) -> bool {
@@ -144,10 +156,11 @@ fn write_uniforms(values: &mut std::collections::BTreeMap<String, Vec<f32>>, mou
         f32::from(mouse.buttons[2]),
         0.0,
     ];
+    let parallax_position = mouse.parallax_position.unwrap_or([0.5; 2]).map(|v| v.clamp(0.0, 1.0));
     for (name, value) in [
         ("g_PointerPosition", mouse.position.as_slice()),
         ("g_PointerPositionLast", mouse.previous.as_slice()),
-        ("g_ParallaxPosition", mouse.parallax_position.as_ref().unwrap_or(&[0.5; 2]).as_slice()),
+        ("g_ParallaxPosition", parallax_position.as_slice()),
         ("g_PointerState", buttons.as_slice()),
     ] {
         if let Some(existing) = values.get_mut(name) {
@@ -178,7 +191,7 @@ impl Group {
             quad.rect = *base;
             for axis in 0..2 {
                 quad.rect[axis] +=
-                    layer.parallax[axis] * mouse.displacement[axis] * mouse.canvas[0];
+                    layer.parallax[axis] * mouse.displacement[axis] * mouse.canvas[axis];
             }
             if let Some(clock) = layer.clock {
                 quad.projection =
