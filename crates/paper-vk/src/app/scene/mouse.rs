@@ -7,7 +7,7 @@ pub(super) struct SceneMouse {
     layers: Vec<(LayerMouse, [f32; 4])>,
     pub position: [f32; 2],
     previous: [f32; 2],
-    buttons: [bool; 3],
+    pub(super) buttons: [bool; 3],
     displacement: [f32; 2],
     parallax_position: Option<[f32; 2]>,
     revision: u64,
@@ -20,15 +20,15 @@ pub(super) struct SceneMouse {
 
 impl SceneMouse {
     pub fn new(model: &paper_scene::model::SceneModel) -> Self {
-        let enabled = model.layers.iter().any(|layer| {
-            layer.mouse.clock.is_some()
-                || layer.mouse.parallax != [0.0; 2]
-                || layer
-                    .effects
-                    .iter()
-                    .flat_map(|effect| &effect.passes)
-                    .any(|pass| paper_scene::effects::PassMeta::of(pass).pointer_dependent())
-        });
+        let enabled =
+            model.scripts.is_some()
+                || model.layers.iter().any(|layer| {
+                    layer.mouse.clock.is_some()
+                        || layer.mouse.parallax != [0.0; 2]
+                        || layer.effects.iter().flat_map(|effect| &effect.passes).any(|pass| {
+                            paper_scene::effects::PassMeta::of(pass).pointer_dependent()
+                        })
+                });
         Self {
             enabled,
             config: model.mouse,
@@ -94,6 +94,12 @@ impl SceneMouse {
         });
         self.buttons = buttons;
         self.dirty = true;
+    }
+
+    pub fn set_script_rect(&mut self, index: usize, rect: [f32; 4]) {
+        if let Some((_, base)) = self.layers.get_mut(index) {
+            *base = rect;
+        }
     }
 
     pub fn pending(&self) -> bool {

@@ -3,10 +3,13 @@ use crate::tex;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
+pub mod script;
+
 pub const MAX_SCENE_TEXTURE_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_SCENE_OBJECTS: usize = 16_384;
 
 pub struct SceneModel {
+    pub scripts: Option<crate::script::SceneScripts>,
     pub canvas: (f32, f32),
     pub mouse: crate::mouse::Parallax,
     pub camera_fov: f32,
@@ -36,6 +39,7 @@ pub struct Layer {
     pub passthrough: bool,
     pub solid: bool,
     pub live_text: Option<crate::text::Prepared>,
+    pub script_text: Option<crate::text::script::ScriptText>,
     pub is_text: bool,
     pub mouse: crate::mouse::LayerMouse,
     pub effects: Vec<crate::effects::Effect>,
@@ -571,26 +575,37 @@ pub fn load_from_dir_with(
     dir: &std::path::Path,
     overrides: &Properties,
 ) -> Result<SceneModel> {
-    let properties = std::fs::read(dir.join("project.json"))
+    let project = std::fs::read(dir.join("project.json"))
         .ok()
         .and_then(|bytes| crate::json::parse(&bytes).ok())
-        .map(|project| crate::effects::parse_properties(&project))
-        .unwrap_or_default();
+        .unwrap_or(Value::Null);
+    let properties = crate::effects::parse_properties(&project);
     let configured = std::env::var("SKWD_WE_ASSETS").ok();
-    load_with(
+    load_with_project(
         pkg,
         &crate::effects::Assets::discover(configured.as_deref())
             .with_properties(properties)
             .with_overrides(overrides.clone()),
+        &project,
     )
 }
 
 pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<SceneModel> {
+    load_with_project(pkg, assets, &Value::Null)
+}
+
+fn load_with_project(
+    pkg: &Package,
+    assets: &crate::effects::Assets,
+    project: &Value,
+) -> Result<SceneModel> {
     let props = &assets.properties;
-    let scene = pkg
+    let mut scene = pkg
         .find_json("scene.json")
         .map_err(|err| anyhow!("{err:#}"))?
         .ok_or_else(|| anyhow!("no scene.json"))?;
+    let scripts = crate::script::SceneScripts::load(&mut scene, props, project)?;
+    let scripted = scripts.is_some();
     let general = scene.get("general");
     let ortho = general.and_then(|top| top.get("orthogonalprojection"));
     let canvas = (
@@ -646,7 +661,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
             truthy(node.get("visible"), props, true)
                 && !crate::dynamic_text::media_scripted(node.get("visible"))
         });
-        if !visible && !render_target_layer_ids.contains(&id) {
+        if !visible && !scripted && !render_target_layer_ids.contains(&id) {
             continue;
         }
         if object
@@ -680,8 +695,13 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                     None => skipped.push(format!("{name}: particle {path} unsupported")),
                 }
             } else if object.get("text").is_some() {
-                match crate::text::render(pkg, assets, object, props) {
-                    Some(rendered) => {
+                match if scripted {
+                    crate::text::script::render(pkg, assets, object, props)
+                        .map(|(r, s)| (r, Some(s)))
+                } else {
+                    crate::text::render(pkg, assets, object, props).map(|r| (r, None))
+                } {
+                    Some((rendered, script_text)) => {
                         let transform = resolve_transform(object, &by_id, props, parallax.as_ref());
                         let (w, h) =
                             (rendered.texture.width as f32, rendered.texture.height as f32);
@@ -712,6 +732,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                             name,
                             visible,
                             live_text: rendered.live,
+                            script_text,
                             is_text: true,
                             mouse: layer_mouse(object, &by_id, props, mouse, transform, true),
                             texture: rendered.texture,
@@ -828,6 +849,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
             name,
             visible,
             live_text: None,
+            script_text: None,
             is_text: false,
             mouse: layer_mouse(object, &by_id, props, mouse, transform, false),
             texture,
@@ -873,6 +895,7 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
                 name: "bloom".to_string(),
                 visible: true,
                 live_text: None,
+                script_text: None,
                 is_text: false,
                 mouse: crate::mouse::LayerMouse::default(),
                 texture: solid_texture(),
@@ -914,7 +937,18 @@ pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<Scene
             layers[index].scene_order = scene_order;
         }
     }
+    let mut fonts: Vec<std::sync::Arc<[u8]>> = Vec::new();
+    for layer in &mut layers {
+        if let Some(text) = &mut layer.script_text {
+            if let Some(font) = fonts.iter().find(|font| font.as_ref() == text.font.as_ref()) {
+                text.font = font.clone();
+            } else {
+                fonts.push(text.font.clone());
+            }
+        }
+    }
     Ok(SceneModel {
+        scripts,
         canvas,
         mouse,
         camera_fov: number(general.and_then(|top| top.get("fov")), props, 50.0).clamp(1.0, 179.0),
