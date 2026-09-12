@@ -287,6 +287,7 @@ fn passive_target_quad_crops_padded_texture_at_layer_extent() {
     texture.img_height = 5;
     let layer = paper_scene::model::Layer {
         live_text: None,
+        script_text: None,
         is_text: false,
         mouse: paper_scene::mouse::LayerMouse::default(),
         id: "producer".into(),
@@ -319,6 +320,7 @@ fn passive_target_quad_crops_padded_texture_at_layer_extent() {
 fn active_and_passive_duplicate_ids_remain_ambiguous() {
     let layer = |name: &str| paper_scene::model::Layer {
         live_text: None,
+        script_text: None,
         is_text: false,
         mouse: paper_scene::mouse::LayerMouse::default(),
         id: "duplicate".into(),
@@ -624,6 +626,7 @@ fn sprite_grid_reports_engine_render_var() {
 fn layer_model_matrix_composes_origin_rotation_and_scale_without_size() {
     let mut layer = paper_scene::model::Layer {
         live_text: None,
+        script_text: None,
         is_text: false,
         mouse: paper_scene::mouse::LayerMouse::default(),
         id: "1".into(),
@@ -667,6 +670,7 @@ fn clock_effects_refresh_pixels_across_a_minute_without_continuous_animation() {
         let dir = std::path::Path::new(&root).join(item);
         let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
         let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
+        assert!(model.scripts.is_none(), "known native clocks must not allocate a JS runtime");
         model.layers.retain(|layer| layer.id == layer_id);
         model.particles.clear();
         model.skipped.clear();

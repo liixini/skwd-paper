@@ -268,6 +268,7 @@ fn depth_parallax_moves_with_zero_camera_amount_and_settles() {
     let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
     let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
     model.layers.retain(|layer| layer.id == "13");
+    model.scripts = None;
     model.particles.clear();
     assert_eq!(model.mouse.amount, 0.0);
     assert_eq!(model.mouse.influence, -0.2);
@@ -347,6 +348,7 @@ fn parallax_layer_translation_matches_proton_and_zero_depth_pixels_stay_fixed() 
         for depth in [0.0, 1.0] {
             let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
             model.layers.retain(|layer| layer.id == "13");
+            model.scripts = None;
             model.particles.clear();
             model.canvas = (width as f32, height as f32);
             model.clear = [0.7; 3];
