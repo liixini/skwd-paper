@@ -313,7 +313,9 @@ impl Renderer {
     ) -> Result<EffectPipeline> {
         self.ensure_scene_pipelines()?;
         let pool = self.effect_pool()?;
+        let shaders_started = std::time::Instant::now();
         let (vert_words, frag_words, hlsl) = compile_stages(vertex, fragment, hlsl, label)?;
+        let shaders_ms = shaders_started.elapsed().as_secs_f64() * 1000.0;
         let (sampler_count, ubo_size) = effect_caps(vertex, fragment)?;
 
         unsafe {
@@ -473,6 +475,7 @@ impl Renderer {
             let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&att);
             let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
+            let pipeline_started = std::time::Instant::now();
             let pipeline = self
                 .device
                 .create_graphics_pipelines(
@@ -492,6 +495,12 @@ impl Renderer {
                     None,
                 )
                 .map_err(|(_, err)| anyhow!("effect pipeline {label}: {err}"))?[0];
+            tracing::debug!(
+                label,
+                shaders_ms,
+                pipeline_ms = pipeline_started.elapsed().as_secs_f64() * 1000.0,
+                "scene pipeline setup"
+            );
             self.device.destroy_shader_module(vert_module, None);
             self.device.destroy_shader_module(frag_module, None);
 

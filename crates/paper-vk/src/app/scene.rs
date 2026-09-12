@@ -2491,6 +2491,7 @@ fn build_group(
     outputs: &[(u32, u32)],
     mode: FillMode,
 ) -> Result<Group> {
+    let _compilation = paper_scene::shader::CompilationSession::new()?;
     let dimensions = scene_dimensions(model, outputs, mode);
     let (canvas_w, canvas_h) = dimensions.raster;
     let mut renderer =
