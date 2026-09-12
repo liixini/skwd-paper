@@ -520,11 +520,11 @@ fn atlas_frames_advance_by_cumulative_frame_time_and_wrap() {
         SpriteFrame { uv: [0.0, 0.0, 0.5, 1.0], rotated: false, time: 0.1, image: 0 },
         SpriteFrame { uv: [0.5, 0.0, 0.5, 1.0], rotated: false, time: 0.3, image: 0 },
     ];
-    assert_eq!(frame_uv(&frames, 0.4, 0.0), frames[0].uv);
-    assert_eq!(frame_uv(&frames, 0.4, 0.05), frames[0].uv);
-    assert_eq!(frame_uv(&frames, 0.4, 0.2), frames[1].uv);
-    assert_eq!(frame_uv(&frames, 0.4, 0.45), frames[0].uv);
-    assert_eq!(frame_uv(&frames, 0.0, 9.0), frames[0].uv);
+    assert_eq!(animation_frame(&frames, 0.4, 0.0).uv, frames[0].uv);
+    assert_eq!(animation_frame(&frames, 0.4, 0.05).uv, frames[0].uv);
+    assert_eq!(animation_frame(&frames, 0.4, 0.2).uv, frames[1].uv);
+    assert_eq!(animation_frame(&frames, 0.4, 0.45).uv, frames[0].uv);
+    assert_eq!(animation_frame(&frames, 0.0, 9.0).uv, frames[0].uv);
 }
 
 fn transform(m: &Mat4, p: [f32; 4]) -> [f32; 4] {

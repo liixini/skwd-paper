@@ -23,7 +23,6 @@ hassle-rs = "0.12"
 swash = "0.2.10"
 read-fonts = "0.41"
 
-[dev-dependencies]
 tempfile = { workspace = true }
 
 [package.metadata.cargo-machete]

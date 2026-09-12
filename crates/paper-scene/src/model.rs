@@ -244,12 +244,41 @@ pub struct SpriteFrame {
     pub image: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MediaTexture {
+    Current,
+    Previous,
+}
+
+impl MediaTexture {
+    pub fn of(value: &Value) -> Option<Self> {
+        if value.get("type").and_then(Value::as_str) != Some("system") {
+            return None;
+        }
+        match value.get("name").and_then(Value::as_str)? {
+            "$mediaThumbnail" => Some(Self::Current),
+            "$mediaPreviousThumbnail" => Some(Self::Previous),
+            _ => None,
+        }
+    }
+
+    pub fn texture(self) -> Texture {
+        let mut texture = solid_texture();
+        texture.pixels = tex::Pixels::rgba(1, 1, vec![0; 4]);
+        texture.system_texture = Some(self);
+        texture
+    }
+}
+
 pub struct Texture {
     pub width: u32,
     pub height: u32,
     pub img_width: u32,
     pub img_height: u32,
     pub pixels: tex::Pixels,
+    pub pages: Vec<tex::Pixels>,
+    pub system_texture: Option<MediaTexture>,
+    pub image_count: usize,
     pub video: Option<std::sync::Arc<[u8]>>,
     pub frames: Vec<SpriteFrame>,
     pub clamp: bool,
@@ -258,11 +287,21 @@ pub struct Texture {
 }
 
 fn sprite_frames(parsed: &tex::Tex, width: u32, height: u32) -> Vec<SpriteFrame> {
-    let (aw, ah) = (width.max(1) as f32, height.max(1) as f32);
+    let dimensions: Vec<_> = parsed
+        .images
+        .iter()
+        .map(|image| image.first().map(|mip| (mip.width as f32, mip.height as f32)))
+        .collect();
     parsed
         .frames
         .iter()
         .filter_map(|frame| {
+            let (aw, ah) = dimensions
+                .get(usize::try_from(frame.image_id).ok()?)?
+                .unwrap_or((width as f32, height as f32));
+            if aw <= 0.0 || ah <= 0.0 {
+                return None;
+            }
             let (fw, fh) = frame.size();
             if fw <= 0.0 || fh <= 0.0 {
                 return None;
@@ -281,7 +320,9 @@ fn sprite_frames(parsed: &tex::Tex, width: u32, height: u32) -> Vec<SpriteFrame>
 
 impl Texture {
     pub fn payload_bytes(&self) -> usize {
-        self.pixels.bytes() + self.video.as_ref().map_or(0, |payload| payload.len())
+        self.pixels.bytes()
+            + self.pages.iter().map(tex::Pixels::bytes).sum::<usize>()
+            + self.video.as_ref().map_or(0, |payload| payload.len())
     }
 
     #[must_use]
@@ -300,7 +341,10 @@ impl Texture {
     #[must_use]
     pub fn atlas_frames(&self) -> Option<&[SpriteFrame]> {
         let playable = self.frames.len() > 1
-            && self.frames.iter().all(|frame| frame.image == 0 && !frame.rotated)
+            && self.frames.iter().all(|frame| {
+                usize::try_from(frame.image).is_ok_and(|image| image < self.image_count)
+                    && !frame.rotated
+            })
             && self.frames.iter().map(|frame| frame.time).sum::<f32>() > 0.0;
         playable.then_some(self.frames.as_slice())
     }
@@ -382,12 +426,22 @@ pub fn load_texture_bytes(bytes: &[u8]) -> Option<Texture> {
     let img_width = if img_width == 0 { width } else { img_width.min(width) };
     let img_height = if img_height == 0 { height } else { img_height.min(height) };
     let frames = sprite_frames(&parsed, width, height);
+    let pages = if frames.is_empty() {
+        Vec::new()
+    } else {
+        (1..parsed.images.len())
+            .map(|index| tex::take_image_pixels(&mut parsed, index))
+            .collect::<Option<Vec<_>>>()?
+    };
     Some(Texture {
         width,
         height,
         img_width,
         img_height,
         pixels,
+        pages,
+        system_texture: None,
+        image_count: parsed.meta.image_count,
         video,
         frames,
         clamp: parsed.meta.flags & tex::FLAG_CLAMP_UVS != 0,
@@ -446,6 +500,9 @@ pub fn solid_texture() -> Texture {
         img_height: 1,
         pixels: tex::Pixels::rgba(1, 1, vec![255, 255, 255, 255]),
         video: None,
+        pages: Vec::new(),
+        system_texture: None,
+        image_count: 1,
         frames: Vec::new(),
         clamp: true,
         nearest: false,
@@ -575,6 +632,15 @@ pub fn load_from_dir_with(
     dir: &std::path::Path,
     overrides: &Properties,
 ) -> Result<SceneModel> {
+    load_from_dir_with_storage(pkg, dir, overrides, None)
+}
+
+pub fn load_from_dir_with_storage(
+    pkg: &Package,
+    dir: &std::path::Path,
+    overrides: &Properties,
+    storage: Option<crate::script::Storage>,
+) -> Result<SceneModel> {
     let project = std::fs::read(dir.join("project.json"))
         .ok()
         .and_then(|bytes| crate::json::parse(&bytes).ok())
@@ -587,24 +653,27 @@ pub fn load_from_dir_with(
             .with_properties(properties)
             .with_overrides(overrides.clone()),
         &project,
+        storage,
     )
 }
 
 pub fn load_with(pkg: &Package, assets: &crate::effects::Assets) -> Result<SceneModel> {
-    load_with_project(pkg, assets, &Value::Null)
+    load_with_project(pkg, assets, &Value::Null, None)
 }
 
 fn load_with_project(
     pkg: &Package,
     assets: &crate::effects::Assets,
     project: &Value,
+    storage: Option<crate::script::Storage>,
 ) -> Result<SceneModel> {
     let props = &assets.properties;
     let mut scene = pkg
         .find_json("scene.json")
         .map_err(|err| anyhow!("{err:#}"))?
         .ok_or_else(|| anyhow!("no scene.json"))?;
-    let scripts = crate::script::SceneScripts::load(&mut scene, props, project)?;
+    let scripts =
+        crate::script::SceneScripts::load_with_storage(&mut scene, props, project, storage)?;
     let scripted = scripts.is_some();
     let general = scene.get("general");
     let ortho = general.and_then(|top| top.get("orthogonalprojection"));
@@ -662,21 +731,6 @@ fn load_with_project(
                 && !crate::dynamic_text::media_scripted(node.get("visible"))
         });
         if !visible && !scripted && !render_target_layer_ids.contains(&id) {
-            continue;
-        }
-        if object
-            .get("instance")
-            .and_then(|instance| instance.get("usertextures"))
-            .and_then(Value::as_array)
-            .is_some_and(|slots| {
-                slots.iter().any(|slot| {
-                    slot.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| name.starts_with("$media"))
-                })
-            })
-        {
-            skipped.push(format!("{name}: media thumbnail layer hidden without playback"));
             continue;
         }
         let Some(model_path) = object.get("image").and_then(Value::as_str) else {
@@ -765,7 +819,10 @@ fn load_with_project(
             UtilModel::default()
         };
         let solid = resolved.is_none() && util.flat;
-        let texture = if let Some(tex_path) = resolved {
+        let media_texture = object.pointer("/instance/usertextures/0").and_then(MediaTexture::of);
+        let texture = if let Some(kind) = media_texture {
+            kind.texture()
+        } else if let Some(tex_path) = resolved {
             let Some(texture) = load_texture_or_asset(pkg, assets, &tex_path) else {
                 skipped.push(format!("{name}: undecodable texture {tex_path}"));
                 continue;

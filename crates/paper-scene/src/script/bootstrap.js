@@ -70,6 +70,8 @@ function __setup(json, props) {
     for (const layer of __layers) {
         for (const [key,value] of Object.entries({visible:true, origin:'0 0 0', scale:'1 1 1', angles:'0 0 0', color:'1 1 1', alpha:1}))
             if (layer[key] === undefined) layer[key] = value;
+        Object.defineProperty(layer, 'getParent', {value: () => __layers.find(l => String(l.id) === String(layer.parent))});
+        Object.defineProperty(layer, 'getChildren', {value: () => __layers.filter(l => String(l.parent) === String(layer.id))});
         Object.defineProperty(layer, 'getEffect', {value: key => (layer.effects || []).find(e => e.name === key || e.id === key)});
         Object.defineProperty(layer, 'getAnimation', {value: () => { throw Error('SceneScript timeline control is not implemented'); }});
     }
@@ -143,6 +145,17 @@ let __lastPointer = [-1,-1];
 let __lastButtons = [false,false,false];
 let __hover = new Set();
 const __pressed = new Map();
+function __localPosition(layer,world) {
+    const chain=[], seen=new Set();
+    for(let current=layer;current&&!seen.has(current)&&chain.length<64;current=current.getParent()) {seen.add(current);chain.push(current);}
+    let p=world.copy();
+    for(const current of chain.reverse()) {
+        p=p.subtract(current.origin);
+        const angle=-current.angles.z*Math.PI/180, c=Math.cos(angle), s=Math.sin(angle);
+        p=new Vec3(p.x*c-p.y*s,p.x*s+p.y*c,p.z).divide(current.scale);
+    }
+    return p.add(new Vec3((layer.size?.x||0)/2,(layer.size?.y||0)/2,0));
+}
 function __pointer(x,y,buttons,hits) {
     const moved=x!==__lastPointer[0] || y!==__lastPointer[1];
     if(!moved && buttons.every((v,i)=>v===__lastButtons[i])) return;
@@ -152,15 +165,32 @@ function __pointer(x,y,buttons,hits) {
     for(let i=0;i<__modules.length;i++) {
         const m=__modules[i]; if(!m || m.disabled || !m.layer) continue;
         const id=String(m.layer.id), inside=hovered.has(id), was=__hover.has(id);
-        const event={cursorWorldPosition:input.cursorWorldPosition.copy(),cursorScreenPosition:input.cursorScreenPosition.copy()};
+        const worldPosition=input.cursorWorldPosition.copy();
+        const event={worldPosition, localPosition:__localPosition(m.layer,worldPosition), cursorWorldPosition:worldPosition, cursorScreenPosition:input.cursorScreenPosition.copy()};
         const call=name=>{if(typeof m.ns[name]==='function') m.ns[name](event);};
         try {
             if(inside&&!was) call('cursorEnter');
             if(!inside&&was) call('cursorLeave');
-            if(inside&&moved) call('cursorMove');
+            if((inside||__pressed.has(i))&&moved) call('cursorMove');
             if(inside&&buttons[0]&&!__lastButtons[0]) {__pressed.set(i,true);call('cursorDown');}
-            if(!buttons[0]&&__lastButtons[0]) {if(inside){call('cursorUp');if(__pressed.has(i)) call('cursorClick');}__pressed.delete(i);}
+            if(!buttons[0]&&__lastButtons[0]) {if(inside||__pressed.has(i))call('cursorUp');if(inside&&__pressed.has(i))call('cursorClick');__pressed.delete(i);}
         } catch(e) {m.disabled=true;__log('cursor script '+i+': '+String(e));}
     }
     __lastPointer=[x,y];__lastButtons=buttons;__hover=hovered;
 }
+
+const __mediaState = new Map();
+function __media(json) {
+    const events=JSON.parse(json);
+    for(const [name,event] of Object.entries(events)) {
+        const signature=JSON.stringify(event);
+        if(__mediaState.get(name)===signature)continue;
+        __mediaState.set(name,signature);
+        for(const key of ['primaryColor','secondaryColor','tertiaryColor','textColor','highContrastColor']) if(Array.isArray(event[key]))event[key]=new Vec3(...event[key]);
+        for(const m of __modules) {
+            if(!m || m.disabled || typeof m.ns[name]!=='function')continue;
+            try {m.ns[name](event);} catch(e){m.disabled=true;__log(name+': '+String(e));}
+        }
+    }
+}
+function __needsMedia() { return __modules.some(m=>m && ['mediaPlaybackChanged','mediaPropertiesChanged','mediaThumbnailChanged','mediaStatusChanged','mediaTimelineChanged'].some(name=>typeof m.ns[name]==='function')); }
