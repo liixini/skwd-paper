@@ -10,6 +10,7 @@ const HEAP_LIMIT: usize = 32 * 1024 * 1024;
 const FRAME_BUDGET: Duration = Duration::from_millis(4);
 
 pub struct SceneScripts {
+    storage: Option<super::Storage>,
     context: Context,
     runtime: Runtime,
     deadline: Rc<Cell<Instant>>,
@@ -34,6 +35,15 @@ impl SceneScripts {
         props: &crate::model::Properties,
         project: &Value,
     ) -> Result<Option<Self>> {
+        Self::load_with_storage(scene, props, project, None)
+    }
+
+    pub fn load_with_storage(
+        scene: &mut Value,
+        props: &crate::model::Properties,
+        project: &Value,
+        storage: Option<super::Storage>,
+    ) -> Result<Option<Self>> {
         if !source::present(scene) || !source::needs_runtime(scene, "") {
             return Ok(None);
         }
@@ -52,6 +62,7 @@ impl SceneScripts {
         runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= interrupt.get())));
         let context = Context::full(&runtime).map_err(|e| anyhow!("SceneScript context: {e}"))?;
         let mut host = Self {
+            storage,
             context,
             runtime,
             deadline,
@@ -106,6 +117,10 @@ impl SceneScripts {
             let result = (|| -> rquickjs::Result<()> {
                 ctx.globals().set("__log", Function::new(ctx.clone(), |message: String| { tracing::debug!("SceneScript: {}", message.chars().take(1024).collect::<String>()); })?)?;
                 ctx.eval::<(), _>(include_str!("bootstrap.js"))?;
+                ctx.eval::<(), _>(include_str!("storage.js"))?;
+                if let Some(storage) = &self.storage {
+                    ctx.globals().get::<_, Function>("__storageLoad")?.call::<_, ()>((storage.data.to_string(),))?;
+                }
                 let setup: Function = ctx.globals().get("__setup")?;
                 let mut values = project.pointer("/general/properties").and_then(Value::as_object).cloned().unwrap_or_default();
                 for (key, numbers) in props {
@@ -116,6 +131,7 @@ impl SceneScripts {
                 }
                 setup.call::<_, ()>((resolved.to_string(), Value::Object(values).to_string()))?;
                 for (name, source) in [
+                    ("WEColor", include_str!("color.js")),
                     ("WEMath", "export const mix=(a,b,t)=>a+(b-a)*t; export const clamp=(x,a,b)=>Math.min(b,Math.max(a,x)); export const smoothstep=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t)}; export const random=(a=0,b=1)=>mix(a,b,Math.random()); export const radians=x=>x*Math.PI/180; export const degrees=x=>x*180/Math.PI; export const deg2rad=radians; export const rad2deg=degrees; export const smoothStep=smoothstep;"),
                     ("WEVector", "export const lerp=(a,b,t)=>a.add(b.subtract(a).multiply(t));"),
                 ] { let (_, p) = Module::declare(ctx.clone(), name, source)?.eval()?; p.finish::<()>()?; }
@@ -165,6 +181,32 @@ impl SceneScripts {
         });
         if let Err(error) = result {
             self.stop(format!("audio stopped: {error:#}"));
+        }
+        Ok(())
+    }
+
+    pub fn needs_media(&self) -> bool {
+        self.context.with(|ctx| {
+            ctx.globals()
+                .get::<_, Function>("__needsMedia")
+                .and_then(|f| f.call::<_, bool>(()))
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn media(&mut self, events: &Value) -> Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        self.deadline.set(Instant::now() + FRAME_BUDGET);
+        let result = self.context.with(|ctx| {
+            ctx.globals()
+                .get::<_, Function>("__media")
+                .and_then(|f| f.call::<_, ()>((events.to_string(),)))
+                .map_err(|e| js_error(&ctx, &e))
+        });
+        if let Err(error) = result {
+            self.stop(format!("media event stopped: {error:#}"));
         }
         Ok(())
     }
@@ -279,6 +321,14 @@ impl SceneScripts {
             self.context.with(|ctx| ctx.eval::<bool, _>("__audio.length > 0").unwrap_or(false));
         self.timers_pending =
             self.context.with(|ctx| ctx.eval::<bool, _>("__timers.size > 0").unwrap_or(false));
+        if let Some(storage) = &mut self.storage {
+            let data: String = self
+                .context
+                .with(|ctx| ctx.globals().get::<_, Function>("__storageDrain")?.call(()))?;
+            if !data.is_empty() {
+                storage.save(&data)?;
+            }
+        }
         let changes: Vec<(String, Value)> = serde_json::from_str(&json)?;
         for (path, value) in &changes {
             if let Some(target) = self.scene.pointer_mut(path) {

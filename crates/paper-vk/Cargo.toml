@@ -26,6 +26,9 @@ image = { workspace = true }
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
 ffmpeg-the-third = { version = "6", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 libc = "0.2"
+dbus = { version = "0.9.12", features = ["vendored"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+url = "2"
 tempfile = { workspace = true }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
