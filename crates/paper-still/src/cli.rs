@@ -23,7 +23,9 @@ pub(crate) struct Cli {
     #[arg(long = "dim", default_value_t = 0)]
     pub(crate) dim: u32,
     #[arg(long = "frame-stream")]
-    pub(crate) frame_stream: Option<String>,
+    pub(crate) frame_stream: Vec<String>,
+    #[arg(long = "frame-fd")]
+    pub(crate) frame_fd: Vec<i32>,
     #[arg(long = "stream-no-header")]
     pub(crate) stream_no_header: bool,
 }

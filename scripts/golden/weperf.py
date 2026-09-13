@@ -17,6 +17,7 @@ import oracle
 
 CLK = os.sysconf("SC_CLK_TCK")
 APP = "431960"
+VK = os.environ.get("SKWD_VK") or str(HERE.parent.parent / "target" / "release" / "skwd-wall-vk")
 
 
 def gpu():
@@ -118,6 +119,27 @@ def sample(pids):
     return {pid: cpu_seconds(pid) for pid in pids if cpu_seconds(pid) is not None}
 
 
+def vram_mib(pids):
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "pmon", "-c", "1", "-s", "m"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    total = 0
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or line.lstrip().startswith("#"):
+            continue
+        try:
+            pid, memory = int(fields[1]), int(fields[3])
+        except ValueError:
+            continue
+        if pid in pids:
+            total += memory
+    return total
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("scene")
@@ -157,10 +179,9 @@ def main():
             sys.exit("Wallpaper Engine never opened its window")
         oracle.park_windows()
     else:
-        binary = str(HERE.parent.parent / "target" / "release" / "skwd-wall-vk")
         env = dict(os.environ, SKWD_PAPER_WE_FPS=str(args.fps))
         ours = subprocess.Popen(
-            [binary, args.output, args.scene, "--mute", "--scene", args.scene],
+            [VK, args.output, args.scene, "--mute", "--scene", args.scene],
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
@@ -188,6 +209,7 @@ def main():
     last = sample(current)
     spent = sum(last[pid] - first.get(pid, 0.0) for pid in last)
     rss = sum(rss_mib(pid) for pid in current)
+    vram = vram_mib(current)
     if not current:
         sys.exit(f"the {args.engine} processes vanished during the window")
     niri_cpu = None
@@ -203,6 +225,8 @@ def main():
         "processes": len(last),
         "cpu_percent_of_one_core": round(100.0 * spent / elapsed, 1),
         "rss_mib": round(rss),
+        "vram_mib": vram,
+        "fps": args.fps,
         "gpu_percent": round(mean(util), 1),
         "gpu_percent_idle_floor": round(mean(floor_util), 1),
         "watts": round(mean(watts), 1),

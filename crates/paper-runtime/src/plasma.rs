@@ -78,14 +78,33 @@ pub fn begin_stream(fd: i32, epoch: u16) -> std::io::Result<()> {
 }
 
 pub fn frame_ready() -> std::io::Result<()> {
-    let Some(fd) = std::env::var("SKWD_PAPER_PLASMA_FD")
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .filter(|fd| *fd >= 0)
-    else {
-        return Ok(());
-    };
+    for fd in ready_fds(std::env::var("SKWD_PAPER_PLASMA_FD").ok().as_deref()) {
+        frame_ready_on(fd)?;
+    }
+    Ok(())
+}
+
+pub fn frame_ready_on(fd: i32) -> std::io::Result<()> {
     send(fd, packet(6, 0, stream_epoch()))
+}
+
+pub fn ready_fds(value: Option<&str>) -> Vec<i32> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|item| item.trim().parse::<i32>().ok())
+        .filter(|fd| *fd >= 0)
+        .collect()
+}
+
+pub fn frame_pipe(fd: i32) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(duplicate) })
 }
 
 mod tests;

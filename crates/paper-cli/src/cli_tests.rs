@@ -100,10 +100,25 @@ fn plasma_presenter_contract() {
     .unwrap();
     let Command::PresentPlasma(args) = cli.command else { panic!("expected Plasma presenter") };
     assert_eq!(args.assignment, assignment);
-    assert_eq!(args.stream_size, "1920x1080");
-    assert_eq!(args.stream_fps, 60);
-    assert_eq!(args.stream_fd, 3);
+    assert_eq!(args.stream_size.as_deref(), Some("1920x1080"));
+    assert_eq!(args.stream_fps, Some(60));
+    assert_eq!(args.stream_fd, Some(3));
     assert!(args.paused);
+    let cli = <Cli as Parser>::try_parse_from([
+        "skwd-paper",
+        "present-plasma",
+        "--assignment",
+        assignment,
+        "--stream",
+        "fd=3,size=1920x1080,fps=144,output=DP-3",
+        "--stream",
+        "fd=4,size=2560x1440,fps=165,output=DP-1,paused=1",
+    ])
+    .unwrap();
+    let Command::PresentPlasma(args) = cli.command else { panic!("expected Plasma presenter") };
+    assert_eq!(args.streams.len(), 2);
+    assert!(args.stream_fd.is_none());
+    assert!(!args.paused);
 }
 
 #[test]

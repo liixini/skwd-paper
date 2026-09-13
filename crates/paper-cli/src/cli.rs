@@ -44,11 +44,13 @@ pub(crate) struct PresentPlasmaArgs {
     #[arg(long)]
     pub(crate) assignment: String,
     #[arg(long)]
-    pub(crate) stream_size: String,
+    pub(crate) stream_size: Option<String>,
     #[arg(long)]
-    pub(crate) stream_fps: u32,
+    pub(crate) stream_fps: Option<u32>,
     #[arg(long)]
-    pub(crate) stream_fd: i32,
+    pub(crate) stream_fd: Option<i32>,
+    #[arg(long = "stream", help = "fd=N,size=WxH,fps=N,output=NAME[,paused=1]; repeatable")]
+    pub(crate) streams: Vec<String>,
     #[arg(long)]
     pub(crate) paused: bool,
 }

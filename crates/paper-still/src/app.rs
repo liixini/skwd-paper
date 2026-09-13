@@ -9,12 +9,17 @@ pub(crate) fn run() -> Result<()> {
     let cli = Cli::read();
     tracing::info!(file = %cli.file, output = %cli.output, "starting skwd-wall-still");
 
-    if let Some(size) = cli.frame_stream.as_deref() {
-        let (width, height) = parse_size(size)?;
+    if !cli.frame_stream.is_empty() {
+        let sizes =
+            cli.frame_stream.iter().map(|size| parse_size(size)).collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            cli.frame_fd.is_empty() || cli.frame_fd.len() == sizes.len(),
+            "each --frame-stream needs its own --frame-fd when pipes are used"
+        );
         return image_paper::stream(
             &cli.file,
-            width,
-            height,
+            &sizes,
+            &cli.frame_fd,
             cli.fill_mode,
             cli.blur,
             cli.dim,

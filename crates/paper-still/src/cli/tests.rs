@@ -40,7 +40,24 @@ fn frame_stream_contract() {
         "--stream-no-header",
     ])
     .unwrap();
-    assert_eq!(cli.frame_stream.as_deref(), Some("1920x1080"));
+    assert_eq!(cli.frame_stream, vec!["1920x1080".to_string()]);
+    assert!(cli.frame_fd.is_empty());
     assert_eq!(cli.fill_mode, FillMode::Fit);
     assert!(cli.stream_no_header);
+    let shared = Cli::try_parse_from([
+        "skwd-wall-still",
+        "*",
+        "/wall/a.png",
+        "--frame-stream",
+        "1920x1080",
+        "--frame-fd",
+        "4",
+        "--frame-stream",
+        "1309x2327",
+        "--frame-fd",
+        "6",
+    ])
+    .unwrap();
+    assert_eq!(shared.frame_stream, vec!["1920x1080".to_string(), "1309x2327".to_string()]);
+    assert_eq!(shared.frame_fd, vec![4, 6]);
 }

@@ -1,4 +1,6 @@
-use super::{control_stdin_enabled, parse_idle_secs, renderer_path, transition_hold_enabled};
+use super::{
+    control_stdin_enabled, parse_idle_secs, renderer_path, stream_targets, transition_hold_enabled,
+};
 
 #[test]
 fn standalone_mode_is_opt_in_and_disables_only_control_stdin() {
@@ -51,4 +53,54 @@ fn transitions_always_use_the_transition_capable_path() {
 fn retired_cpu_path_uses_the_vulkan_default() {
     assert_eq!(renderer_path(Some("cpu"), true, false), "shared");
     assert_eq!(renderer_path(Some("cpu"), false, false), "dmabuf-present");
+}
+
+#[test]
+fn stream_targets_pair_repeated_flags_by_position() {
+    let args: Vec<String> = [
+        "--stream-fd",
+        "3",
+        "--stream-size",
+        "1920x1080",
+        "--stream-fps",
+        "144",
+        "--stream-output",
+        "DP-3",
+        "--stream-fd",
+        "4",
+        "--stream-size",
+        "1309x2327",
+        "--stream-fps",
+        "60",
+        "--stream-output",
+        "DP-2",
+        "--stream-paused",
+        "DP-2",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    let targets = stream_targets(&args, false);
+    assert_eq!(targets.len(), 2);
+    assert_eq!(
+        (targets[0].socket, targets[0].width, targets[0].height, targets[0].fps),
+        (3, 1920, 1080, 144)
+    );
+    assert_eq!(targets[0].output, "DP-3");
+    assert!(!targets[0].paused);
+    assert_eq!(
+        (targets[1].socket, targets[1].width, targets[1].height, targets[1].fps),
+        (4, 1309, 2327, 60)
+    );
+    assert!(targets[1].paused);
+    let legacy: Vec<String> =
+        ["--stream-fd", "3", "--stream-size", "1280x720", "--stream-fps", "30"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+    let single = stream_targets(&legacy, true);
+    assert_eq!(single.len(), 1);
+    assert!(single[0].paused);
+    assert!(single[0].output.is_empty());
+    assert!(stream_targets(&legacy[2..], false).is_empty());
 }

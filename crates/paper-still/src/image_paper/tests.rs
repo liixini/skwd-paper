@@ -165,3 +165,16 @@ fn physical_size_ratio() {
         (1600, 900)
     );
 }
+
+#[test]
+fn shared_still_frames_carry_their_own_header_per_sink() {
+    let mut first = Vec::new();
+    super::stream::write_frame(&mut first, 2, 1, &[1, 2, 3, 4, 5, 6, 7, 8], true).unwrap();
+    assert_eq!(&first[..4], b"SKWP");
+    assert_eq!(&first[4..8], &2u32.to_le_bytes());
+    assert_eq!(&first[8..12], &1u32.to_le_bytes());
+    assert_eq!(&first[12..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let mut bare = Vec::new();
+    super::stream::write_frame(&mut bare, 2, 1, &[9; 8], false).unwrap();
+    assert_eq!(bare, vec![9; 8]);
+}

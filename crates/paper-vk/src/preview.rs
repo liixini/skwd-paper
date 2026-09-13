@@ -411,25 +411,157 @@ pub(crate) fn receive_ack(socket: RawFd, block: bool) -> std::io::Result<Option<
     }
 }
 
-pub(crate) fn dmabuf_video_stream(
-    path: &str,
-    width: u32,
-    height: u32,
-    fps: u32,
-    socket: RawFd,
-    transition_from: Option<&str>,
-    shader: &str,
-    duration_ms: u64,
-    mute: bool,
-    volume: u32,
-    paused: bool,
-    write_header: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamTarget {
+    pub socket: RawFd,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub output: String,
+    pub paused: bool,
+}
+
+impl StreamTarget {
+    pub(crate) fn single(socket: RawFd, width: u32, height: u32, fps: u32, paused: bool) -> Self {
+        Self { socket, width, height, fps, output: String::new(), paused }
+    }
+}
+
+pub(crate) fn pacing_fps(targets: &[StreamTarget]) -> u32 {
+    targets.iter().map(|target| target.fps).max().unwrap_or(30).clamp(1, 240)
+}
+
+pub(crate) fn apply_output_pauses(
+    targets: &mut [StreamTarget],
+    pauses: Vec<(String, bool)>,
+) -> bool {
+    for (output, paused) in pauses {
+        for target in targets.iter_mut() {
+            if target.output == output || target.output.is_empty() {
+                target.paused = paused;
+            }
+        }
+    }
+    targets.iter().all(|target| target.paused)
+}
+
+pub(crate) fn wait_any_free(
+    sockets: &[RawFd],
+    free: &mut [[bool; 3]],
+    active: &[bool],
 ) -> Result<()> {
-    let (width, height) = (width.max(16), height.max(16));
-    let fps = fps.clamp(1, 240);
-    let frame_step = 1.0 / f64::from(fps);
-    let shared = crate::shared::create(std::ptr::null_mut()).context("video Vulkan device")?;
-    let mut renderer = crate::vk::Renderer::new_shared_headless(
+    loop {
+        if free.iter().zip(active).any(|(slots, active)| *active && slots.iter().any(|slot| *slot))
+        {
+            return Ok(());
+        }
+        let mut events: Vec<libc::pollfd> = sockets
+            .iter()
+            .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+            .collect();
+        let ready =
+            unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, 30_000) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if ready == 0 {
+            if unsafe { libc::getppid() } <= 1 {
+                return Err(anyhow::anyhow!("stream parent exited"));
+            }
+            continue;
+        }
+        for (index, event) in events.iter().enumerate() {
+            if event.revents == 0 {
+                continue;
+            }
+            while let Some(slot) = receive_ack(sockets[index], false)? {
+                if let Some(value) = free[index].get_mut(slot) {
+                    *value = true;
+                }
+            }
+        }
+    }
+}
+
+struct Sink {
+    target: StreamTarget,
+    renderer: crate::vk::Renderer,
+    exports: Vec<crate::vk::ExportImage>,
+    semaphores: Vec<crate::vk::ExternalSemaphore>,
+    targets: Vec<crate::vk::RenderTarget>,
+    free: [bool; 3],
+    uv: [f32; 4],
+    old_uv: [f32; 4],
+    step: f64,
+    next_emit: f64,
+    emitted: bool,
+}
+
+impl Sink {
+    fn drain_acks(&mut self) -> Result<()> {
+        while let Some(slot) = receive_ack(self.target.socket, false)? {
+            if let Some(value) = self.free.get_mut(slot) {
+                *value = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn announce(&self) -> Result<()> {
+        for (slot, export) in self.exports.iter().enumerate() {
+            let init = packet(
+                4,
+                slot as u8,
+                self.target.width,
+                self.target.height,
+                export.stride,
+                export.offset,
+                export.allocation_size,
+            );
+            send_packet(self.target.socket, &init, Some(export.fd)).context("send dmabuf slot")?;
+            send_packet(
+                self.target.socket,
+                &packet(5, slot as u8, 0, 0, 0, 0, 0),
+                Some(self.semaphores[slot].fd),
+            )
+            .context("send dmabuf semaphore")?;
+        }
+        Ok(())
+    }
+
+    fn due(&mut self, relative: f64) -> bool {
+        if self.emitted && relative + self.step * 0.25 < self.next_emit {
+            return false;
+        }
+        self.next_emit = relative + self.step;
+        true
+    }
+
+    fn publish(&mut self, slot: usize) -> Result<()> {
+        self.renderer.wait_frame_complete()?;
+        self.renderer.signal_external_semaphore(&self.semaphores[slot])?;
+        send_packet(self.target.socket, &packet(2, slot as u8, 0, 0, 0, 0, 0), None)
+            .context("send dmabuf frame")?;
+        self.free[slot] = false;
+        if !self.emitted {
+            paper_runtime::plasma::frame_ready_on(self.target.socket)?;
+        }
+        self.emitted = true;
+        Ok(())
+    }
+}
+
+fn build_sink(
+    shared: &crate::shared::SharedDevice,
+    target: StreamTarget,
+    video: (u32, u32),
+    old: Option<(u32, u32)>,
+) -> Result<Sink> {
+    let renderer = crate::vk::Renderer::new_shared_headless(
         (
             shared.entry.clone(),
             shared.instance.clone(),
@@ -438,136 +570,133 @@ pub(crate) fn dmabuf_video_stream(
             shared.gfx_family,
             shared.queue,
         ),
-        width,
-        height,
+        target.width,
+        target.height,
     )
     .context("video renderer")?;
-    let force_software_decode =
-        crate::shared::software_decode_required(shared.software, shared.queue_sync);
-    let mut decoder = crate::decode::open_decoder(
-        path,
-        Some(shared.hwdev),
-        shared.video_decode,
-        shared.render_node.as_deref(),
-        force_software_decode,
-    )?;
-    let hardware = matches!(decoder, crate::decode::AnyDecoder::Vk(_));
-    let (video_width, video_height) = decoder.dims();
-    let upload =
-        (!hardware).then(|| renderer.create_upload_path(video_width, video_height)).transpose()?;
-    let mut transition = if let Some(from) = transition_from.filter(|from| *from != path) {
-        let mut old_decoder = crate::decode::SwDecoder::open_threads(from, 1)?;
-        let (old_width, old_height) = (old_decoder.width, old_decoder.height);
-        let (old_frame, _) = old_decoder.next()?;
-        let old_upload = renderer.create_upload_path(old_width, old_height)?;
-        renderer.upload_nv12(
-            &old_upload,
-            old_frame.data(0),
-            old_frame.stride(0),
-            old_frame.data(1),
-            old_frame.stride(1),
-        )?;
-        let old_uv = crate::fill::mode_uv(old_width, old_height, width, height);
-        Some((old_upload, old_uv, None::<Instant>, 0u64))
-    } else {
-        None
-    };
-    let shader = selected_shader(shader);
-    let sand = paper_shaders::sand_style_index(shader);
-    let effect = sand.is_none().then(|| paper_shaders::effect_index(shader)).flatten();
-    let duration = std::time::Duration::from_millis(duration_ms.max(100));
-    let export_stream = (|| -> Result<_> {
-        let exports = (0..3)
-            .map(|_| renderer.create_stream_export(width, height))
-            .collect::<Result<Vec<_>>>()?;
-        let semaphores =
-            (0..3).map(|_| renderer.create_external_semaphore()).collect::<Result<Vec<_>>>()?;
-        let targets = exports
-            .iter()
-            .map(|export| renderer.create_export_rt(export))
-            .collect::<Result<Vec<_>>>()?;
-        Ok((exports, semaphores, targets))
-    })();
-    let (mut exports, semaphores, targets) = match export_stream {
-        Ok(stream) => stream,
-        Err(error) => {
-            tracing::warn!(%error, "skwd-wall-vk: external stream unavailable, using CPU frames");
-            return video_stream(path, width, height, fps, write_header);
+    let exports = (0..3)
+        .map(|_| renderer.create_stream_export(target.width, target.height))
+        .collect::<Result<Vec<_>>>()?;
+    let semaphores =
+        (0..3).map(|_| renderer.create_external_semaphore()).collect::<Result<Vec<_>>>()?;
+    let targets = exports
+        .iter()
+        .map(|export| renderer.create_export_rt(export))
+        .collect::<Result<Vec<_>>>()?;
+    let uv = crate::fill::mode_uv(video.0, video.1, target.width, target.height);
+    let old_uv = old
+        .map(|(width, height)| crate::fill::mode_uv(width, height, target.width, target.height))
+        .unwrap_or(uv);
+    let step = 1.0 / f64::from(target.fps.clamp(1, 240));
+    Ok(Sink {
+        target,
+        renderer,
+        exports,
+        semaphores,
+        targets,
+        free: [true; 3],
+        uv,
+        old_uv,
+        step,
+        next_emit: 0.0,
+        emitted: false,
+    })
+}
+
+struct Transition {
+    upload: crate::vk::UploadPath,
+    started: Option<Instant>,
+    frames: u64,
+}
+
+struct VideoStreamer {
+    sinks: Vec<Sink>,
+    ctl: crate::ctl::Ctl,
+    upload: Option<crate::vk::UploadPath>,
+    transition: Option<Transition>,
+    sand: Option<i32>,
+    effect: Option<usize>,
+    duration: std::time::Duration,
+    frame_step: f64,
+    frame_duration: std::time::Duration,
+    timeline_shift: std::time::Duration,
+    emitted: bool,
+}
+
+impl VideoStreamer {
+    fn route_pauses(&mut self) {
+        let pauses = self.ctl.take_output_pauses();
+        if pauses.is_empty() {
+            return;
         }
-    };
-    let mut ctl = crate::ctl::Ctl::start(path, mute, volume, true);
-    ctl.set_paused(paused);
-    for (slot, export) in exports.iter().enumerate() {
-        let init = packet(
-            4,
-            slot as u8,
-            width,
-            height,
-            export.stride,
-            export.offset,
-            export.allocation_size,
-        );
-        send_packet(socket, &init, Some(export.fd)).context("send dmabuf slot")?;
-        send_packet(socket, &packet(5, slot as u8, 0, 0, 0, 0, 0), Some(semaphores[slot].fd))
-            .context("send dmabuf semaphore")?;
+        let mut targets: Vec<StreamTarget> =
+            self.sinks.iter().map(|sink| sink.target.clone()).collect();
+        let all_paused = apply_output_pauses(&mut targets, pauses);
+        for (sink, target) in self.sinks.iter_mut().zip(targets) {
+            sink.target.paused = target.paused;
+        }
+        self.ctl.set_paused(all_paused);
     }
-    let uv = crate::fill::mode_uv(video_width, video_height, width, height);
-    let mut free = [true; 3];
-    let mut first_pts = None;
-    let mut last_pts = None;
-    let mut next_emit = 0.0;
-    let mut started = Instant::now();
-    let mut emitted = false;
-    let mut previous_frame = None;
-    let mut last_deadline = None;
-    let frame_duration = std::time::Duration::from_secs_f64(frame_step);
-    let mut transition_active = transition.is_some();
-    let mut timeline_shift = std::time::Duration::ZERO;
-    let mut emit_frame = |frame: &ffmpeg_the_third::frame::Video,
-                          decoder: &mut crate::decode::AnyDecoder,
-                          upload_frame: bool,
-                          deadline: Instant,
-                          emitted: &mut bool,
-                          timeline_shift: &mut std::time::Duration|
-     -> Result<bool> {
-        let suspended =
-            if *emitted { wait_stream_control(&mut ctl)? } else { std::time::Duration::ZERO };
-        *timeline_shift += suspended;
-        if let Some((_, _, Some(started), _)) = &mut transition {
-            *started += suspended;
+
+    fn shift_timeline(&mut self, by: std::time::Duration) {
+        self.timeline_shift += by;
+        if let Some(Transition { started: Some(started), .. }) = &mut self.transition {
+            *started += by;
         }
-        let mut deadline = deadline + *timeline_shift;
-        while let Some(slot) = receive_ack(socket, false)? {
-            if let Some(value) = free.get_mut(slot) {
-                *value = true;
-            }
+    }
+
+    fn wait_for_slot(&mut self) -> Result<()> {
+        for sink in &mut self.sinks {
+            sink.drain_acks()?;
         }
+        let sockets: Vec<RawFd> = self.sinks.iter().map(|sink| sink.target.socket).collect();
+        let active: Vec<bool> = self.sinks.iter().map(|sink| !sink.target.paused).collect();
+        let mut free: Vec<[bool; 3]> = self.sinks.iter().map(|sink| sink.free).collect();
+        wait_any_free(&sockets, &mut free, &active)?;
+        for (sink, slots) in self.sinks.iter_mut().zip(free) {
+            sink.free = slots;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &mut self,
+        frame: &ffmpeg_the_third::frame::Video,
+        decoder: &mut crate::decode::AnyDecoder,
+        upload_frame: bool,
+        deadline: Instant,
+        relative: f64,
+    ) -> Result<bool> {
+        let suspended = if self.emitted {
+            wait_stream_control(&mut self.ctl)?
+        } else {
+            let _ = self.ctl.poll();
+            std::time::Duration::ZERO
+        };
+        self.shift_timeline(suspended);
+        self.route_pauses();
+        if self.ctl.paused {
+            return Ok(self.transition.is_some());
+        }
+        let mut deadline = deadline + self.timeline_shift;
         let wait_started = Instant::now();
-        while !free.iter().any(|value| *value) {
-            if let Some(slot) = receive_ack(socket, true)?
-                && let Some(value) = free.get_mut(slot)
-            {
-                *value = true;
-            }
-        }
+        self.wait_for_slot()?;
         let now = Instant::now();
         let shift = crate::timing::stream_resume_shift(
             deadline,
             now,
             now.duration_since(wait_started),
-            frame_duration,
+            self.frame_duration,
         );
-        *timeline_shift += shift;
+        self.shift_timeline(shift);
         deadline += shift;
-        if let Some((_, _, Some(started), _)) = &mut transition {
-            *started += shift;
-        }
-        if *emitted
+        if self.emitted
             && now
                 .checked_duration_since(deadline)
-                .is_some_and(|late| late.as_secs_f64() > frame_step * 1.5)
+                .is_some_and(|late| late.as_secs_f64() > self.frame_step * 1.5)
         {
-            return Ok(transition.is_some());
+            return Ok(self.transition.is_some());
         }
         let transferred = if upload_frame && let crate::decode::AnyDecoder::Vaapi(decoder) = decoder
         {
@@ -579,10 +708,9 @@ pub(crate) fn dmabuf_video_stream(
         if let Some(delay) = deadline.checked_duration_since(Instant::now()) {
             std::thread::sleep(delay);
         }
-        let slot = free.iter().position(|value| *value).unwrap();
-        let source = if let Some(upload) = &upload {
+        let source = if let Some(upload) = &self.upload {
             if upload_frame {
-                renderer.upload_nv12(
+                self.sinks[0].renderer.upload_nv12(
                     upload,
                     frame.data(0),
                     frame.stride(0),
@@ -595,78 +723,194 @@ pub(crate) fn dmabuf_video_stream(
             Src::Avvk(frame)
         };
         let mut finish_transition = false;
-        if let Some((old_upload, old_uv, transition_started, transition_frames)) = &mut transition {
-            let started = *transition_started.get_or_insert_with(Instant::now);
-            let elapsed = started.elapsed();
-            let progress = if *transition_frames == 0 {
+        let progress = self.transition.as_mut().map(|transition| {
+            let started = *transition.started.get_or_insert_with(Instant::now);
+            let progress = if transition.frames == 0 {
                 0.0
             } else {
-                (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0)
+                (started.elapsed().as_secs_f32() / self.duration.as_secs_f32()).clamp(0.0, 1.0)
             };
-            finish_transition = progress >= 1.0;
-            *transition_frames += 1;
-            let old_source = Src::Views(old_upload.luma_view, old_upload.chroma_view);
-            match (progress, sand, effect) {
-                (progress, _, _) if progress <= 0.0 => {
-                    renderer.render_to(&targets[slot], &mut exports[slot], &old_source, *old_uv)?
+            transition.frames += 1;
+            progress
+        });
+        let old_source = self.transition.as_ref().map(|transition| {
+            Src::Views(transition.upload.luma_view, transition.upload.chroma_view)
+        });
+        for sink in &mut self.sinks {
+            if sink.target.paused || !sink.due(relative) {
+                continue;
+            }
+            let Some(slot) = sink.free.iter().position(|value| *value) else {
+                continue;
+            };
+            match (progress, old_source.as_ref()) {
+                (Some(progress), Some(old_source)) => {
+                    finish_transition = progress >= 1.0;
+                    let target = &sink.targets[slot];
+                    let export = &mut sink.exports[slot];
+                    match (progress, self.sand, self.effect) {
+                        (progress, _, _) if progress <= 0.0 => {
+                            sink.renderer.render_to(target, export, old_source, sink.old_uv)?
+                        }
+                        (progress, _, _) if progress >= 1.0 => {
+                            sink.renderer.render_to(target, export, &source, sink.uv)?
+                        }
+                        (_, Some(style), _) => sink.renderer.render_sand_to(
+                            target,
+                            export,
+                            old_source,
+                            sink.old_uv,
+                            &source,
+                            sink.uv,
+                            progress,
+                            style,
+                        )?,
+                        (_, None, Some(effect)) => sink.renderer.render_effect_to(
+                            target,
+                            export,
+                            old_source,
+                            sink.old_uv,
+                            &source,
+                            sink.uv,
+                            progress,
+                            effect,
+                        )?,
+                        (_, None, None) => sink.renderer.render_fade_to(
+                            target,
+                            export,
+                            old_source,
+                            sink.old_uv,
+                            &source,
+                            sink.uv,
+                            progress * progress * (3.0 - 2.0 * progress),
+                        )?,
+                    }
                 }
-                (progress, _, _) if progress >= 1.0 => {
-                    renderer.render_to(&targets[slot], &mut exports[slot], &source, uv)?
-                }
-                (_, Some(style), _) => renderer.render_sand_to(
-                    &targets[slot],
-                    &mut exports[slot],
-                    &old_source,
-                    *old_uv,
+                _ => sink.renderer.render_to(
+                    &sink.targets[slot],
+                    &mut sink.exports[slot],
                     &source,
-                    uv,
-                    progress,
-                    style,
-                )?,
-                (_, None, Some(effect)) => renderer.render_effect_to(
-                    &targets[slot],
-                    &mut exports[slot],
-                    &old_source,
-                    *old_uv,
-                    &source,
-                    uv,
-                    progress,
-                    effect,
-                )?,
-                (_, None, None) => renderer.render_fade_to(
-                    &targets[slot],
-                    &mut exports[slot],
-                    &old_source,
-                    *old_uv,
-                    &source,
-                    uv,
-                    progress * progress * (3.0 - 2.0 * progress),
+                    sink.uv,
                 )?,
             }
-        } else {
-            renderer.render_to(&targets[slot], &mut exports[slot], &source, uv)?;
+            sink.publish(slot)?;
+            self.emitted = true;
         }
-        renderer.wait_frame_complete()?;
-        renderer.signal_external_semaphore(&semaphores[slot])?;
-        send_packet(socket, &packet(2, slot as u8, 0, 0, 0, 0, 0), None)
-            .context("send dmabuf frame")?;
-        free[slot] = false;
-        if !*emitted {
-            paper_runtime::plasma::frame_ready()?;
-        }
-        *emitted = true;
         if finish_transition {
-            if let Some((_, _, Some(started), frames)) = &transition {
+            if let Some(Transition { started: Some(started), frames, .. }) = &self.transition {
                 tracing::info!(
                     frames,
                     fps = *frames as f64 / started.elapsed().as_secs_f64().max(0.001),
                     "skwd-wall-vk: stream transition complete"
                 );
             }
-            transition = None;
+            self.transition = None;
         }
-        Ok(transition.is_some())
+        Ok(self.transition.is_some())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dmabuf_video_stream(
+    path: &str,
+    targets: Vec<StreamTarget>,
+    transition_from: Option<&str>,
+    shader: &str,
+    duration_ms: u64,
+    mute: bool,
+    volume: u32,
+    write_header: bool,
+) -> Result<()> {
+    let targets: Vec<StreamTarget> = targets
+        .into_iter()
+        .map(|target| StreamTarget {
+            width: target.width.max(16),
+            height: target.height.max(16),
+            ..target
+        })
+        .collect();
+    anyhow::ensure!(!targets.is_empty(), "video stream needs at least one target");
+    let fps = pacing_fps(&targets);
+    let frame_step = 1.0 / f64::from(fps);
+    let shared = crate::shared::create(std::ptr::null_mut()).context("video Vulkan device")?;
+    let force_software_decode =
+        crate::shared::software_decode_required(shared.software, shared.queue_sync);
+    let mut decoder = crate::decode::open_decoder(
+        path,
+        Some(shared.hwdev),
+        shared.video_decode,
+        shared.render_node.as_deref(),
+        force_software_decode,
+    )?;
+    let hardware = matches!(decoder, crate::decode::AnyDecoder::Vk(_));
+    let (video_width, video_height) = decoder.dims();
+    let mut old_decoder = transition_from
+        .filter(|from| *from != path)
+        .map(|from| crate::decode::SwDecoder::open_threads(from, 1))
+        .transpose()?;
+    let old_dims = old_decoder.as_ref().map(|old| (old.width, old.height));
+    let single = targets.len() == 1;
+    let built = targets
+        .iter()
+        .cloned()
+        .map(|target| build_sink(&shared, target, (video_width, video_height), old_dims))
+        .collect::<Result<Vec<_>>>();
+    let sinks = match built {
+        Ok(sinks) => sinks,
+        Err(error) if single => {
+            tracing::warn!(%error, "skwd-wall-vk: external stream unavailable, using CPU frames");
+            let target = &targets[0];
+            return video_stream(path, target.width, target.height, target.fps, write_header);
+        }
+        Err(error) => return Err(error),
     };
+    let upload = (!hardware)
+        .then(|| sinks[0].renderer.create_upload_path(video_width, video_height))
+        .transpose()?;
+    let transition = match old_decoder.as_mut() {
+        Some(old) => {
+            let (old_frame, _) = old.next()?;
+            let old_upload = sinks[0].renderer.create_upload_path(old.width, old.height)?;
+            sinks[0].renderer.upload_nv12(
+                &old_upload,
+                old_frame.data(0),
+                old_frame.stride(0),
+                old_frame.data(1),
+                old_frame.stride(1),
+            )?;
+            Some(Transition { upload: old_upload, started: None, frames: 0 })
+        }
+        None => None,
+    };
+    let shader = selected_shader(shader);
+    let sand = paper_shaders::sand_style_index(shader);
+    let effect = sand.is_none().then(|| paper_shaders::effect_index(shader)).flatten();
+    let mut ctl = crate::ctl::Ctl::start(path, mute, volume, true);
+    ctl.route_output_pauses();
+    ctl.set_paused(targets.iter().all(|target| target.paused));
+    for sink in &sinks {
+        sink.announce()?;
+    }
+    let mut streamer = VideoStreamer {
+        sinks,
+        ctl,
+        upload,
+        transition,
+        sand,
+        effect,
+        duration: std::time::Duration::from_millis(duration_ms.max(100)),
+        frame_step,
+        frame_duration: std::time::Duration::from_secs_f64(frame_step),
+        timeline_shift: std::time::Duration::ZERO,
+        emitted: false,
+    };
+    let mut first_pts = None;
+    let mut last_pts = None;
+    let mut next_emit = 0.0;
+    let mut started = Instant::now();
+    let mut previous_frame = None;
+    let mut last_deadline = None;
+    let mut transition_active = streamer.transition.is_some();
     loop {
         let (frame, pts) = match &mut decoder {
             crate::decode::AnyDecoder::Vaapi(decoder) => decoder.next_hw_frame()?,
@@ -676,10 +920,14 @@ pub(crate) fn dmabuf_video_stream(
             first_pts = None;
             next_emit = 0.0;
             started = Instant::now();
-            emitted = false;
+            streamer.emitted = false;
+            for sink in &mut streamer.sinks {
+                sink.emitted = false;
+                sink.next_emit = 0.0;
+            }
             previous_frame = None;
             last_deadline = None;
-            timeline_shift = std::time::Duration::ZERO;
+            streamer.timeline_shift = std::time::Duration::ZERO;
         }
         last_pts = Some(pts);
         let origin = *first_pts.get_or_insert(pts);
@@ -692,22 +940,20 @@ pub(crate) fn dmabuf_video_stream(
         if let Some(previous_deadline) = last_deadline
             && let Some(previous) = previous_frame.as_ref()
         {
-            let mut fill_deadline = previous_deadline + frame_duration;
+            let mut fill_deadline: Instant = previous_deadline + streamer.frame_duration;
             while transition_active && fill_deadline < deadline {
-                transition_active = emit_frame(
-                    previous,
-                    &mut decoder,
-                    false,
-                    fill_deadline,
-                    &mut emitted,
-                    &mut timeline_shift,
-                )?;
-                fill_deadline += frame_duration;
+                let fill_relative = fill_deadline.duration_since(started).as_secs_f64();
+                transition_active =
+                    streamer.emit(previous, &mut decoder, false, fill_deadline, fill_relative)?;
+                fill_deadline += streamer.frame_duration;
             }
         }
-        transition_active =
-            emit_frame(&frame, &mut decoder, true, deadline, &mut emitted, &mut timeline_shift)?;
+        transition_active = streamer.emit(&frame, &mut decoder, true, deadline, relative)?;
         last_deadline = Some(deadline);
         previous_frame = Some(frame);
     }
 }
+
+#[cfg(test)]
+#[path = "preview_tests.rs"]
+mod tests;

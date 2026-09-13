@@ -44,13 +44,8 @@ pub(crate) fn run() -> Result<()> {
             if let Some(transition) = transition {
                 transition.validate().map_err(|error| anyhow!(error.to_string()))?;
             }
-            crate::backend::present_plasma(
-                &assignment,
-                &args.stream_size,
-                args.stream_fps,
-                args.stream_fd,
-                args.paused,
-            )
+            let streams = crate::backend::plasma_streams(&args)?;
+            crate::backend::present_plasma(&assignment, &streams)
         }
     }
 }

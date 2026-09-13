@@ -124,3 +124,21 @@ fn scene_capture_preserves_playback_and_pause_state() {
         assert!(ctl.take_capture().is_none());
     }
 }
+
+#[test]
+fn routed_output_pauses_stay_out_of_the_global_pause() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut ctl = Ctl::with_receiver(rx);
+    tx.send(serde_json::from_str(r#"{"to":"DP-1","pause":true}"#).unwrap()).unwrap();
+    assert!(ctl.poll().is_none());
+    assert!(ctl.paused);
+    assert!(ctl.take_output_pauses().is_empty());
+    ctl.route_output_pauses();
+    tx.send(serde_json::from_str(r#"{"to":"DP-2","pause":true}"#).unwrap()).unwrap();
+    tx.send(serde_json::from_str(r#"{"to":"","pause":false}"#).unwrap()).unwrap();
+    tx.send(serde_json::from_str(r#"{"to":"*","pause":true}"#).unwrap()).unwrap();
+    assert!(ctl.poll().is_none());
+    assert!(ctl.paused);
+    assert_eq!(ctl.take_output_pauses(), vec![("DP-2".to_string(), true)]);
+    assert!(ctl.take_output_pauses().is_empty());
+}

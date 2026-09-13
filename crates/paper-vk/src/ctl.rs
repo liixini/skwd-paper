@@ -47,6 +47,8 @@ impl AudioSink {
 }
 
 pub struct Ctl {
+    pub output_pauses: Vec<(String, bool)>,
+    route_output_pauses: bool,
     rx: std::sync::mpsc::Receiver<PaperCommand>,
     pub audio: Option<AudioSink>,
     pub mute: bool,
@@ -112,7 +114,18 @@ impl Ctl {
         }
         let audio =
             with_audio.then(|| AudioSink::Media(paper_audio::GatedAudio::new(video, mute, volume)));
-        Self { rx, audio, mute, volume, paused: false, freeze: None, capture: None, wake }
+        Self {
+            rx,
+            audio,
+            mute,
+            volume,
+            paused: false,
+            freeze: None,
+            capture: None,
+            wake,
+            output_pauses: Vec::new(),
+            route_output_pauses: false,
+        }
     }
 
     #[cfg(test)]
@@ -126,6 +139,8 @@ impl Ctl {
             freeze: None,
             capture: None,
             wake: None,
+            output_pauses: Vec::new(),
+            route_output_pauses: false,
         }
     }
 
@@ -140,7 +155,18 @@ impl Ctl {
         let volume = volume.min(100);
         let audio =
             with_audio.then(|| AudioSink::Media(paper_audio::GatedAudio::new(video, mute, volume)));
-        Self { rx, audio, mute, volume, paused: false, freeze: None, capture: None, wake }
+        Self {
+            rx,
+            audio,
+            mute,
+            volume,
+            paused: false,
+            freeze: None,
+            capture: None,
+            wake,
+            output_pauses: Vec::new(),
+            route_output_pauses: false,
+        }
     }
 
     pub fn set_scene_voices(&mut self, voices: Vec<paper_audio::Voice>) {
@@ -209,9 +235,25 @@ impl Ctl {
         self.capture.take()
     }
 
+    pub fn route_output_pauses(&mut self) {
+        self.route_output_pauses = true;
+    }
+
+    pub fn take_output_pauses(&mut self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.output_pauses)
+    }
+
     fn reduce(&mut self, mut cmd: PaperCommand) -> Option<SwapReq> {
         if let Some(capture) = cmd.capture.take() {
             self.capture = Some(capture);
+            return None;
+        }
+        if self.route_output_pauses
+            && let Some(paused) = cmd.pause
+            && !cmd.to.is_empty()
+            && cmd.to != "*"
+        {
+            self.output_pauses.push((cmd.to, paused));
             return None;
         }
         match paper_control::classify_command(cmd) {

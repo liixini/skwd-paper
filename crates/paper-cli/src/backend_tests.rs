@@ -31,9 +31,13 @@ fn plasma_presentation_uses_paper_backend_routing() {
     let mut static_assignment =
         Assignment::new(vec!["DP-1".into()], Source::static_file("/wall/a.png"));
     static_assignment.fill_mode = paper_control::FillMode::Fit;
-    let command =
-        super::plasma_command(&backends, &static_assignment, "1920x1080", 60, 3, false, true)
-            .unwrap();
+    let command = super::plasma_command(
+        &backends,
+        &static_assignment,
+        &[stream(3, "1920x1080", 60, false)],
+        true,
+    )
+    .unwrap();
     let (program, arguments) = command_parts(&command);
     assert_eq!(program, still.to_string_lossy());
     assert_eq!(
@@ -43,9 +47,13 @@ fn plasma_presentation_uses_paper_backend_routing() {
 
     let tinier_assignment =
         Assignment::new(vec!["DP-1".into()], Source::tinier_video("/wall/loop.ivf", "30000/1001"));
-    let command =
-        super::plasma_command(&backends, &tinier_assignment, "1280x720", 60, 3, true, true)
-            .unwrap();
+    let command = super::plasma_command(
+        &backends,
+        &tinier_assignment,
+        &[stream(3, "1280x720", 60, true)],
+        true,
+    )
+    .unwrap();
     let (program, arguments) = command_parts(&command);
     assert_eq!(program, tinier.to_string_lossy());
     assert_eq!(
@@ -64,13 +72,136 @@ fn plasma_presentation_uses_paper_backend_routing() {
 
     let video_assignment =
         Assignment::new(vec!["DP-1".into()], Source::video("/wall/loop.mp4", None));
-    let command =
-        super::plasma_command(&backends, &video_assignment, "2560x1440", 144, 3, false, true)
-            .unwrap();
+    let command = super::plasma_command(
+        &backends,
+        &video_assignment,
+        &[stream(3, "2560x1440", 144, false)],
+        true,
+    )
+    .unwrap();
     let (program, arguments) = command_parts(&command);
     assert_eq!(program, vk.to_string_lossy());
     assert!(arguments.starts_with(&["--video-stream".into(), "/wall/loop.mp4".into()]));
     assert!(arguments.windows(2).any(|pair| pair == ["--stream-fd", "3"]));
+    assert!(!arguments.contains(&"--stream-output".to_string()));
+}
+
+fn stream(fd: i32, size: &str, fps: u32, paused: bool) -> PlasmaStream {
+    PlasmaStream { fd, frame_fd: -1, size: size.into(), fps, output: String::new(), paused }
+}
+
+fn shared(
+    fd: i32,
+    frame_fd: i32,
+    size: &str,
+    fps: u32,
+    output: &str,
+    paused: bool,
+) -> PlasmaStream {
+    PlasmaStream { fd, frame_fd, size: size.into(), fps, output: output.into(), paused }
+}
+
+#[test]
+fn shared_still_presenter_pairs_each_size_with_its_pipe() {
+    let temp = tempfile::tempdir().unwrap();
+    let vk = temp.path().join("skwd-wall-vk");
+    let still = temp.path().join("skwd-wall-still");
+    executable(&vk, "#!/bin/sh\nexit 0\n");
+    executable(&still, "#!/bin/sh\nexit 0\n");
+    let backends = BackendPaths::from_executables(vk, still.clone());
+    let assignment = Assignment::new(vec!["DP-3".into()], Source::static_file("/wall/a.png"));
+    let streams = [
+        shared(3, 4, "1920x1080", 144, "DP-3", false),
+        shared(5, 6, "1309x2327", 60, "DP-2", false),
+    ];
+    let command = super::plasma_command(&backends, &assignment, &streams, false).unwrap();
+    let (program, arguments) = command_parts(&command);
+    assert_eq!(program, still.to_string_lossy());
+    assert_eq!(
+        arguments,
+        [
+            "*",
+            "/wall/a.png",
+            "--frame-stream",
+            "1920x1080",
+            "--frame-fd",
+            "4",
+            "--frame-stream",
+            "1309x2327",
+            "--frame-fd",
+            "6",
+            "--fill-mode",
+            "fill",
+            "--stream-no-header",
+        ]
+    );
+    assert_eq!(super::stream_fd_list(&streams), "3,5");
+    let mut header = Vec::new();
+    super::write_stream_header_to(&mut header, "1920x1080").unwrap();
+    assert_eq!(header.len(), 12);
+    assert_eq!(&header[..4], b"SKWP");
+}
+
+#[test]
+fn shared_plasma_presenter_lists_every_stream_in_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let vk = temp.path().join("skwd-wall-vk");
+    let still = temp.path().join("skwd-wall-still");
+    executable(&vk, "#!/bin/sh\nexit 0\n");
+    executable(&still, "#!/bin/sh\nexit 0\n");
+    let backends = BackendPaths::from_executables(vk.clone(), still);
+    let assignment = Assignment::new(vec!["DP-3".into()], Source::video("/wall/loop.mp4", None));
+    let streams = [
+        shared(3, -1, "1920x1080", 144, "DP-3", false),
+        shared(4, -1, "1309x2327", 60, "DP-2", true),
+    ];
+    let command = super::plasma_command(&backends, &assignment, &streams, true).unwrap();
+    let (_, arguments) = command_parts(&command);
+    let joined = arguments.join(" ");
+    assert!(joined.contains(
+        "--stream-size 1920x1080 --stream-fps 144 --stream-fd 3 --stream-output DP-3 --stream-size 1309x2327 --stream-fps 60 --stream-fd 4 --stream-output DP-2 --stream-paused DP-2"
+    ));
+    assert!(!arguments.contains(&"--paused".to_string()));
+    let both_paused: Vec<PlasmaStream> =
+        streams.iter().cloned().map(|stream| PlasmaStream { paused: true, ..stream }).collect();
+    let command = super::plasma_command(&backends, &assignment, &both_paused, true).unwrap();
+    let (_, arguments) = command_parts(&command);
+    assert!(arguments.contains(&"--paused".to_string()));
+    assert!(!arguments.contains(&"--stream-paused".to_string()));
+    assert_eq!(super::stream_fd_list(&streams), "3,4");
+}
+
+#[test]
+fn plasma_stream_specs_parse_key_value_fields() {
+    let stream =
+        super::parse_plasma_stream("fd=5,size=1920x1080,fps=120,output=DP-1,paused=1", false)
+            .unwrap();
+    assert_eq!(stream, shared(5, -1, "1920x1080", 120, "DP-1", true));
+    assert_eq!(super::parse_plasma_stream("fd=3,frame_fd=4,size=1x1", false).unwrap().frame_fd, 4);
+    assert!(super::parse_plasma_stream("size=1920x1080", false).is_err());
+    assert!(super::parse_plasma_stream("fd=3", false).is_err());
+    assert!(super::parse_plasma_stream("fd=3,size=1x1,bogus=1", false).is_err());
+    let args = crate::cli::PresentPlasmaArgs {
+        assignment: String::new(),
+        stream_size: Some("1280x720".into()),
+        stream_fps: Some(30),
+        stream_fd: Some(3),
+        streams: vec!["fd=4,size=640x480,fps=60,output=DP-2".into()],
+        paused: true,
+    };
+    let streams = super::plasma_streams(&args).unwrap();
+    assert_eq!(streams.len(), 2);
+    assert!(streams.iter().all(|stream| stream.paused));
+    assert_eq!(streams[1].output, "DP-2");
+    let none = crate::cli::PresentPlasmaArgs {
+        assignment: String::new(),
+        stream_size: None,
+        stream_fps: None,
+        stream_fd: None,
+        streams: Vec::new(),
+        paused: false,
+    };
+    assert!(super::plasma_streams(&none).is_err());
 }
 
 #[test]
@@ -86,7 +217,8 @@ fn plasma_presentation_does_not_require_a_second_wayland_surface() {
     });
     let assignment = Assignment::new(vec!["DP-1".into()], Source::static_file("/wall/a.png"));
     let command =
-        super::plasma_command(&backends, &assignment, "1920x1080", 60, 3, false, true).unwrap();
+        super::plasma_command(&backends, &assignment, &[stream(3, "1920x1080", 60, false)], true)
+            .unwrap();
     assert_eq!(command.get_program(), still);
 }
 
@@ -115,7 +247,8 @@ fn plasma_transition_is_a_one_shot_paper_prelude() {
     assert!(arguments.contains(&"--stream-no-header".to_string()));
 
     let steady =
-        super::plasma_command(&backends, &assignment, "1920x1080", 60, 3, false, false).unwrap();
+        super::plasma_command(&backends, &assignment, &[stream(3, "1920x1080", 60, false)], false)
+            .unwrap();
     let (_, arguments) = command_parts(&steady);
     assert!(arguments.contains(&"--stream-no-header".to_string()));
     assert!(!arguments.contains(&"--transition-from".to_string()));

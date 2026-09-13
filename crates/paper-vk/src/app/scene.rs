@@ -4257,16 +4257,22 @@ pub(super) fn dump_scene(
 pub(super) fn stream_scene(
     dir: &str,
     properties: &paper_scene::model::Properties,
-    width: u32,
-    height: u32,
-    fps: u32,
-    socket: RawFd,
+    targets: Vec<crate::preview::StreamTarget>,
     mute: bool,
     volume: u32,
-    paused: bool,
 ) -> Result<()> {
-    let (width, height) = (width.max(16), height.max(16));
-    let fps = fps.clamp(1, 144);
+    let mut targets: Vec<crate::preview::StreamTarget> = targets
+        .into_iter()
+        .map(|target| crate::preview::StreamTarget {
+            width: target.width.max(16),
+            height: target.height.max(16),
+            ..target
+        })
+        .collect();
+    anyhow::ensure!(!targets.is_empty(), "scene stream needs at least one target");
+    let sizes: Vec<(u32, u32)> =
+        targets.iter().map(|target| (target.width, target.height)).collect();
+    let fps = crate::preview::pacing_fps(&targets).min(144);
     let pkg_path = locate_pkg(dir)?;
     let pkg = paper_scene::pkg::Package::open(&pkg_path)?;
     let strict = strict_scene_startup();
@@ -4287,33 +4293,40 @@ pub(super) fn stream_scene(
         ));
     }
     let sd = shared::create(std::ptr::null_mut()).context("scene stream shared device")?;
-    let mut group = build_group(&sd, &mut model, strict, &[(width, height)], fill_mode())?;
+    let mut group = build_group(&sd, &mut model, strict, &sizes, fill_mode())?;
     drop(model);
-    let mut presenter = build_stream_presenter(&sd, width, height)?;
-    for (slot, export) in presenter.exports.iter().enumerate() {
-        let init = crate::preview::packet(
-            4,
-            slot as u8,
-            width,
-            height,
-            export.stride,
-            export.offset,
-            export.allocation_size,
-        );
-        crate::preview::send_packet(socket, &init, Some(export.fd))
-            .context("send scene stream slot")?;
-        crate::preview::send_packet(
-            socket,
-            &crate::preview::packet(5, slot as u8, 0, 0, 0, 0, 0),
-            Some(presenter.stream_semaphores[slot].fd),
-        )
-        .context("send scene stream semaphore")?;
+    let mut presenters = targets
+        .iter()
+        .map(|target| build_stream_presenter(&sd, target.width, target.height))
+        .collect::<Result<Vec<_>>>()?;
+    for (presenter, target) in presenters.iter().zip(&targets) {
+        for (slot, export) in presenter.exports.iter().enumerate() {
+            let init = crate::preview::packet(
+                4,
+                slot as u8,
+                target.width,
+                target.height,
+                export.stride,
+                export.offset,
+                export.allocation_size,
+            );
+            crate::preview::send_packet(target.socket, &init, Some(export.fd))
+                .context("send scene stream slot")?;
+            crate::preview::send_packet(
+                target.socket,
+                &crate::preview::packet(5, slot as u8, 0, 0, 0, 0, 0),
+                Some(presenter.stream_semaphores[slot].fd),
+            )
+            .context("send scene stream semaphore")?;
+        }
     }
+    let sockets: Vec<RawFd> = targets.iter().map(|target| target.socket).collect();
     let mut ctl = ctl::Ctl::start_opts(dir, mute, volume, false, true);
+    ctl.route_output_pauses();
     if let Some(audio) = &_scene_audio {
         ctl.set_scene_voices(audio.voices());
     }
-    ctl.set_paused(paused);
+    ctl.set_paused(targets.iter().all(|target| target.paused));
     let mut animated = group.animated();
     let frame_gap = Duration::from_secs_f64(1.0 / f64::from(fps));
     let mut epoch = Instant::now();
@@ -4325,11 +4338,14 @@ pub(super) fn stream_scene(
     let mut fade_ms = 0u64;
     let mut fade_first_frame = false;
     let mut trans_style = TransitionStyle::Fade;
-    let mut free = [true; 3];
+    let mut free = vec![[true; 3]; targets.len()];
+    let mut emitted = vec![false; targets.len()];
     loop {
-        while let Some(slot) = crate::preview::receive_ack(socket, false)? {
-            if let Some(value) = free.get_mut(slot) {
-                *value = true;
+        for (index, socket) in sockets.iter().enumerate() {
+            while let Some(slot) = crate::preview::receive_ack(*socket, false)? {
+                if let Some(value) = free[index].get_mut(slot) {
+                    *value = true;
+                }
             }
         }
         if let Some(req) = ctl.poll() {
@@ -4366,14 +4382,13 @@ pub(super) fn stream_scene(
                 signal_swap_failure(&req.to, &format!("{error:#}"));
                 continue;
             }
-            let next_group =
-                match build_group(&sd, &mut next, strict, &[(width, height)], fill_mode()) {
-                    Ok(group) => group,
-                    Err(error) => {
-                        signal_swap_failure(&req.to, &format!("{error:#}"));
-                        continue;
-                    }
-                };
+            let next_group = match build_group(&sd, &mut next, strict, &sizes, fill_mode()) {
+                Ok(group) => group,
+                Err(error) => {
+                    signal_swap_failure(&req.to, &format!("{error:#}"));
+                    continue;
+                }
+            };
             let mut old = std::mem::replace(&mut group, next_group);
             ctl.set_scene_voices(next_audio.as_ref().map(SceneAudio::voices).unwrap_or_default());
             _scene_audio = next_audio;
@@ -4401,6 +4416,11 @@ pub(super) fn stream_scene(
             last_frame = now;
             next_frame = now;
             presented = false;
+        }
+        let pauses = ctl.take_output_pauses();
+        if !pauses.is_empty() {
+            let all_paused = crate::preview::apply_output_pauses(&mut targets, pauses);
+            ctl.set_paused(all_paused);
         }
         if ctl.paused && presented {
             suspended_at.get_or_insert_with(Instant::now);
@@ -4446,13 +4466,8 @@ pub(super) fn stream_scene(
             }
             continue;
         }
-        while !free.iter().any(|value| *value) {
-            if let Some(slot) = crate::preview::receive_ack(socket, true)?
-                && let Some(value) = free.get_mut(slot)
-            {
-                *value = true;
-            }
-        }
+        let active: Vec<bool> = targets.iter().map(|target| !target.paused).collect();
+        crate::preview::wait_any_free(&sockets, &mut free, &active)?;
         let now = Instant::now();
         if now < next_frame {
             std::thread::sleep(next_frame - now);
@@ -4464,29 +4479,38 @@ pub(super) fn stream_scene(
             last_frame = now;
             group.compose(epoch.elapsed().as_secs_f32(), dt)?;
         }
-        let slot = free.iter().position(|value| *value).unwrap();
         let fade_step = scene_fade_step(
             fade_start.map(|started| started.elapsed().as_secs_f32() * 1000.0 / fade_ms as f32),
             fade_first_frame,
         );
-        if fade_step.render_transition {
-            presenter.fade(&group, slot, fade_step.mix, trans_style)?;
-        } else {
-            presenter.present(&group.target, slot)?;
+        for (index, target) in targets.iter().enumerate() {
+            if target.paused {
+                continue;
+            }
+            let Some(slot) = free[index].iter().position(|value| *value) else {
+                continue;
+            };
+            let presenter = &mut presenters[index];
+            if fade_step.render_transition {
+                presenter.fade(&group, slot, fade_step.mix, trans_style)?;
+            } else {
+                presenter.present(&group.target, slot)?;
+            }
+            presenter.wait_render()?;
+            presenter.renderer.signal_external_semaphore(&presenter.stream_semaphores[slot])?;
+            crate::preview::send_packet(
+                target.socket,
+                &crate::preview::packet(2, slot as u8, 0, 0, 0, 0, 0),
+                None,
+            )
+            .context("send scene stream frame")?;
+            free[index][slot] = false;
+            if !emitted[index] {
+                paper_runtime::plasma::frame_ready_on(target.socket)?;
+                emitted[index] = true;
+            }
+            presented = true;
         }
-        presenter.wait_render()?;
-        presenter.renderer.signal_external_semaphore(&presenter.stream_semaphores[slot])?;
-        crate::preview::send_packet(
-            socket,
-            &crate::preview::packet(2, slot as u8, 0, 0, 0, 0, 0),
-            None,
-        )
-        .context("send scene stream frame")?;
-        free[slot] = false;
-        if !presented {
-            paper_runtime::plasma::frame_ready()?;
-        }
-        presented = true;
         if fade_first_frame {
             fade_first_frame = false;
         }

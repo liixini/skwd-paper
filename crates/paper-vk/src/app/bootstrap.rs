@@ -23,6 +23,38 @@ fn parse_flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|arg| arg == name).and_then(|idx| args.get(idx + 1)).map(String::as_str)
 }
 
+fn parse_flags<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
+    args.windows(2).filter(|pair| pair[0] == name).map(|pair| pair[1].as_str()).collect()
+}
+
+#[cfg(feature = "shared-device")]
+pub(super) fn stream_targets(args: &[String], paused: bool) -> Vec<crate::preview::StreamTarget> {
+    let sizes = parse_flags(args, "--stream-size");
+    let rates = parse_flags(args, "--stream-fps");
+    let outputs = parse_flags(args, "--stream-output");
+    let paused_outputs = parse_flags(args, "--stream-paused");
+    parse_flags(args, "--stream-fd")
+        .iter()
+        .enumerate()
+        .filter_map(|(index, fd)| {
+            let socket = fd.parse().ok()?;
+            let size = sizes.get(index).or(sizes.first()).copied();
+            let (width, height) = crate::preview::parse_size(size);
+            let fps =
+                rates.get(index).or(rates.first()).and_then(|text| text.parse().ok()).unwrap_or(30);
+            let output = outputs.get(index).copied().unwrap_or_default().to_string();
+            Some(crate::preview::StreamTarget {
+                socket,
+                width,
+                height,
+                fps,
+                paused: paused || (!output.is_empty() && paused_outputs.contains(&output.as_str())),
+                output,
+            })
+        })
+        .collect()
+}
+
 fn parse_idle_secs(value: Option<&str>) -> u32 {
     value.and_then(|text| text.parse::<u32>().ok()).unwrap_or(0)
 }
@@ -108,7 +140,6 @@ pub(crate) fn run() -> Result<()> {
             .unwrap_or_default();
         let fps =
             parse_flag(&args[3..], "--stream-fps").and_then(|text| text.parse().ok()).unwrap_or(30);
-        let stream_fd = parse_flag(&args[3..], "--stream-fd").and_then(|text| text.parse().ok());
         let transition_from = parse_flag(&args[3..], "--transition-from");
         let shader = parse_flag(&args[3..], "--shader").unwrap_or("fade");
         let duration_ms = parse_flag(&args[3..], "--duration-ms")
@@ -123,40 +154,27 @@ pub(crate) fn run() -> Result<()> {
         let write_header = !args[3..].iter().any(|arg| arg == "--stream-no-header");
         set_fill_mode(fill);
         let (width, height) = crate::preview::parse_size(parse_flag(&args[3..], "--stream-size"));
+        let targets = stream_targets(&args[3..], paused);
         if args[3..].iter().any(|arg| arg == "--scene") {
-            let stream_fd = stream_fd.context("scene stream requires --stream-fd")?;
+            anyhow::ensure!(!targets.is_empty(), "scene stream requires --stream-fd");
             let properties = parse_flag(&args[3..], "--scene-properties")
                 .map(super::scene::parse_scene_properties)
                 .unwrap_or_default();
-            return super::scene::stream_scene(
-                &args[2],
-                &properties,
-                width,
-                height,
-                fps,
-                stream_fd,
-                mute,
-                volume,
-                paused,
-            );
+            return super::scene::stream_scene(&args[2], &properties, targets, mute, volume);
         }
-        return if let Some(stream_fd) = stream_fd {
+        return if targets.is_empty() {
+            crate::preview::video_stream(&args[2], width, height, fps, write_header)
+        } else {
             crate::preview::dmabuf_video_stream(
                 &args[2],
-                width,
-                height,
-                fps,
-                stream_fd,
+                targets,
                 transition_from,
                 shader,
                 duration_ms,
                 mute,
                 volume,
-                paused,
                 write_header,
             )
-        } else {
-            crate::preview::video_stream(&args[2], width, height, fps, write_header)
         };
     }
     #[cfg(feature = "shared-device")]

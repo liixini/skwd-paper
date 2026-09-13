@@ -382,50 +382,143 @@ impl BackendPaths {
     }
 }
 
-pub(crate) fn present_plasma(
-    assignment: &Assignment,
-    stream_size: &str,
-    stream_fps: u32,
-    stream_fd: i32,
-    paused: bool,
-) -> Result<()> {
-    let backends = BackendPaths::discover();
-    let gpu_stream = std::env::var("SKWD_PAPER_PLASMA_GPU_STREAM").as_deref() == Ok("1");
-    let transition = plasma_transition_command(&backends, assignment, stream_size, stream_fps)
-        .inspect_err(|error| tracing::warn!(%error, "Plasma transition prelude unavailable"))
-        .ok()
-        .flatten();
-    let prefaced = if let Some(mut transition) = transition {
-        if gpu_stream {
-            paper_runtime::plasma::begin_stream(stream_fd, 1)?;
-            transition.arg("--stream-fd").arg(stream_fd.to_string());
-            transition.env("SKWD_PAPER_STREAM_EPOCH", "1");
-        } else {
-            write_stream_header(stream_size)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlasmaStream {
+    pub(crate) fd: i32,
+    pub(crate) frame_fd: i32,
+    pub(crate) size: String,
+    pub(crate) fps: u32,
+    pub(crate) output: String,
+    pub(crate) paused: bool,
+}
+
+pub(crate) fn parse_plasma_stream(spec: &str, paused: bool) -> Result<PlasmaStream> {
+    let mut stream = PlasmaStream {
+        fd: -1,
+        frame_fd: -1,
+        size: String::new(),
+        fps: 30,
+        output: String::new(),
+        paused,
+    };
+    for item in spec.split(',').filter(|item| !item.is_empty()) {
+        let (key, value) =
+            item.split_once('=').ok_or_else(|| anyhow!("stream field {item} needs key=value"))?;
+        match key {
+            "fd" => stream.fd = value.parse().with_context(|| format!("stream fd {value}"))?,
+            "frame_fd" => {
+                stream.frame_fd =
+                    value.parse().with_context(|| format!("stream frame fd {value}"))?;
+            }
+            "size" => stream.size = value.to_string(),
+            "fps" => stream.fps = value.parse().with_context(|| format!("stream fps {value}"))?,
+            "output" => stream.output = value.to_string(),
+            "paused" => stream.paused = paused || matches!(value, "1" | "true"),
+            other => anyhow::bail!("unknown stream field {other}"),
         }
-        match transition.status() {
-            Ok(status) if status.success() => {}
-            Ok(status) => tracing::warn!(%status, "Plasma transition prelude exited early"),
+    }
+    anyhow::ensure!(stream.fd >= 0, "stream {spec} needs fd=N");
+    anyhow::ensure!(stream.size.contains('x'), "stream {spec} needs size=WxH");
+    Ok(stream)
+}
+
+pub(crate) fn plasma_streams(args: &crate::cli::PresentPlasmaArgs) -> Result<Vec<PlasmaStream>> {
+    let mut streams = Vec::new();
+    if let (Some(size), Some(fps)) = (&args.stream_size, args.stream_fps) {
+        streams.push(PlasmaStream {
+            fd: args.stream_fd.unwrap_or(-1),
+            frame_fd: -1,
+            size: size.clone(),
+            fps,
+            output: String::new(),
+            paused: args.paused,
+        });
+    }
+    for spec in &args.streams {
+        streams.push(parse_plasma_stream(spec, args.paused)?);
+    }
+    anyhow::ensure!(
+        !streams.is_empty(),
+        "present-plasma needs --stream or --stream-size/--stream-fps/--stream-fd"
+    );
+    anyhow::ensure!(
+        streams.len() == 1 || streams.iter().all(|stream| stream.fd >= 0),
+        "shared Plasma streams each need a frame socket"
+    );
+    Ok(streams)
+}
+
+fn stream_fd_list(streams: &[PlasmaStream]) -> String {
+    streams
+        .iter()
+        .filter(|stream| stream.fd >= 0)
+        .map(|stream| stream.fd.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub(crate) fn present_plasma(assignment: &Assignment, streams: &[PlasmaStream]) -> Result<()> {
+    let backends = BackendPaths::discover();
+    let still = assignment.source.kind == SourceKind::Static;
+    let gpu_stream = !still && std::env::var("SKWD_PAPER_PLASMA_GPU_STREAM").as_deref() == Ok("1");
+    if streams.len() > 1 {
+        if still {
+            anyhow::ensure!(
+                streams.iter().all(|stream| stream.frame_fd >= 0),
+                "shared still streams each need a frame pipe"
+            );
+        } else {
+            anyhow::ensure!(gpu_stream, "a shared Plasma presenter needs the GPU frame stream");
+            anyhow::ensure!(
+                assignment.source.effective_video_engine() != Some(VideoEngine::Tinier),
+                "tinier videos present one Plasma stream per process"
+            );
+        }
+    }
+    let mut preludes = Vec::new();
+    for stream in streams {
+        let transition = plasma_transition_command(&backends, assignment, &stream.size, stream.fps)
+            .inspect_err(|error| tracing::warn!(%error, "Plasma transition prelude unavailable"))
+            .ok()
+            .flatten();
+        let Some(mut transition) = transition else { continue };
+        if gpu_stream {
+            paper_runtime::plasma::begin_stream(stream.fd, 1)?;
+            transition.arg("--stream-fd").arg(stream.fd.to_string());
+            transition.env("SKWD_PAPER_STREAM_EPOCH", "1");
+        } else if stream.frame_fd >= 0 {
+            write_stream_header_to(
+                &mut paper_runtime::plasma::frame_pipe(stream.frame_fd)?,
+                &stream.size,
+            )?;
+            transition.stdout(Stdio::from(paper_runtime::plasma::frame_pipe(stream.frame_fd)?));
+        } else {
+            write_stream_header(&stream.size)?;
+        }
+        match transition.spawn() {
+            Ok(child) => preludes.push(child),
             Err(error) => tracing::warn!(%error, "Plasma transition prelude failed to start"),
         }
-        true
-    } else {
-        false
-    };
-    let mut command = plasma_command(
-        &backends,
-        assignment,
-        stream_size,
-        stream_fps,
-        stream_fd,
-        paused,
-        !prefaced || gpu_stream,
-    )?;
+    }
+    let prefaced = !preludes.is_empty();
+    for mut child in preludes {
+        match child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => tracing::warn!(%status, "Plasma transition prelude exited early"),
+            Err(error) => tracing::warn!(%error, "Plasma transition prelude did not finish"),
+        }
+    }
+    let mut command = plasma_command(&backends, assignment, streams, !prefaced || gpu_stream)?;
     if gpu_stream {
-        paper_runtime::plasma::begin_stream(stream_fd, 2)?;
+        for stream in streams {
+            paper_runtime::plasma::begin_stream(stream.fd, 2)?;
+        }
         command.env("SKWD_PAPER_STREAM_EPOCH", "2");
     }
-    command.env("SKWD_PAPER_PLASMA_FD", stream_fd.to_string());
+    if still {
+        command.env("SKWD_PAPER_PLASMA_GPU_STREAM", "0");
+    }
+    command.env("SKWD_PAPER_PLASMA_FD", stream_fd_list(streams));
     let executable = command.get_program().to_string_lossy().into_owned();
     let error = command.exec();
     Err(error).with_context(|| format!("start Plasma presenter {executable}"))
@@ -434,13 +527,12 @@ pub(crate) fn present_plasma(
 fn plasma_command(
     backends: &BackendPaths,
     assignment: &Assignment,
-    stream_size: &str,
-    stream_fps: u32,
-    stream_fd: i32,
-    paused: bool,
+    streams: &[PlasmaStream],
     write_header: bool,
 ) -> Result<StdCommand> {
     let source = &assignment.source;
+    let first = streams.first().ok_or_else(|| anyhow!("Plasma presenter needs a stream"))?;
+    let all_paused = streams.iter().all(|stream| stream.paused);
     let (executable, uses_vk) = match source.kind {
         SourceKind::Static => {
             (backends.still.require_headless("Plasma static image presentation")?, false)
@@ -456,13 +548,14 @@ fn plasma_command(
     let mut command = StdCommand::new(executable);
     match source.kind {
         SourceKind::Static => {
-            command
-                .arg("*")
-                .arg(&source.path)
-                .arg("--frame-stream")
-                .arg(stream_size)
-                .arg("--fill-mode")
-                .arg(assignment.fill_mode.as_str());
+            command.arg("*").arg(&source.path);
+            for stream in streams {
+                command.arg("--frame-stream").arg(&stream.size);
+                if stream.frame_fd >= 0 {
+                    command.arg("--frame-fd").arg(stream.frame_fd.to_string());
+                }
+            }
+            command.arg("--fill-mode").arg(assignment.fill_mode.as_str());
             if !write_header {
                 command.arg("--stream-no-header");
             }
@@ -474,10 +567,10 @@ fn plasma_command(
                 .ok_or_else(|| anyhow!("tinier video source has no frame rate"))?;
             command
                 .arg("--frame-stream")
-                .arg(stream_size)
+                .arg(&first.size)
                 .arg("--fill-mode")
                 .arg(assignment.fill_mode.as_str());
-            if paused {
+            if all_paused {
                 command.arg("--paused");
             }
             if !write_header {
@@ -501,23 +594,34 @@ fn plasma_command(
         },
     }
     if uses_vk {
+        let gpu_stream = std::env::var("SKWD_PAPER_PLASMA_GPU_STREAM").as_deref() != Ok("0");
+        if !gpu_stream && command.get_args().any(|arg| arg == "--scene") {
+            anyhow::bail!("Plasma graphics backend cannot import GPU scene frames");
+        }
+        for stream in streams {
+            command
+                .arg("--stream-size")
+                .arg(&stream.size)
+                .arg("--stream-fps")
+                .arg(stream.fps.clamp(1, 240).to_string());
+            if gpu_stream {
+                command.arg("--stream-fd").arg(stream.fd.to_string());
+            }
+            if !stream.output.is_empty() {
+                command.arg("--stream-output").arg(&stream.output);
+                if stream.paused && !all_paused {
+                    command.arg("--stream-paused").arg(&stream.output);
+                }
+            }
+        }
         command
-            .arg("--stream-size")
-            .arg(stream_size)
-            .arg("--stream-fps")
-            .arg(stream_fps.clamp(1, 240).to_string())
             .arg("--fill-mode")
             .arg(assignment.fill_mode.as_str())
             .arg("--mute")
             .arg(assignment.mute.to_string())
             .arg("--volume")
             .arg(assignment.volume.min(100).to_string());
-        if std::env::var("SKWD_PAPER_PLASMA_GPU_STREAM").as_deref() != Ok("0") {
-            command.arg("--stream-fd").arg(stream_fd.to_string());
-        } else if command.get_args().any(|arg| arg == "--scene") {
-            anyhow::bail!("Plasma graphics backend cannot import GPU scene frames");
-        }
-        if paused {
+        if all_paused {
             command.arg("--paused");
         }
         if !write_header {
@@ -571,11 +675,14 @@ fn transition_media(path: &str) -> Result<String> {
 }
 
 fn write_stream_header(size: &str) -> Result<()> {
+    write_stream_header_to(&mut std::io::stdout().lock(), size)
+}
+
+fn write_stream_header_to(output: &mut dyn Write, size: &str) -> Result<()> {
     let (width, height) = size
         .split_once('x')
         .and_then(|(width, height)| Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?)))
         .ok_or_else(|| anyhow!("Plasma stream size must be WIDTHxHEIGHT"))?;
-    let mut output = std::io::stdout().lock();
     output.write_all(b"SKWP")?;
     output.write_all(&width.to_le_bytes())?;
     output.write_all(&height.to_le_bytes())?;

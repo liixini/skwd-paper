@@ -73,9 +73,10 @@ fn plasma_vk_stream_falls_back_when_external_export_is_unavailable() {
     let fallback = source
         .find("external stream unavailable, using CPU frames")
         .expect("external stream fallback warning");
-    assert!(
-        source[fallback..].contains("return video_stream(path, width, height, fps, write_header);")
-    );
+    assert!(source[fallback..].contains(
+        "return video_stream(path, target.width, target.height, target.fps, write_header);"
+    ));
+    assert!(source[..fallback].contains("Err(error) if single =>"));
     let control = source[fallback..].find("Ctl::start").expect("stream control after fallback");
     assert!(control > 0);
 }
