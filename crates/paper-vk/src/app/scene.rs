@@ -1,3 +1,4 @@
+mod media;
 mod mouse;
 mod script;
 mod video;
@@ -88,17 +89,24 @@ struct LayerAnimation {
     quad: usize,
     frames: Vec<paper_scene::model::SpriteFrame>,
     total: f32,
+    pages: Vec<usize>,
+    slot: usize,
+    image: i32,
 }
 
-fn frame_uv(frames: &[paper_scene::model::SpriteFrame], total: f32, time: f32) -> [f32; 4] {
+fn animation_frame(
+    frames: &[paper_scene::model::SpriteFrame],
+    total: f32,
+    time: f32,
+) -> &paper_scene::model::SpriteFrame {
     let mut cursor = if total > 0.0 { time.rem_euclid(total) } else { 0.0 };
     for frame in frames {
         if cursor < frame.time {
-            return frame.uv;
+            return frame;
         }
         cursor -= frame.time;
     }
-    frames.last().map_or([0.0, 0.0, 1.0, 1.0], |frame| frame.uv)
+    frames.last().expect("animation has frames")
 }
 
 struct PuppetGroup {
@@ -390,6 +398,7 @@ impl TextureKey {
 
 struct TextureInterner<'a> {
     device: &'a shared::SharedDevice,
+    media_slots: HashMap<paper_scene::model::MediaTexture, usize>,
     videos: Vec<video::VideoTexture>,
     video_slots: HashMap<(std::sync::Arc<[u8]>, bool, bool), usize>,
     slots: HashMap<TextureKey, usize>,
@@ -426,6 +435,20 @@ impl TextureInterner<'_> {
         textures: &mut Vec<vk::SceneTexture>,
         texture: &mut paper_scene::model::Texture,
     ) -> Result<usize> {
+        if let Some(kind) = texture.system_texture {
+            if let Some(slot) = self.media_slots.get(&kind) {
+                return Ok(*slot);
+            }
+            let slot = textures.len();
+            textures.push(renderer.create_scene_texture_pixels(
+                &texture.pixels,
+                true,
+                false,
+                false,
+            )?);
+            self.media_slots.insert(kind, slot);
+            return Ok(slot);
+        }
         if let Some(payload) = &texture.video {
             let key = (payload.clone(), texture.clamp, texture.nearest);
             if let Some(&slot) = self.video_slots.get(&key) {
@@ -589,6 +612,12 @@ fn layer_model_matrix(layer: &paper_scene::model::Layer, canvas: (f32, f32)) -> 
     (model, inverse)
 }
 
+fn layer_projection_inverse(inverse: &Mat4, canvas: (f32, f32)) -> Mat4 {
+    let (w, h) = (canvas.0 * 0.5, canvas.1 * 0.5);
+    let projection = [w, 0.0, 0.0, 0.0, 0.0, h, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, w, h, 0.0, 1.0];
+    mat4_mul(inverse, &projection)
+}
+
 fn layer_uniforms(
     layer: &paper_scene::model::Layer,
     canvas: (f32, f32),
@@ -599,6 +628,10 @@ fn layer_uniforms(
         ("g_LayerModelMatrix".to_string(), matrix.to_vec()),
         ("g_ModelMatrix".to_string(), matrix.to_vec()),
         ("g_ModelMatrixInverse".to_string(), inverse.to_vec()),
+        (
+            "g_ModelViewProjectionMatrixInverse".to_string(),
+            layer_projection_inverse(&inverse, canvas).to_vec(),
+        ),
         ("g_LightAmbientColor".to_string(), lights.0.to_vec()),
         ("g_LightSkylightColor".to_string(), lights.1.to_vec()),
     ])
@@ -775,6 +808,9 @@ enum TransitionStyle {
 
 struct Group {
     scripts: Option<script::Scripts>,
+    media: Option<media::Media>,
+    media_slots: HashMap<paper_scene::model::MediaTexture, usize>,
+    media_art: Option<paper_scene::tex::Pixels>,
     renderer: vk::Renderer,
     target: vk::SceneTarget,
     scene_snapshot: Option<vk::SceneTarget>,
@@ -1129,8 +1165,18 @@ impl Group {
     }
 
     fn advance_layer_animations(&mut self, time: f32) {
-        for animation in &self.animations {
-            let uv = frame_uv(&animation.frames, animation.total, time);
+        for animation in &mut self.animations {
+            let frame = animation_frame(&animation.frames, animation.total, time);
+            let uv = frame.uv;
+            if frame.image != animation.image {
+                let page = &self.textures[animation.pages[frame.image as usize]];
+                let (view, sampler) = (page.view, page.sampler);
+                let slot = &mut self.textures[animation.slot];
+                slot.view = view;
+                slot.sampler = sampler;
+                self.renderer.point_slot_at(slot, view);
+                animation.image = frame.image;
+            }
             match self.fx.iter_mut().find(|fx| fx.quad == animation.quad) {
                 Some(fx) if !fx.passthrough => fx.base_quad.uv = uv,
                 Some(_) => {}
@@ -1468,6 +1514,7 @@ impl Group {
         self.advance_layer_animations(time);
         self.advance_live_text(time)?;
         self.advance_audio(dt);
+        self.advance_media()?;
         self.advance_scripts(time, dt)?;
         self.advance_mouse(dt);
         let debug_fx = std::env::var("SKWD_VK_FX_DEBUG").is_ok();
@@ -2001,6 +2048,8 @@ impl Group {
     }
 
     fn release_composition_inputs(&mut self) {
+        self.media.take();
+        self.media_art.take();
         for fx in std::mem::take(&mut self.fx) {
             self.destroy_layer_fx(fx);
         }
@@ -2495,6 +2544,7 @@ fn build_group(
     outputs: &[(u32, u32)],
     mode: FillMode,
 ) -> Result<Group> {
+    let _compilation = paper_scene::shader::CompilationSession::new()?;
     let scripted = model.scripts.is_some();
     let dimensions = scene_dimensions(model, outputs, mode);
     let (canvas_w, canvas_h) = dimensions.raster;
@@ -2527,13 +2577,23 @@ fn build_group(
         .flat_map(|layer| &layer.effects)
         .map(|effect| effect.fbos.len())
         .sum();
-    let sets =
-        model.layers.len() + fx_layers * 4 + fx_textures + fx_fbos + model.particles.len() + 16;
+    let sets = model.layers.len()
+        + model
+            .layers
+            .iter()
+            .map(|layer| layer.texture.pages.len() + usize::from(!layer.texture.pages.is_empty()))
+            .sum::<usize>()
+        + fx_layers * 4
+        + fx_textures
+        + fx_fbos
+        + model.particles.len()
+        + 16;
     renderer.ensure_scene_pool(sets.max(1) as u32)?;
     let target = renderer.create_scene_target(canvas_w, canvas_h).context("scene target")?;
     let mut textures = Vec::with_capacity(model.layers.len());
     let mut texture_interner = TextureInterner {
         device: sd,
+        media_slots: HashMap::new(),
         videos: Vec::new(),
         video_slots: HashMap::new(),
         slots: HashMap::new(),
@@ -2541,6 +2601,7 @@ fn build_group(
         reused_bytes: 0,
     };
     let mut layer_slots = Vec::with_capacity(model.layers.len());
+    let mut layer_pages = HashMap::new();
     let mut hidden_target_texture = None;
     for layer in &mut model.layers {
         if !layer.visible && !scripted {
@@ -2563,11 +2624,29 @@ fn build_group(
             textures.push(texture);
             continue;
         }
-        layer_slots.push(
-            texture_interner
-                .intern_texture(&mut renderer, &mut textures, &mut layer.texture)
-                .with_context(|| format!("texture for layer {}", layer.name))?,
-        );
+        let base = texture_interner
+            .intern_texture(&mut renderer, &mut textures, &mut layer.texture)
+            .with_context(|| format!("texture for layer {}", layer.name))?;
+        if layer.texture.pages.is_empty() {
+            layer_slots.push(base);
+        } else {
+            let mut pages = vec![base];
+            for pixels in std::mem::take(&mut layer.texture.pages) {
+                let key = TextureKey {
+                    pixels,
+                    clamp: layer.texture.clamp,
+                    nearest: layer.texture.nearest,
+                };
+                pages.push(texture_interner.intern_rgba(&mut renderer, &mut textures, key)?);
+            }
+            let mut slot = renderer.create_view_slot()?;
+            slot.view = textures[base].view;
+            slot.sampler = textures[base].sampler;
+            renderer.point_slot_at(&slot, slot.view);
+            layer_pages.insert(layer_slots.len(), pages);
+            layer_slots.push(textures.len());
+            textures.push(slot);
+        }
     }
     let puppets =
         create_puppets(&mut renderer, model, &mut layer_slots, &mut textures, dimensions)?;
@@ -2579,7 +2658,14 @@ fn build_group(
         .filter_map(|(index, layer)| {
             let frames = layer.texture.atlas_frames()?.to_vec();
             let total = frames.iter().map(|frame| frame.time).sum();
-            Some(LayerAnimation { quad: index, frames, total })
+            Some(LayerAnimation {
+                quad: index,
+                frames,
+                total,
+                pages: layer_pages.remove(&index).unwrap_or_else(|| vec![layer_slots[index]]),
+                slot: layer_slots[index],
+                image: -1,
+            })
         })
         .collect();
     for animation in &animations {
@@ -2865,10 +2951,12 @@ fn build_group(
         let slot_texture = renderer.create_view_slot()?;
         let slot = textures.len();
         textures.push(slot_texture);
-        let source_dynamic = scripted
+        let source_dynamic = layer.texture.system_texture.is_some()
+            || scripted
             || layer.texture.video.is_some()
             || inputs.iter().flatten().any(|slot| {
                 texture_interner.video_slots.values().any(|video_slot| video_slot == slot)
+                    || texture_interner.media_slots.values().any(|media_slot| media_slot == slot)
             })
             || atlas.is_some()
             || puppets.iter().any(|puppet| puppet.layer == index && puppet.animated());
@@ -3088,6 +3176,7 @@ fn build_group(
     let uploaded_payload_bytes =
         texture_interner.slots.keys().map(|key| key.pixels.bytes()).sum::<usize>();
     let videos = std::mem::take(&mut texture_interner.videos);
+    let media_slots = std::mem::take(&mut texture_interner.media_slots);
     drop(texture_interner);
     let unused_payload_bytes = release_model_texture_payloads(model);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -3157,9 +3246,20 @@ fn build_group(
         }
     }
 
+    let media =
+        if !media_slots.is_empty() || model.scripts.as_ref().is_some_and(|s| s.needs_media()) {
+            media::Media::start()
+                .map_err(|e| tracing::warn!("media integration unavailable: {e:#}"))
+                .ok()
+        } else {
+            None
+        };
     let scripts = script::Scripts::take(model, &layer_slots);
     let mut group = Group {
         scripts,
+        media,
+        media_slots,
+        media_art: None,
         renderer,
         target,
         scene_snapshot: None,
@@ -3212,7 +3312,8 @@ fn build_group(
     let was_animated = group.animated()
         || !group.live_text.is_empty()
         || group.mouse.enabled
-        || group.scripts.is_some();
+        || group.scripts.is_some()
+        || group.media.is_some();
     let memory = if was_animated {
         group.bake_static_effects()?
     } else {
@@ -3621,8 +3722,15 @@ pub(super) fn run_scene(
     let pkg = paper_scene::pkg::Package::open(&pkg_path)?;
     let strict = strict_scene_startup();
     validate_native_compatibility(&pkg, strict)?;
-    let mut model =
-        paper_scene::model::load_from_dir_with(&pkg, std::path::Path::new(dir), properties)?;
+    let mut model = paper_scene::model::load_from_dir_with_storage(
+        &pkg,
+        std::path::Path::new(dir),
+        properties,
+        paper_scene::script::Storage::open(
+            std::path::Path::new(dir),
+            &target.app.surfaces.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(","),
+        ),
+    )?;
     let mut scene_audio = extract_scene_audio(&pkg, properties);
     drop(pkg);
     let particles_disabled = std::env::var("SKWD_PAPER_WE_DISABLE_PARTICLES").as_deref() == Ok("1");
@@ -3856,10 +3964,20 @@ pub(super) fn run_scene(
             let loaded = locate_pkg(&req.to)
                 .and_then(|path| paper_scene::pkg::Package::open(&path))
                 .and_then(|pkg| {
-                    let model = paper_scene::model::load_from_dir_with(
+                    let model = paper_scene::model::load_from_dir_with_storage(
                         &pkg,
                         std::path::Path::new(&req.to),
                         &next_properties,
+                        paper_scene::script::Storage::open(
+                            std::path::Path::new(&req.to),
+                            &target
+                                .app
+                                .surfaces
+                                .iter()
+                                .map(|s| s.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        ),
                     )?;
                     Ok((model, extract_scene_audio(&pkg, &next_properties)))
                 });
@@ -4035,10 +4153,14 @@ pub(super) fn run_scene(
             && !render_pending.iter().any(|pending| *pending)
         {
             let elapsed = epoch.elapsed().as_secs_f32();
-            let wait = group.live_text_wait(elapsed);
+            let media_pending = group.media.as_ref().is_some_and(media::Media::has_pending);
+            let wait = if media_pending { Some(0.0) } else { group.live_text_wait(elapsed) };
             if wait.is_none_or(|seconds| seconds > 0.0) {
                 let seconds = wait.map_or(30.0, |seconds| seconds.clamp(0.0, 30.0));
-                target.dispatch_wait_events(Instant::now() + Duration::from_secs_f32(seconds))?;
+                target.dispatch_wait_events_with_fd(
+                    Instant::now() + Duration::from_secs_f32(seconds),
+                    group.media.as_ref().and_then(media::Media::wake_fd),
+                )?;
                 continue;
             }
             let now = Instant::now();
@@ -4449,10 +4571,21 @@ pub(super) fn stream_scene(
                 *fade += suspended;
             }
         }
-        if presented && !animated && fade_start.is_none() {
+        if presented
+            && !animated
+            && fade_start.is_none()
+            && !group.media.as_ref().is_some_and(media::Media::has_pending)
+        {
             if let Some(fd) = ctl.wake_fd() {
-                let mut event = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-                let result = unsafe { libc::poll(&raw mut event, 1, 30_000) };
+                let mut events = [
+                    libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
+                    libc::pollfd {
+                        fd: group.media.as_ref().and_then(media::Media::wake_fd).unwrap_or(-1),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let result = unsafe { libc::poll(events.as_mut_ptr(), 2, 30_000) };
                 if result < 0
                     && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
                 {

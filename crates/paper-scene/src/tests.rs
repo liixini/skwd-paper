@@ -919,7 +919,7 @@ fn conditional_symbol_defaults_ignore_trailing_comments() {
 }
 
 #[test]
-fn atlas_frames_require_one_unrotated_image_with_timing() {
+fn atlas_frames_require_valid_images_and_unrotated_frames_with_timing() {
     use crate::model::{SpriteFrame, Texture};
     let frame = |image, rotated, time| SpriteFrame { uv: [0.0; 4], rotated, time, image };
     let mut texture = model::solid_texture();
@@ -1340,7 +1340,7 @@ fn bloom_scenes_get_the_engine_bloom_chain_as_a_final_passthrough_layer() {
 }
 
 #[test]
-fn media_thumbnail_layers_are_hidden_without_playback() {
+fn media_thumbnail_layers_keep_transparent_slots_for_playback() {
     let mask = build_tex("TEXB0002", 9, 0, &[9u8; 16], false, None);
     let scene = br#"{"general":{"orthogonalprojection":{"width":1920,"height":1080}},"objects":[
         {"id":1,"name":"bg","image":"models/bg.json","origin":"960 540 0","size":"10 10"},
@@ -1354,12 +1354,10 @@ fn media_thumbnail_layers_are_hidden_without_playback() {
     let package = pkg::Package::parse(bytes).unwrap();
     let model =
         model::load_with(&package, &effects::Assets::discover(Some("/nonexistent"))).unwrap();
-    assert_eq!(model.layers.len(), 1);
-    assert!(
-        model.skipped.iter().any(|skip| skip.contains("media thumbnail")),
-        "{:?}",
-        model.skipped
-    );
+    assert_eq!(model.layers.len(), 2);
+    assert!(model.skipped.is_empty(), "{:?}", model.skipped);
+    assert_eq!(model.layers[1].texture.system_texture, Some(model::MediaTexture::Current));
+    assert_eq!(model.layers[1].texture.pixels.base_rgba().unwrap(), vec![0; 4]);
 }
 
 #[test]

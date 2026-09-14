@@ -461,10 +461,14 @@ fn rgba_len(width: u32, height: u32) -> Option<usize> {
 }
 
 pub fn take_pixels(tex: &mut Tex) -> Option<Pixels> {
+    take_image_pixels(tex, 0)
+}
+
+pub fn take_image_pixels(tex: &mut Tex, index: usize) -> Option<Pixels> {
     if tex.meta.flags & FLAG_IS_VIDEO != 0 {
         return None;
     }
-    let image = std::mem::take(tex.images.first_mut()?);
+    let image = std::mem::take(tex.images.get_mut(index)?);
     let base = image.first()?;
     if tex.meta.free_image_format.is_some_and(|format| format >= 0) {
         let (width, height, data) = decode_free_image(base)?;

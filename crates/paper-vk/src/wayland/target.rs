@@ -832,6 +832,14 @@ impl Target {
     }
 
     pub fn dispatch_wait_events(&mut self, deadline: std::time::Instant) -> Result<()> {
+        self.dispatch_wait_events_with_fd(deadline, None)
+    }
+
+    pub fn dispatch_wait_events_with_fd(
+        &mut self,
+        deadline: std::time::Instant,
+        wake_fd: Option<i32>,
+    ) -> Result<()> {
         loop {
             let dispatched = self.queue.dispatch_pending(&mut self.app)?;
             self.conn.flush()?;
@@ -856,13 +864,17 @@ impl Target {
                         events: libc::POLLIN,
                         revents: 0,
                     },
+                    libc::pollfd { fd: wake_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
                 ];
-                let nfds = if self.ctl_fd.is_some() { 2 } else { 1 };
+                let nfds = 3;
                 let nready = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout_ms.max(1)) };
                 if nready > 0 && pfds[0].revents & libc::POLLIN != 0 {
                     let _ = guard.read();
                 } else {
                     drop(guard);
+                }
+                if nready > 0 && pfds[2].revents != 0 {
+                    return Ok(());
                 }
                 if nready > 0 && pfds[1].revents & libc::POLLIN != 0 {
                     let mut buf = [0u8; 64];

@@ -64,3 +64,62 @@ fn parallax_is_off_unless_the_scene_enables_it_and_defaults_to_half_amount() {
     let object = json!({"id": 1, "origin": "600 400 0", "parallaxDepth": "1 1"});
     assert!((defaulted.offset(&object, &props).0 - 50.0).abs() < 1e-3);
 }
+
+#[test]
+fn animated_texture_retains_pages_and_uses_each_pages_dimensions() {
+    let mut bytes = b"TEXV0005\0TEXI0001\0".to_vec();
+    for value in [0i32, 4, 4, 2, 4, 2, 0] {
+        bytes.extend(value.to_le_bytes());
+    }
+    bytes.extend(b"TEXB0001\0");
+    bytes.extend(2i32.to_le_bytes());
+    for (width, height, color) in [(4i32, 2i32, [255u8, 0, 0, 255]), (2, 2, [0, 255, 0, 255])] {
+        for value in [1, width, height, width * height * 4] {
+            bytes.extend(value.to_le_bytes());
+        }
+        for _ in 0..width * height {
+            bytes.extend(color);
+        }
+    }
+    bytes.extend(b"TEXS0003\0");
+    for value in [2i32, 2, 2] {
+        bytes.extend(value.to_le_bytes());
+    }
+    for image in [0i32, 1] {
+        bytes.extend(image.to_le_bytes());
+        for value in [0.1f32, 0.0, 0.0, 2.0, 0.0, 0.0, 2.0] {
+            bytes.extend(value.to_le_bytes());
+        }
+    }
+    let texture = super::load_texture_bytes(&bytes).unwrap();
+    assert_eq!(texture.pages.len(), 1);
+    assert_eq!(texture.payload_bytes(), 48);
+    let frames = texture.atlas_frames().unwrap();
+    assert_eq!(frames[0].uv, [0.0, 0.0, 0.5, 1.0]);
+    assert_eq!(frames[1].uv, [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(frames[1].image, 1);
+    assert_eq!(texture.pages[0].base_rgba().unwrap(), [0, 255, 0, 255].repeat(4));
+}
+
+#[test]
+fn hidden_script_layer_preserves_effect_source_alpha() {
+    let mut scene = json!({"objects":[{"id":1,"visible":false},{"id":2,"parent":1,"color":"0.2 0.4 0.6","alpha":0.5}]});
+    let layout =
+        super::script::Layout { id: "2".into(), size: [64.0; 2], offset: [0.0; 2], text: false };
+    let frame = super::script::frames(
+        &scene,
+        std::slice::from_ref(&layout),
+        (64.0, 64.0),
+        &Properties::new(),
+    )
+    .remove(0)
+    .unwrap();
+    assert_eq!(frame.tint, [0.2, 0.4, 0.6, 0.0]);
+    assert_eq!(frame.source_tint, [0.2, 0.4, 0.6, 0.5]);
+    scene["objects"][0]["visible"] = json!(true);
+    let shown = super::script::frames(&scene, &[layout], (64.0, 64.0), &Properties::new())
+        .remove(0)
+        .unwrap();
+    assert_eq!(shown.tint, frame.source_tint);
+    assert_eq!(shown.source_tint, frame.source_tint);
+}

@@ -693,6 +693,14 @@ fn build_material(
                 names[slot] = Some(default.to_string());
             }
         }
+        let usertextures = overrides
+            .and_then(Value::as_array)
+            .and_then(|array| array.get(index))
+            .and_then(|v| v.get("usertextures"))
+            .and_then(Value::as_array);
+        if let Some(usertextures) = usertextures {
+            names.resize(names.len().max(usertextures.len()), None);
+        }
         let textures: Vec<Option<crate::model::Texture>> = names
             .iter()
             .enumerate()
@@ -700,7 +708,11 @@ fn build_material(
                 if slot == 0 {
                     return None;
                 }
-                texture_slot(pkg, assets, name.as_deref())
+                usertextures
+                    .and_then(|v| v.get(slot))
+                    .and_then(crate::model::MediaTexture::of)
+                    .map(crate::model::MediaTexture::texture)
+                    .or_else(|| texture_slot(pkg, assets, name.as_deref()))
             })
             .collect();
         for (slot, texture) in textures.iter().enumerate() {

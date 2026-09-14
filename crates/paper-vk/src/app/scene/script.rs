@@ -118,10 +118,14 @@ impl Group {
                     ("g_LayerModelMatrix", matrix),
                     ("g_ModelMatrix", matrix),
                     ("g_ModelMatrixInverse", inverse),
+                    (
+                        "g_ModelViewProjectionMatrixInverse",
+                        super::layer_projection_inverse(&inverse, self.canvas),
+                    ),
                 ] {
                     fx.uniforms.insert(name.into(), value.to_vec());
                 }
-                fx.base_quad.tint = state.tint;
+                fx.base_quad.tint = state.source_tint;
                 fx.fallback_tint = state.tint;
                 quad.tint = [1.0, 1.0, 1.0, f32::from(state.tint[3] > 0.0)];
                 let node = scripts.host.scene["objects"].as_array().and_then(|nodes| {

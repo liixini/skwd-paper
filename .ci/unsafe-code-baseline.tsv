@@ -22,6 +22,7 @@
 6	crates/paper-vk/src/app/dmabuf_helpers.rs
 4	crates/paper-vk/src/app/dmabuf_present.rs
 6	crates/paper-vk/src/app/scene.rs
+2	crates/paper-vk/src/app/scene/media.rs
 2	crates/paper-vk/src/app/shared_support.rs
 1	crates/paper-vk/src/app/shared_upload.rs
 31	crates/paper-vk/src/decode.rs
