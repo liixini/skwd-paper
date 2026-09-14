@@ -1434,6 +1434,17 @@ pub fn store_spirv(source: &str, tag: &str, words: &[u32]) {
     }
 }
 
+pub struct CompilationSession {
+    _compiler: shaderc::Compiler,
+}
+
+impl CompilationSession {
+    pub fn new() -> Result<Self> {
+        let compiler = shaderc::Compiler::new().map_err(|err| anyhow!("shaderc init: {err}"))?;
+        Ok(Self { _compiler: compiler })
+    }
+}
+
 pub fn compile(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>> {
     let tag = if stage == Stage::Vertex { "vert" } else { "frag" };
     if let Some(words) = cached_spirv(source, tag) {
@@ -1455,3 +1466,6 @@ pub fn compile(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>> {
     store_spirv(source, tag, &words);
     Ok(words)
 }
+
+#[cfg(test)]
+mod tests;

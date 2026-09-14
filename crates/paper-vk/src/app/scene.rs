@@ -2544,6 +2544,7 @@ fn build_group(
     outputs: &[(u32, u32)],
     mode: FillMode,
 ) -> Result<Group> {
+    let _compilation = paper_scene::shader::CompilationSession::new()?;
     let scripted = model.scripts.is_some();
     let dimensions = scene_dimensions(model, outputs, mode);
     let (canvas_w, canvas_h) = dimensions.raster;
