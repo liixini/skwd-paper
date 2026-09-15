@@ -177,6 +177,7 @@ pub struct ExportImage {
 
 pub struct ExternalSemaphore {
     pub semaphore: vk::Semaphore,
+    fence: vk::Fence,
     pub fd: std::os::fd::RawFd,
     device: ash::Device,
 }
@@ -184,6 +185,7 @@ pub struct ExternalSemaphore {
 impl Drop for ExternalSemaphore {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_fence(self.fence, None);
             self.device.destroy_semaphore(self.semaphore, None);
             if self.fd >= 0 {
                 let _ = libc::close(self.fd);
@@ -392,20 +394,32 @@ impl Renderer {
                     return Err(error).context("export semaphore fd");
                 }
             };
-            Ok(ExternalSemaphore { semaphore, fd, device: self.device.clone() })
+            let fence = match self.device.create_fence(&vk::FenceCreateInfo::default(), None) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    libc::close(fd);
+                    self.device.destroy_semaphore(semaphore, None);
+                    return Err(error).context("create external signal fence");
+                }
+            };
+            Ok(ExternalSemaphore { semaphore, fence, fd, device: self.device.clone() })
         }
     }
 
     #[cfg(feature = "shared-device")]
-    pub fn signal_external_semaphore(&self, semaphore: &ExternalSemaphore) -> Result<()> {
+    pub fn complete_external_signal(&self, semaphore: &ExternalSemaphore) -> Result<()> {
         unsafe {
             let semaphores = [semaphore.semaphore];
-            let _guard = self.queue_guard();
-            self.device.queue_submit(
-                self.queue,
-                &[vk::SubmitInfo::default().signal_semaphores(&semaphores)],
-                vk::Fence::null(),
-            )?;
+            self.device.reset_fences(&[semaphore.fence])?;
+            {
+                let _guard = self.queue_guard();
+                self.device.queue_submit(
+                    self.queue,
+                    &[vk::SubmitInfo::default().signal_semaphores(&semaphores)],
+                    semaphore.fence,
+                )?;
+            }
+            self.device.wait_for_fences(&[semaphore.fence], true, u64::MAX)?;
         }
         Ok(())
     }

@@ -112,7 +112,7 @@ pub(crate) fn stream(
         }
         renderer.wait_frame_complete()?;
         render_time += render_started.elapsed();
-        renderer.signal_external_semaphore(&semaphores[slot])?;
+        renderer.complete_external_signal(&semaphores[slot])?;
         send_packet(socket, &packet(2, slot as u8, 0, 0, 0, 0, 0), None)?;
         free[slot] = false;
         frames += 1;

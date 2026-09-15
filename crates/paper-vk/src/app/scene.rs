@@ -4630,7 +4630,7 @@ pub(super) fn stream_scene(
                 presenter.present(&group.target, slot)?;
             }
             presenter.wait_render()?;
-            presenter.renderer.signal_external_semaphore(&presenter.stream_semaphores[slot])?;
+            presenter.renderer.complete_external_signal(&presenter.stream_semaphores[slot])?;
             crate::preview::send_packet(
                 target.socket,
                 &crate::preview::packet(2, slot as u8, 0, 0, 0, 0, 0),

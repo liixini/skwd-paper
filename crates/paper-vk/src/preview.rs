@@ -543,7 +543,7 @@ impl Sink {
 
     fn publish(&mut self, slot: usize) -> Result<()> {
         self.renderer.wait_frame_complete()?;
-        self.renderer.signal_external_semaphore(&self.semaphores[slot])?;
+        self.renderer.complete_external_signal(&self.semaphores[slot])?;
         send_packet(self.target.socket, &packet(2, slot as u8, 0, 0, 0, 0, 0), None)
             .context("send dmabuf frame")?;
         self.free[slot] = false;
