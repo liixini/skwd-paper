@@ -10,6 +10,7 @@ mod we_source;
 fn main() {
     paper_log::init_tracing("skwd-paper");
     if let Err(error) = app::run() {
+        tracing::error!(error = format!("{error:#}"), "skwd-paper failed");
         eprintln!("skwd-paper: {error:#}");
         std::process::exit(1);
     }
