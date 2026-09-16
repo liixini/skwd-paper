@@ -12,6 +12,7 @@ pub struct SceneModel {
     pub scripts: Option<crate::script::SceneScripts>,
     pub canvas: (f32, f32),
     pub mouse: crate::mouse::Parallax,
+    pub shake: Option<crate::mouse::Shake>,
     pub camera_fov: f32,
     pub clear: [f32; 3],
     pub ambient: [f32; 3],
@@ -79,6 +80,48 @@ fn object_transform(object: &Value, props: &Properties) -> Transform {
         scale: vec3(object.get("scale"), props).map_or((1.0, 1.0), |(x, y, _)| (x, y)),
         angle: vec3(object.get("angles"), props).map_or(0.0, |(_, _, z)| z),
     }
+}
+
+fn aligned_center(
+    center: (f32, f32),
+    size: (f32, f32),
+    angle: f32,
+    alignment: Option<&str>,
+) -> (f32, f32) {
+    let Some(alignment) = alignment else {
+        return center;
+    };
+    let mut shift = (0.0, 0.0);
+    if alignment.contains("top") {
+        shift.1 += size.1 * 0.5;
+    } else if alignment.contains("bottom") {
+        shift.1 -= size.1 * 0.5;
+    }
+    if alignment.contains("left") {
+        shift.0 += size.0 * 0.5;
+    } else if alignment.contains("right") {
+        shift.0 -= size.0 * 0.5;
+    }
+    let (sin, cos) = angle.sin_cos();
+    (center.0 + shift.0 * cos - shift.1 * sin, center.1 + shift.0 * sin + shift.1 * cos)
+}
+
+fn auto_background(scene: &Value) -> Option<&Value> {
+    scene
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|object| object.get("image").and_then(Value::as_str).is_some())
+}
+
+fn auto_background_id(scene: &Value) -> Option<String> {
+    auto_background(scene)?.get("id").and_then(id_of)
+}
+
+fn auto_canvas(scene: &Value, props: &Properties) -> Option<(f32, f32)> {
+    let size = vec2_or(auto_background(scene)?.get("size"), props, (0.0, 0.0));
+    (size.0 >= 1.0 && size.1 >= 1.0).then_some((size.0, size.1))
 }
 
 fn compose(parent: Transform, child: Transform) -> Transform {
@@ -672,15 +715,18 @@ fn load_with_project(
         .find_json("scene.json")
         .map_err(|err| anyhow!("{err:#}"))?
         .ok_or_else(|| anyhow!("no scene.json"))?;
-    let scripts =
+    let mut scripts =
         crate::script::SceneScripts::load_with_storage(&mut scene, props, project, storage)?;
     let scripted = scripts.is_some();
     let general = scene.get("general");
     let ortho = general.and_then(|top| top.get("orthogonalprojection"));
-    let canvas = (
+    let declared = (
         number(ortho.and_then(|proj| proj.get("width")), props, 1920.0).max(1.0),
         number(ortho.and_then(|proj| proj.get("height")), props, 1080.0).max(1.0),
     );
+    let auto = truthy(ortho.and_then(|proj| proj.get("auto")), props, false);
+    let canvas = if auto { auto_canvas(&scene, props).unwrap_or(declared) } else { declared };
+    let background = auto.then(|| auto_background_id(&scene)).flatten();
     let clear = vec3(general.and_then(|top| top.get("clearcolor")), props)
         .map_or([0.0, 0.0, 0.0], |(r, g, b)| [r, g, b]);
     let ambient = vec3(general.and_then(|top| top.get("ambientcolor")), props)
@@ -901,6 +947,13 @@ fn load_with_project(
                 -transform.angle,
             )
         };
+        let center = if util.fullscreen {
+            center
+        } else if background.as_deref() == Some(id.as_str()) {
+            (canvas.0 * 0.5, canvas.1 * 0.5)
+        } else {
+            aligned_center(center, size, angle, object.get("alignment").and_then(Value::as_str))
+        };
         layers.push(Layer {
             id,
             name,
@@ -994,6 +1047,20 @@ fn load_with_project(
             layers[index].scene_order = scene_order;
         }
     }
+    if let Some(scripts) = &mut scripts {
+        let sprites: Vec<(usize, usize, f32)> = layers
+            .iter()
+            .filter(|layer| layer.texture.frames.len() > 1)
+            .map(|layer| {
+                (
+                    layer.scene_order,
+                    layer.texture.frames.len(),
+                    layer.texture.frames.iter().map(|frame| frame.time).sum(),
+                )
+            })
+            .collect();
+        scripts.set_sprites(&sprites);
+    }
     let mut fonts: Vec<std::sync::Arc<[u8]>> = Vec::new();
     for layer in &mut layers {
         if let Some(text) = &mut layer.script_text {
@@ -1009,6 +1076,21 @@ fn load_with_project(
         canvas,
         mouse,
         camera_fov: number(general.and_then(|top| top.get("fov")), props, 50.0).clamp(1.0, 179.0),
+        shake: truthy(general.and_then(|top| top.get("camerashake")), props, false).then(|| {
+            crate::mouse::Shake {
+                amplitude: number(
+                    general.and_then(|top| top.get("camerashakeamplitude")),
+                    props,
+                    1.0,
+                ),
+                speed: number(general.and_then(|top| top.get("camerashakespeed")), props, 1.0),
+                roughness: number(
+                    general.and_then(|top| top.get("camerashakeroughness")),
+                    props,
+                    1.0,
+                ),
+            }
+        }),
         clear,
         ambient,
         skylight,

@@ -104,8 +104,14 @@ fn animated_texture_retains_pages_and_uses_each_pages_dimensions() {
 #[test]
 fn hidden_script_layer_preserves_effect_source_alpha() {
     let mut scene = json!({"objects":[{"id":1,"visible":false},{"id":2,"parent":1,"color":"0.2 0.4 0.6","alpha":0.5}]});
-    let layout =
-        super::script::Layout { id: "2".into(), size: [64.0; 2], offset: [0.0; 2], text: false };
+    let layout = super::script::Layout {
+        id: "2".into(),
+        size: [64.0; 2],
+        offset: [0.0; 2],
+        text: false,
+        hidden_without_fx: false,
+        passthrough: false,
+    };
     let frame = super::script::frames(
         &scene,
         std::slice::from_ref(&layout),

@@ -22,9 +22,17 @@ static FLOW: std::sync::LazyLock<Flow> = std::sync::LazyLock::new(|| Flow {
     paused: AtomicBool::new(false),
     wake: (Mutex::new(()), Condvar::new()),
 });
+static HOLD: AtomicBool = AtomicBool::new(false);
+static RESTART: AtomicBool = AtomicBool::new(false);
 
 fn open_gate(flow: &Flow) -> ParkGate<'_> {
-    ParkGate { mute: &flow.mute, paused: &flow.paused, wake: &flow.wake }
+    ParkGate {
+        mute: &flow.mute,
+        paused: &flow.paused,
+        hold: &HOLD,
+        restart: &RESTART,
+        wake: &flow.wake,
+    }
 }
 
 fn drain(consumer: &mut ringbuf::HeapCons<f32>) -> Vec<f32> {

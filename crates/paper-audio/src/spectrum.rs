@@ -115,8 +115,13 @@ fn band_edges(count: usize, rate: f32) -> Vec<(usize, usize)> {
         .collect()
 }
 
+enum Capture {
+    Monitor(crate::pulse::MonitorCapture),
+    Bridge(cpal::Stream),
+}
+
 pub struct Analyser {
-    _stream: cpal::Stream,
+    _capture: Capture,
     consumer: ringbuf::HeapCons<f32>,
     channels: usize,
     edges: Vec<Vec<(usize, usize)>>,
@@ -134,6 +139,59 @@ pub struct Analyser {
 
 impl Analyser {
     pub fn start() -> Result<Self> {
+        let source = source_name();
+        let (producer, consumer) =
+            ringbuf::HeapRb::<f32>::new(WINDOW * usize::from(crate::pulse::CHANNELS) * 8).split();
+        match crate::pulse::MonitorCapture::start(&source, producer) {
+            Ok(capture) => {
+                tracing::info!(
+                    "skwd-wall-vk: audio capture on pulse monitor source={source} rate={} channels={}",
+                    crate::pulse::RATE,
+                    crate::pulse::CHANNELS
+                );
+                return Ok(Self::with_capture(
+                    Capture::Monitor(capture),
+                    consumer,
+                    crate::pulse::RATE as f32,
+                    usize::from(crate::pulse::CHANNELS),
+                ));
+            }
+            Err(error) => tracing::info!(
+                "skwd-wall-vk: pulse monitor capture unavailable ({error}); using the ALSA bridge"
+            ),
+        }
+        Self::start_bridge()
+    }
+
+    fn with_capture(
+        capture: Capture,
+        consumer: ringbuf::HeapCons<f32>,
+        rate: f32,
+        channels: usize,
+    ) -> Self {
+        let gain = std::env::var("SKWD_VK_AUDIO_GAIN")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(GAIN);
+        Self {
+            _capture: capture,
+            consumer,
+            channels,
+            edges: BAND_COUNTS.iter().map(|count| band_edges(*count, rate)).collect(),
+            window: hann(),
+            left: vec![0.0; WINDOW],
+            right: vec![0.0; WINDOW],
+            re: vec![0.0; WINDOW],
+            im: vec![0.0; WINDOW],
+            gain,
+            attack: tuned("SKWD_VK_AUDIO_ATTACK", ATTACK_TAU),
+            release: tuned("SKWD_VK_AUDIO_RELEASE", RELEASE_TAU),
+            starved: 0.0,
+            cursor: 0,
+        }
+    }
+
+    fn start_bridge() -> Result<Self> {
         let host = cpal::default_host();
         let mut device = None;
         for wanted in BRIDGES {
@@ -166,30 +224,11 @@ impl Analyser {
             )
             .context("capture stream")?;
         stream.play().context("capture start")?;
-        let gain = std::env::var("SKWD_VK_AUDIO_GAIN")
-            .ok()
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(GAIN);
         tracing::info!(
             "skwd-wall-vk: audio capture on {name} source={} rate={rate} channels={channels}",
             source_name()
         );
-        Ok(Self {
-            _stream: stream,
-            consumer,
-            channels,
-            edges: BAND_COUNTS.iter().map(|count| band_edges(*count, rate)).collect(),
-            window: hann(),
-            left: vec![0.0; WINDOW],
-            right: vec![0.0; WINDOW],
-            re: vec![0.0; WINDOW],
-            im: vec![0.0; WINDOW],
-            gain,
-            attack: tuned("SKWD_VK_AUDIO_ATTACK", ATTACK_TAU),
-            release: tuned("SKWD_VK_AUDIO_RELEASE", RELEASE_TAU),
-            starved: 0.0,
-            cursor: 0,
-        })
+        Ok(Self::with_capture(Capture::Bridge(stream), consumer, rate, channels))
     }
 
     fn drain(&mut self) -> usize {

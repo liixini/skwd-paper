@@ -3,7 +3,7 @@ mod source;
 mod storage;
 pub use storage::Storage;
 
-pub use runtime::SceneScripts;
+pub use runtime::{SceneScripts, ScriptCommand, SoundOp, SpriteOp};
 
 #[cfg(test)]
 mod tests;

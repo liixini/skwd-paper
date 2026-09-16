@@ -165,6 +165,7 @@ fn policy_golden_line() {
             max_effect_chains: Some(4),
             max_effect_passes: Some(8),
             strict: Some(true),
+            clamp: Some(SceneClamp::Border),
         }),
         output_fps: [("DP-1".into(), 60), ("DP-2".into(), 120)].into(),
     };
@@ -183,7 +184,7 @@ fn policy_golden_line() {
         r#""replace_all":true,"policy":{"idle_seconds":45,"transitions_enabled":true,"#,
         r#""sand":{"quality":"low","scope":"primary","primary":"DP-1","sharp":true,"fps":30},"#,
         r#""scene":{"fps":60,"disable_particles":true,"assets_dir":"/we/assets","#,
-        r#""max_dimension":2048,"max_effect_chains":4,"max_effect_passes":8,"strict":true},"#,
+        r#""max_dimension":2048,"max_effect_chains":4,"max_effect_passes":8,"strict":true,"clamp":"border"},"#,
         r#""output_fps":{"DP-1":60,"DP-2":120}}}}"#,
         "\n"
     );

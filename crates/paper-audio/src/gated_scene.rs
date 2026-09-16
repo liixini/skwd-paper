@@ -1,24 +1,32 @@
 use crate::gated::wants_pipeline;
-use crate::mixer::{SceneMixer, Voice};
+use crate::mixer::{SceneMixer, Voice, VoiceOp};
 
 pub struct GatedScene {
     voices: Vec<Voice>,
     mute: bool,
     volume: u32,
     paused: bool,
+    ducked: bool,
     mixer: Option<SceneMixer>,
 }
 
 impl GatedScene {
     #[must_use]
     pub fn new(voices: Vec<Voice>, mute: bool, volume: u32) -> Self {
-        let mut gated = Self { voices, mute, volume: volume.min(100), paused: false, mixer: None };
+        let mut gated = Self {
+            voices,
+            mute,
+            volume: volume.min(100),
+            paused: false,
+            ducked: false,
+            mixer: None,
+        };
         gated.sync();
         gated
     }
 
     fn sync(&mut self) {
-        let inaudible = !wants_pipeline(self.mute, self.volume);
+        let inaudible = self.ducked || !wants_pipeline(self.mute, self.volume);
         if let Some(mixer) = &self.mixer {
             mixer.set_mute(inaudible);
             mixer.set_volume(self.volume);
@@ -48,10 +56,45 @@ impl GatedScene {
         self.sync();
     }
 
+    pub fn set_duck(&mut self, ducked: bool) {
+        self.ducked = ducked;
+        self.sync();
+    }
+
+    #[must_use]
+    pub fn ducked(&self) -> bool {
+        self.ducked
+    }
+
     pub fn set_pause(&mut self, paused: bool) {
         self.paused = paused;
         if let Some(mixer) = &self.mixer {
             mixer.set_pause(paused);
+        }
+    }
+
+    pub fn voice(&mut self, id: &str, op: VoiceOp) -> bool {
+        let Some(voice) = self.voices.iter_mut().find(|voice| voice.id == id) else {
+            return false;
+        };
+        match op {
+            VoiceOp::Play => voice.autostart = true,
+            VoiceOp::Stop | VoiceOp::Pause => voice.autostart = false,
+            VoiceOp::Gain(gain) => voice.gain = gain.max(0.0),
+        }
+        match &self.mixer {
+            Some(mixer) => mixer.voice(id, op),
+            None => {
+                self.sync();
+                true
+            }
+        }
+    }
+
+    pub fn voice_playing(&self, id: &str) -> bool {
+        match &self.mixer {
+            Some(mixer) => mixer.voice_playing(id),
+            None => self.voices.iter().any(|voice| voice.id == id && voice.autostart),
         }
     }
 

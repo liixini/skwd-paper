@@ -128,6 +128,16 @@ pub struct ScenePolicy {
     pub max_effect_passes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clamp: Option<SceneClamp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SceneClamp {
+    Clamp,
+    Border,
+    Repeat,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -1450,6 +1450,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "ffmpeg-the-third",
+ "libloading",
  "ringbuf",
  "tracing",
 ]

@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::model::Properties;
 use crate::pkg::Package;
 
-pub const MAX_SCENE_SOUNDS: usize = 16;
+pub const MAX_SCENE_SOUNDS: usize = 32;
 pub const MAX_CLIPS_PER_SOUND: usize = 32;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -31,12 +31,14 @@ pub enum PlaybackMode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneSound {
+    pub id: String,
     pub name: String,
     pub clips: Vec<String>,
     pub volume: f32,
     pub mode: PlaybackMode,
     pub min_gap: f32,
     pub max_gap: f32,
+    pub autostart: bool,
 }
 
 impl SceneSound {
@@ -49,6 +51,22 @@ impl SceneSound {
 }
 
 pub fn scene_sounds(pkg: &Package, properties: &Properties) -> Result<Vec<SceneSound>> {
+    scene_sounds_with_silent(pkg, properties, false)
+}
+
+pub fn scripts_drive_sounds(pkg: &Package) -> bool {
+    pkg.find("scene.json").is_some_and(|raw| {
+        [&b".play("[..], b".stop(", b".pause(", b".isPlaying("]
+            .iter()
+            .any(|needle| raw.windows(needle.len()).any(|window| window == *needle))
+    })
+}
+
+pub fn scene_sounds_with_silent(
+    pkg: &Package,
+    properties: &Properties,
+    include_silent: bool,
+) -> Result<Vec<SceneSound>> {
     let scene = pkg.find_json("scene.json")?.ok_or_else(|| anyhow!("no scene.json"))?;
     let objects = scene.get("objects").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let mut out = Vec::new();
@@ -59,9 +77,8 @@ pub fn scene_sounds(pkg: &Package, properties: &Properties) -> Result<Vec<SceneS
         if object.get("sound").is_none() {
             continue;
         }
-        if !truthy(object.get("visible"), properties, true)
-            || truthy(object.get("startsilent"), properties, false)
-        {
+        let silent = truthy(object.get("startsilent"), properties, false);
+        if !truthy(object.get("visible"), properties, true) || (silent && !include_silent) {
             continue;
         }
         let clips: Vec<String> = clip_paths(object.get("sound"))
@@ -73,12 +90,17 @@ pub fn scene_sounds(pkg: &Package, properties: &Properties) -> Result<Vec<SceneS
             continue;
         }
         out.push(SceneSound {
+            id: object
+                .get("id")
+                .map(|id| id.to_string().trim_matches('"').to_owned())
+                .unwrap_or_default(),
             name: object.get("name").and_then(Value::as_str).unwrap_or("sound").trim().to_string(),
             clips,
             volume: number(object.get("volume"), properties, 1.0).max(0.0),
             mode: mode_of(object.get("playbackmode")),
             min_gap: number(object.get("mintime"), properties, 0.0).max(0.0),
             max_gap: number(object.get("maxtime"), properties, 0.0).max(0.0),
+            autostart: !silent,
         });
     }
     Ok(out)

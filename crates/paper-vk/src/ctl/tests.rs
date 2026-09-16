@@ -26,12 +26,14 @@ fn ctl_reduce() {
         mute: Some(false),
         volume: Some(40),
         pause: None,
+        duck: None,
         freeze: None,
         capture: None,
         shader: None,
         duration_ms: None,
         outputs: None,
         properties: None,
+        pointer: None,
     })
     .unwrap();
     assert!(ctl.poll().is_none());
@@ -43,12 +45,14 @@ fn ctl_reduce() {
         mute: None,
         volume: None,
         pause: Some(true),
+        duck: None,
         freeze: None,
         capture: None,
         shader: None,
         duration_ms: None,
         outputs: None,
         properties: None,
+        pointer: None,
     })
     .unwrap();
     assert!(ctl.poll().is_none());
@@ -141,4 +145,25 @@ fn routed_output_pauses_stay_out_of_the_global_pause() {
     assert!(ctl.paused);
     assert_eq!(ctl.take_output_pauses(), vec![("DP-2".to_string(), true)]);
     assert!(ctl.take_output_pauses().is_empty());
+}
+
+#[test]
+fn duck_command_leaves_mute_and_pause_alone() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut ctl = Ctl::with_receiver(rx);
+    tx.send(PaperCommand::audio(Some(false), Some(60))).unwrap();
+    tx.send(PaperCommand::duck(true)).unwrap();
+    assert!(ctl.poll().is_none());
+    assert!(ctl.ducked);
+    assert!(!ctl.mute);
+    assert!(!ctl.paused);
+    assert_eq!(ctl.volume, 60);
+    tx.send(PaperCommand::audio(Some(true), None)).unwrap();
+    tx.send(PaperCommand::swap_video("/v/next.mp4", false, 70)).unwrap();
+    assert!(ctl.poll().is_some());
+    assert!(ctl.ducked);
+    tx.send(PaperCommand::duck(false)).unwrap();
+    assert!(ctl.poll().is_none());
+    assert!(!ctl.ducked);
+    assert!(!ctl.mute);
 }

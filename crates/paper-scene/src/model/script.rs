@@ -8,6 +8,8 @@ pub struct Layout {
     pub size: [f32; 2],
     pub offset: [f32; 2],
     pub text: bool,
+    pub hidden_without_fx: bool,
+    pub passthrough: bool,
 }
 
 pub struct Frame {
@@ -48,7 +50,14 @@ impl Layout {
                 (-dx * sin + dy * cos) / if scale.1.abs() > 0.00001 { scale.1 } else { 1.0 },
             ]
         });
-        Self { id: layer.id.clone(), size, offset, text: layer.is_text }
+        Self {
+            id: layer.id.clone(),
+            size,
+            offset,
+            text: layer.is_text,
+            hidden_without_fx: layer.passthrough || (layer.solid && !layer.effects.is_empty()),
+            passthrough: layer.passthrough,
+        }
     }
 }
 

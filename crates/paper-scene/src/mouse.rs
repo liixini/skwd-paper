@@ -36,6 +36,32 @@ impl Parallax {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct Shake {
+    pub amplitude: f32,
+    pub speed: f32,
+    pub roughness: f32,
+}
+
+impl Default for Shake {
+    fn default() -> Self {
+        Self { amplitude: 1.0, speed: 1.0, roughness: 1.0 }
+    }
+}
+
+pub const SHAKE_PIXELS: f32 = 11.2;
+
+impl Shake {
+    #[must_use]
+    pub fn offset(self, time: f32) -> [f32; 2] {
+        let t = time * self.speed;
+        let rough = (self.roughness - 1.0).clamp(0.0, 8.0) * 0.25;
+        let x = (t * 1.03).sin() + rough * (t * 5.3).sin();
+        let y = (t * 1.31 + 1.9).sin() + rough * (t * 6.7 + 0.7).sin();
+        [x * self.amplitude * SHAKE_PIXELS, y * self.amplitude * SHAKE_PIXELS]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Clock3d {
     pub origin: [f32; 2],
 }

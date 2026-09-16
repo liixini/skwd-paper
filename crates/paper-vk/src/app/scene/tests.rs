@@ -760,3 +760,86 @@ fn pointer_unprojection_uses_centered_layer_coordinates() {
     assert!((rotated[1] + 960.0).abs() < 0.001);
     assert!((rotated[4] - 540.0).abs() < 0.001);
 }
+
+fn test_layer(visible: bool, effects: usize) -> paper_scene::model::Layer {
+    let mut layer = paper_scene::model::Layer {
+        id: String::new(),
+        name: String::new(),
+        visible,
+        texture: paper_scene::model::solid_texture(),
+        puppet: None,
+        center: (0.0, 0.0),
+        size: (1.0, 1.0),
+        scale: (1.0, 1.0),
+        depth: 0.0,
+        scene_order: 0,
+        alpha: 1.0,
+        angle: 0.0,
+        color: [1.0; 3],
+        color_blend: 0,
+        passthrough: false,
+        solid: false,
+        live_text: None,
+        script_text: None,
+        is_text: false,
+        mouse: paper_scene::mouse::LayerMouse::default(),
+        effects: Vec::new(),
+    };
+    layer.effects = (0..effects)
+        .map(|_| paper_scene::effects::Effect {
+            name: String::new(),
+            passes: Vec::new(),
+            fbos: Vec::new(),
+            swaps: Vec::new(),
+        })
+        .collect();
+    layer
+}
+
+#[test]
+fn chain_admission_prefers_visible_layers_in_scene_order() {
+    let layers = vec![
+        test_layer(false, 1),
+        test_layer(true, 1),
+        test_layer(true, 0),
+        test_layer(false, 1),
+        test_layer(true, 1),
+    ];
+    assert_eq!(chain_admission_order(&layers, true), vec![1, 4, 0, 3]);
+    assert_eq!(chain_admission_order(&layers, false), vec![1, 4]);
+}
+
+#[test]
+fn sprite_controls_hold_play_and_rejoin_the_shared_clock() {
+    use paper_scene::script::SpriteOp;
+    let frame = |time: f32| paper_scene::model::SpriteFrame {
+        image: 0,
+        time,
+        uv: [0.0; 4],
+        rotated: false,
+    };
+    let mut animation = LayerAnimation {
+        quad: 0,
+        object: 0,
+        frames: vec![frame(0.5), frame(0.5), frame(0.5)],
+        total: 1.5,
+        pages: vec![0],
+        slot: 0,
+        image: -1,
+        control: SpriteControl::Follow,
+        rate: 1.0,
+    };
+    assert_eq!(animation.current_frame(0.6), 1);
+    animation.apply(SpriteOp::Frame(2), 0.6);
+    assert_eq!(animation.current_frame(0.6), 2);
+    assert_eq!(animation.current_frame(0.7), 2);
+    animation.apply(SpriteOp::Pause, 0.7);
+    assert_eq!(animation.current_frame(5.0), 2);
+    animation.apply(SpriteOp::Play, 5.0);
+    assert_eq!(animation.current_frame(5.0), 2);
+    assert_eq!(animation.current_frame(5.4), 0);
+    animation.apply(SpriteOp::Stop, 6.0);
+    assert_eq!(animation.current_frame(9.0), 0);
+    animation.apply(SpriteOp::Join, 9.0);
+    assert_eq!(animation.current_frame(0.6), 1);
+}

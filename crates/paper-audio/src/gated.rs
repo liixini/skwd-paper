@@ -9,6 +9,7 @@ pub struct GatedAudio {
     mute: bool,
     volume: u32,
     paused: bool,
+    ducked: bool,
     player: Option<AudioPlayer>,
 }
 
@@ -19,6 +20,7 @@ impl GatedAudio {
             mute,
             volume: volume.min(100),
             paused: false,
+            ducked: false,
             player: None,
         };
         gated.sync();
@@ -26,7 +28,7 @@ impl GatedAudio {
     }
 
     fn sync(&mut self) {
-        let inaudible = !wants_pipeline(self.mute, self.volume);
+        let inaudible = self.ducked || !wants_pipeline(self.mute, self.volume);
         if let Some(player) = &self.player {
             player.set_mute(inaudible);
             player.set_volume(self.volume);
@@ -57,6 +59,16 @@ impl GatedAudio {
     pub fn set_volume(&mut self, volume: u32) {
         self.volume = volume.min(100);
         self.sync();
+    }
+
+    pub fn set_duck(&mut self, ducked: bool) {
+        self.ducked = ducked;
+        self.sync();
+    }
+
+    #[must_use]
+    pub fn ducked(&self) -> bool {
+        self.ducked
     }
 
     pub fn set_pause(&mut self, paused: bool) {

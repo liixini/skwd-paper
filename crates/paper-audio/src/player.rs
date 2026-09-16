@@ -90,12 +90,16 @@ impl AudioPlayer {
             .name("skwd-audio".into())
             .spawn(move || {
                 let mut producer = producer;
+                let hold = AtomicBool::new(false);
+                let restart = AtomicBool::new(false);
                 if let Err(error) = decode_loop(
                     &path,
                     &mut producer,
                     &thread_stop,
                     &thread_mute,
                     &thread_paused,
+                    &hold,
+                    &restart,
                     &thread_wake,
                     Repeat::Forever,
                 ) {

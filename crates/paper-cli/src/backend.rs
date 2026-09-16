@@ -785,6 +785,14 @@ fn apply_policy(command: &mut Command, policy: &RendererPolicy) {
         if let Some(strict) = scene.strict {
             command.env("SKWD_VK_SCENE_STRICT", if strict { "1" } else { "0" });
         }
+        if let Some(clamp) = scene.clamp {
+            let mode = match clamp {
+                paper_control::SceneClamp::Clamp => "clamp",
+                paper_control::SceneClamp::Border => "border",
+                paper_control::SceneClamp::Repeat => "repeat",
+            };
+            command.env("SKWD_VK_SCENE_CLAMP", mode);
+        }
     }
     if !policy.output_fps.is_empty() {
         let output_fps = policy

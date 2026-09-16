@@ -1,9 +1,14 @@
 use super::{Group, vk};
-use paper_scene::mouse::{Clock3d, LayerMouse, Parallax};
+use paper_scene::mouse::{Clock3d, LayerMouse, Parallax, Shake};
 
 pub(super) struct SceneMouse {
     pub enabled: bool,
     config: Parallax,
+    base: Parallax,
+    shake: Shake,
+    shake_on: bool,
+    shake_time: f32,
+    shake_offset: [f32; 2],
     layers: Vec<(LayerMouse, [f32; 4])>,
     pub position: [f32; 2],
     previous: [f32; 2],
@@ -30,13 +35,18 @@ impl SceneMouse {
                         })
                 });
         Self {
-            enabled,
+            enabled: enabled || model.shake.is_some(),
             config: model.mouse,
+            base: model.mouse,
+            shake: model.shake.unwrap_or_default(),
+            shake_on: model.shake.is_some(),
+            shake_time: 0.0,
+            shake_offset: [0.0; 2],
             layers: model
                 .layers
                 .iter()
                 .map(|layer| {
-                    (layer.mouse, [layer.center.0, layer.center.1, layer.size.0, layer.size.1])
+                    (layer.mouse, super::screen_rect(layer.passthrough, layer.center, layer.size))
                 })
                 .collect(),
             position: [0.5; 2],
@@ -103,7 +113,53 @@ impl SceneMouse {
     }
 
     pub fn pending(&self) -> bool {
-        self.enabled && (self.dirty || self.settling)
+        self.enabled && (self.dirty || self.settling || self.shake_on)
+    }
+
+    pub(super) fn set_fov(&mut self, fov: f32) {
+        self.fov = fov;
+        self.dirty = true;
+    }
+
+    pub(super) fn set_parallax(&mut self, key: &str, flag: Option<bool>, scalar: Option<f32>) {
+        match (key, flag, scalar) {
+            ("cameraparallax", Some(on), _) => {
+                self.config.amount = if !on {
+                    0.0
+                } else if self.base.amount > 0.0 {
+                    self.base.amount
+                } else {
+                    0.5
+                };
+            }
+            ("cameraparallaxamount", _, Some(amount)) => self.config.amount = amount,
+            ("cameraparallaxdelay", _, Some(delay)) => self.config.delay = delay,
+            ("cameraparallaxmouseinfluence", _, Some(influence)) => {
+                self.config.influence = influence;
+            }
+            _ => return,
+        }
+        self.enabled = true;
+        self.dirty = true;
+        self.settling = true;
+    }
+
+    pub(super) fn set_shake(&mut self, key: &str, flag: Option<bool>, scalar: Option<f32>) {
+        match (key, flag, scalar) {
+            ("camerashake", Some(on), _) => {
+                self.shake_on = on;
+                if !on {
+                    self.shake_offset = [0.0; 2];
+                }
+            }
+            ("camerashakeamplitude", _, Some(amplitude)) => self.shake.amplitude = amplitude,
+            ("camerashakespeed", _, Some(speed)) => self.shake.speed = speed,
+            ("camerashakeroughness", _, Some(roughness)) => self.shake.roughness = roughness,
+            _ => return,
+        }
+        self.enabled = true;
+        self.dirty = true;
+        self.settling = true;
     }
 }
 
@@ -181,6 +237,11 @@ impl Group {
         let before = mouse.displacement;
         mouse.displacement = mouse.config.displacement(mouse.position, before, dt);
         mouse.settling = mouse.displacement != before;
+        if mouse.shake_on {
+            mouse.shake_time += dt;
+            mouse.shake_offset = mouse.shake.offset(mouse.shake_time);
+            mouse.settling = true;
+        }
         if let Some(position) = &mut mouse.parallax_position {
             let before = *position;
             *position = mouse.config.position(mouse.position, before, dt);
@@ -191,7 +252,8 @@ impl Group {
             quad.rect = *base;
             for axis in 0..2 {
                 quad.rect[axis] +=
-                    layer.parallax[axis] * mouse.displacement[axis] * mouse.canvas[axis];
+                    layer.parallax[axis] * mouse.displacement[axis] * mouse.canvas[axis]
+                        + mouse.shake_offset[axis];
             }
             if let Some(clock) = layer.clock {
                 quad.projection =

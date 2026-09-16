@@ -245,7 +245,7 @@ fn instance_overrides_scale_count_lifetime_speed_and_bind_to_properties() {
     use crate::pkg::Package;
     let particle = br#"{"renderer":[{"name":"sprite"}],"maxcount":100,
         "emitter":[{"name":"boxrandom","rate":2}],
-        "initializer":[{"name":"lifetimerandom","min":1,"max":2},{"name":"velocityrandom","min":"1 2 0","max":"3 4 0"},{"name":"turbulentvelocityrandom","min":5,"max":6}]}"#;
+        "initializer":[{"name":"lifetimerandom","min":1,"max":2},{"name":"velocityrandom","min":"1 2 0","max":"3 4 0"},{"name":"turbulentvelocityrandom","speedmin":5,"speedmax":6}]}"#;
     let object: serde_json::Value = serde_json::json!({
         "id": 1, "particle": "particles/p.json", "origin": "0 0 0",
         "instanceoverride": {"count": 0.5, "lifetime": 2.0, "speed": {"user": "spd", "value": 3.0}, "rate": {"user": "missing", "value": 0.25}, "colorn": {"user": "tint", "value": "1 1 1"}}
@@ -273,8 +273,8 @@ fn instance_overrides_scale_count_lifetime_speed_and_bind_to_properties() {
                 assert_eq!(max, &[30.0, 40.0, 0.0]);
                 saw += 1;
             }
-            super::Initializer::TurbulentVelocity { min, max } => {
-                assert_eq!((*min, *max), (50.0, 60.0));
+            super::Initializer::TurbulentVelocity(turbulent) => {
+                assert_eq!(turbulent.speed, (50.0, 60.0));
                 saw += 1;
             }
             _ => {}
@@ -611,4 +611,220 @@ fn attraction_tracks_its_selected_mouse_control_point() {
     sim.set_pointer([-100.0, 0.0]);
     sim.step(&sys, 0.01);
     assert!(sim.particles[0].vel[0] < 0.0);
+}
+
+fn turbulent(scale: f32, offset: f32, phase: (f32, f32)) -> Turbulent {
+    Turbulent {
+        speed: (100.0, 100.0),
+        scale,
+        offset,
+        forward: [0.0, 1.0, 0.0],
+        right: [0.0, 0.0, 1.0],
+        time_scale: 1.0,
+        phase,
+    }
+}
+
+fn point_emitter(origin: [f32; 3], rate: f32, instantaneous: u32) -> Emitter {
+    Emitter::Box { control_point: None, instantaneous, origin, extent: [0.0; 3], rate }
+}
+
+#[test]
+fn turbulent_velocity_stays_inside_the_forward_cone_and_the_plane() {
+    let mut sys = system();
+    sys.initializers.push(Initializer::TurbulentVelocity(turbulent(0.5, 0.0, (0.0, 0.1))));
+    let mut sim = Sim::new(9);
+    for _ in 0..30 {
+        sim.step(&sys, 1.0 / 30.0);
+    }
+    assert!(sim.particles.len() > 20);
+    let limit = std::f32::consts::FRAC_PI_4.cos() - 1e-3;
+    for particle in &sim.particles {
+        let speed = dot3(particle.vel, particle.vel).sqrt();
+        assert!((speed - 100.0).abs() < 0.01, "speed {speed}");
+        assert_eq!(particle.vel[2], 0.0);
+        assert!(particle.vel[1] / speed >= limit, "outside the cone: {:?}", particle.vel);
+    }
+}
+
+#[test]
+fn turbulent_directions_are_coherent_per_emission_and_drift_over_time() {
+    let mut sys = system();
+    sys.emitters = vec![point_emitter([0.0; 3], 600.0, 0)];
+    sys.initializers.push(Initializer::TurbulentVelocity(turbulent(2.0, 0.0, (0.0, 0.0))));
+    let mut sim = Sim::new(4);
+    sim.step(&sys, 1.0 / 30.0);
+    let first = sim.particles[0].vel;
+    assert!(sim.particles.len() >= 10);
+    assert!(
+        sim.particles
+            .iter()
+            .all(|p| (p.vel[0] - first[0]).abs() < 1e-3 && (p.vel[1] - first[1]).abs() < 1e-3)
+    );
+    sim.particles.clear();
+    for _ in 0..15 {
+        sim.step(&sys, 1.0 / 30.0);
+    }
+    let later = sim.particles.last().unwrap().vel;
+    assert!((later[0] - first[0]).abs() + (later[1] - first[1]).abs() > 1e-3, "{later:?}");
+}
+
+#[test]
+fn turbulent_offset_tilts_the_cone_and_scale_zero_locks_it_to_forward() {
+    let straight = turbulent_direction([0.3, 0.9, 0.2], &turbulent(0.0, 0.0, (0.0, 0.0)), false);
+    assert!((straight[0]).abs() < 1e-6 && (straight[1] - 1.0).abs() < 1e-6);
+    let tilted = turbulent_direction(
+        [0.3, 0.9, 0.2],
+        &turbulent(0.0, std::f32::consts::FRAC_PI_2, (0.0, 0.0)),
+        false,
+    );
+    assert!((tilted[0] + 1.0).abs() < 1e-5 && tilted[1].abs() < 1e-5, "{tilted:?}");
+    let wide = turbulent_direction([1.0, -1.0, 0.0], &turbulent(2.0, 0.0, (0.0, 0.0)), false);
+    assert!((wide[0] - wide[1].abs()).abs() < 1e-5 && wide[1] < 0.0);
+}
+
+#[test]
+fn map_sequence_spreads_emissions_evenly_around_the_control_point() {
+    let mut sys = system();
+    sys.emitters = vec![point_emitter([0.0; 3], 60.0, 0)];
+    sys.control_points[2].offset = [50.0, 20.0, 0.0];
+    sys.initializers.push(Initializer::MapSequence {
+        control_point: 2,
+        count: 4.0,
+        axis: [0.0, 0.0, 1.0],
+        min: [100.0, 0.0, 0.0],
+        max: [100.0, 0.0, 0.0],
+    });
+    let mut sim = Sim::new(2);
+    sim.step(&sys, 3.0 / 60.0);
+    assert_eq!(sim.particles.len(), 4);
+    let expected = [[100.0, 0.0], [0.0, -100.0], [-100.0, 0.0], [0.0, 100.0]];
+    for (particle, want) in sim.particles.iter().zip(expected) {
+        assert!((particle.pos[0] - 50.0).abs() < 1e-3 && (particle.pos[1] - 20.0).abs() < 1e-3);
+        assert!(
+            (particle.vel[0] - want[0]).abs() < 1e-3 && (particle.vel[1] - want[1]).abs() < 1e-3,
+            "{:?}",
+            particle.vel
+        );
+    }
+    sys.emitters = vec![point_emitter([30.0, 40.0, 0.0], 60.0, 0)];
+    let mut sim = Sim::new(2);
+    sim.step(&sys, 3.0 / 60.0);
+    for (particle, want) in sim.particles.iter().zip(expected) {
+        let along = [particle.pos[0] - 50.0, particle.pos[1] - 20.0];
+        assert!((along[0] - want[0] * 0.5).abs() < 1e-3 && (along[1] - want[1] * 0.5).abs() < 1e-3);
+    }
+}
+
+#[test]
+fn vortex_spins_particles_around_the_axis_and_can_pull_them_inward() {
+    let mut sys = system();
+    sys.emitters = vec![point_emitter([100.0, 0.0, 0.0], 0.0, 1)];
+    let vortex = Vortex {
+        control_point: 0,
+        infinite_axis: true,
+        maintain_distance: false,
+        ring: false,
+        axis: [0.0, 0.0, 1.0],
+        offset: [0.0; 3],
+        distance: (0.0, 200.0),
+        speed: (1000.0, 1000.0),
+        center_force: 500.0,
+        ring_radius: 300.0,
+        ring_width: 50.0,
+        ring_pull: (50.0, 10.0),
+        audio: false,
+    };
+    sys.operators = vec![Operator::Vortex(vortex)];
+    let mut sim = Sim::new(3);
+    sim.step(&sys, 0.1);
+    let spun = sim.particles[0].vel;
+    assert!(spun[0].abs() < 1e-3 && (spun[1] + 100.0).abs() < 1e-3, "{spun:?}");
+    sys.operators = vec![Operator::Vortex(Vortex { maintain_distance: true, ..vortex })];
+    let mut sim = Sim::new(3);
+    sim.step(&sys, 0.1);
+    assert_eq!(sim.particles[0].vel, spun);
+    sys.operators =
+        vec![Operator::Vortex(Vortex { maintain_distance: true, distance: (0.0, 50.0), ..vortex })];
+    let mut sim = Sim::new(3);
+    sim.step(&sys, 0.1);
+    let pulled = sim.particles[0].vel;
+    assert!((pulled[0] + 50.0).abs() < 1e-3 && (pulled[1] + 100.0).abs() < 1e-3, "{pulled:?}");
+    sys.operators = vec![Operator::Vortex(Vortex { ring: true, ..vortex })];
+    let mut sim = Sim::new(3);
+    sim.step(&sys, 0.1);
+    assert_eq!(sim.particles[0].vel, [0.0; 3]);
+    sys.operators = vec![Operator::Vortex(Vortex { ring: true, ring_radius: 100.0, ..vortex })];
+    let mut sim = Sim::new(3);
+    sim.step(&sys, 0.1);
+    assert_eq!(sim.particles[0].vel, spun);
+}
+
+#[test]
+fn once_animation_walks_the_sheet_a_single_time_and_holds_the_last_frame() {
+    let mut sys = system();
+    sys.animation = Animation::Once;
+    let mut sim = Sim::new(5);
+    sim.particles.push(Particle {
+        pos: [0.0; 3],
+        vel: [0.0; 3],
+        size: 10.0,
+        base_size: 10.0,
+        color: [1.0; 3],
+        alpha: 1.0,
+        base_alpha: 1.0,
+        angle: 0.0,
+        angular: 0.0,
+        age: 0.0,
+        lifetime: 1.0,
+        phase: 0.0,
+    });
+    let mut out = Vec::new();
+    pack_sprites(&sys, &sim, 8, &mut out);
+    assert_eq!(out[14], 0.0);
+    sim.particles[0].age = 0.5;
+    pack_sprites(&sys, &sim, 8, &mut out);
+    assert!((out[14] - 4.0 / 8.0).abs() < 1e-6);
+    sim.particles[0].age = 1.0;
+    pack_sprites(&sys, &sim, 8, &mut out);
+    assert!((out[14] - 7.0 / 8.0).abs() < 1e-6);
+    sys.sequence_multiplier = 2.0;
+    sim.particles[0].age = 0.5;
+    pack_sprites(&sys, &sim, 8, &mut out);
+    assert!((out[14] - 7.0 / 8.0).abs() < 1e-6);
+}
+
+#[test]
+fn turbulent_vortex_and_map_sequence_parsers_take_engine_defaults() {
+    let init = parse_initializer(&serde_json::json!({
+        "name": "turbulentvelocityrandom", "offset": -0.5, "scale": 0.1
+    }))
+    .unwrap();
+    let Initializer::TurbulentVelocity(t) = init else { panic!("turbulent") };
+    assert_eq!((t.speed, t.scale, t.offset), ((100.0, 250.0), 0.1, -0.5));
+    assert_eq!(
+        (t.forward, t.right, t.time_scale, t.phase),
+        ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], 1.0, (0.0, 0.1))
+    );
+    let op = parse_operator(&serde_json::json!({
+        "name": "vortex", "distanceinner": 0, "distanceouter": 32, "speedinner": 0,
+        "speedouter": 2500, "flags": 3
+    }))
+    .unwrap();
+    let Operator::Vortex(v) = op else { panic!("vortex") };
+    assert_eq!(
+        (v.distance, v.speed, v.infinite_axis, v.maintain_distance, v.ring),
+        ((0.0, 32.0), (0.0, 2500.0), true, true, false)
+    );
+    assert_eq!(
+        (v.center_force, v.ring_radius, v.ring_width, v.ring_pull),
+        (1.0, 300.0, 50.0, (50.0, 10.0))
+    );
+    let map = parse_initializer(&serde_json::json!({
+        "name": "mapsequencearoundcontrolpoint", "count": 3.02, "speedmin": "0 10 0",
+        "speedmax": "0 100 0"
+    }))
+    .unwrap();
+    let Initializer::MapSequence { count, min, max, .. } = map else { panic!("map") };
+    assert_eq!((count, min, max), (3.02, [0.0, 10.0, 0.0], [0.0, 100.0, 0.0]));
 }

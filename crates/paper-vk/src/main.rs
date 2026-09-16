@@ -29,6 +29,9 @@ fn audio_source_env() {
     if std::env::var_os("PULSE_SOURCE").is_none() {
         unsafe { std::env::set_var("PULSE_SOURCE", paper_audio::spectrum::source_name()) };
     }
+    if std::env::var_os("PIPEWIRE_PROPS").is_none() {
+        unsafe { std::env::set_var("PIPEWIRE_PROPS", "{ stream.capture.sink = true }") };
+    }
 }
 
 fn main() {

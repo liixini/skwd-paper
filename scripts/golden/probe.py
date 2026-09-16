@@ -172,6 +172,38 @@ def probe_text1(root):
         text_layer(8, 'H48-880', '1100 880 0', 'H', 48, size='300 300')])})
 
 
+def probe_text_lines(root):
+    objs = []
+    oid = 1
+    for column, text in enumerate(['H', 'H\nH\nH', 'H\nH\nH\nH\nH']):
+        for row, valign in enumerate(['top', 'center', 'bottom']):
+            objs.append(text_layer(oid, f'{valign}-{column}', f'{300 + column * 500} {880 - row * 320} 0', text, 48,
+                                   size='300 300', halign='left', valign=valign))
+            oid += 1
+    return write(root, 'probe_text_lines', {'scene.json': scene(objs)})
+
+
+def probe_text_lines2(root):
+    objs = []
+    oid = 1
+    for column, (lines, box) in enumerate([(1, '300 300'), (3, '300 300'), (3, '300 900'), (1, '300 900'), (3, '900 900'), (5, '300 300')]):
+        for row, valign in enumerate(['top', 'center', 'bottom']):
+            text = '\n'.join(['H'] * lines)
+            objs.append(text_layer(oid, f'{valign}-{lines}-{box.split()[1]}', f'{100 + column * 300} {(3 - row) * 270} 0', text, 24,
+                                   size=box, halign='left', valign=valign))
+            oid += 1
+    return write(root, 'probe_text_lines2', {'scene.json': scene(objs)})
+
+
+def probe_text_lines3(root):
+    objs = [image_layer(1, 'backdrop', '960 540 0', '1920 1080', color='0.5 0.5 0.5')]
+    objs.append(text_layer(2, 'top-3', '200 900 0', 'H\nH\nH', 24, size='300 600', halign='left', valign='top'))
+    objs.append(text_layer(3, 'top-5', '700 950 0', 'H\nH\nH\nH\nH', 24, size='300 600', halign='left', valign='top'))
+    objs.append(text_layer(4, 'center-3', '1200 540 0', 'H\nH\nH', 24, size='300 600', halign='left', valign='center'))
+    objs.append(text_layer(5, 'bottom-3', '1700 200 0', 'H\nH\nH', 24, size='300 600', halign='left', valign='bottom'))
+    return write(root, 'probe_text_lines3', white_probe_files(objs))
+
+
 def probe_text_bearing2(root):
     objs = []
     oid = 1
@@ -693,6 +725,283 @@ def probe_count_override(root):
                  'scene.json': scene([particle_object(2, 'ovr', '960 540 0', 'particles/p.json', override=override)])}
         outs.append(write(root, name, files))
     return outs
+
+
+
+def dark_bg():
+    return image_layer(1, 'bg', '960 540 0', '1920 1080', color='0.3 0.3 0.3')
+
+
+def grey_bg(oid=1):
+    return image_layer(oid, 'backdrop', '960 540 0', '1920 1080', color='0.5 0.5 0.5')
+
+
+def motion_doc(size, life, rate, maxcount, origin='0 0 0', instantaneous=0):
+    doc = particle_doc(size, starttime=0, maxcount=maxcount)
+    doc['emitter'] = [{'distancemax': '0 0 0', 'id': 7, 'name': 'boxrandom', 'origin': origin, 'rate': rate, 'instantaneous': instantaneous}]
+    doc['initializer'] = [{'id': 2, 'max': life, 'min': life, 'name': 'lifetimerandom'}, {'id': 3, 'max': size, 'min': size, 'name': 'sizerandom'}]
+    doc['operator'] = [{'drag': 0, 'gravity': '0 0 0', 'id': 8, 'name': 'movement'}]
+    return doc
+
+
+def particle_probe(root, name, doc, extra_objs=()):
+    files = {'materials/probe_particle.json': PARTICLE_MAT, 'particles/p.json': doc}
+    files.update(white_probe_files([dark_bg(), *extra_objs, particle_object(2, name, '960 540 0', 'particles/p.json')]))
+    return write(root, name, files)
+
+
+def probe_turb(root):
+    outs = []
+    for tag, kw in (('s01', dict(scale=0.1, offset=0)), ('s05', dict(scale=0.5, offset=0)), ('s1', dict(scale=1, offset=0)),
+                    ('s2', dict(scale=2, offset=0)), ('s01_on', dict(scale=0.1, offset=-0.5)), ('s01_op', dict(scale=0.1, offset=0.5)),
+                    ('s01_fx', dict(scale=0.1, offset=0, forward='1 0 0')), ('s01_fdown', dict(scale=0.1, offset=0, forward='0 -1 0')),
+                    ('s01_rx', dict(scale=0.1, offset=0.5, right='1 0 0'))):
+        doc = motion_doc(6, 0.6, 1500, 4000)
+        init = {'id': 5, 'name': 'turbulentvelocityrandom', 'speedmin': 400, 'speedmax': 400}
+        init.update(kw)
+        doc['initializer'].append(init)
+        outs.append(particle_probe(root, f'probe_turb_{tag}', doc))
+    return outs
+
+
+def probe_vortex(root):
+    outs = []
+    base = {'id': 9, 'name': 'vortex', 'controlpoint': 0, 'distanceinner': 500, 'distanceouter': 650, 'speedinner': 5, 'speedouter': 0}
+    for tag, op, origin in (('std', dict(base), '200 0 0'),
+                            ('keep', dict(base, flags=2, centerforce=5), '200 0 0'),
+                            ('ring', dict(base, flags=4, ringradius=300, ringwidth=100, ringpulldistance=200, ringpullforce=5), '450 0 0'),
+                            ('axis', dict(base, flags=1), '200 0 0'),
+                            ('fast', dict(base, speedinner=60), '200 0 0')):
+        doc = motion_doc(8, 60, 0, 400, origin=origin, instantaneous=200)
+        doc['operator'].append(op)
+        outs.append(particle_probe(root, f'probe_vortex_{tag}', doc, [image_layer(3, 'centre', '960 540 0', '10 10', color='1 0 0')]))
+    return outs
+
+
+def probe_mapseq(root):
+    outs = []
+    for tag, count, speed, rate, life, cp, origin in (('c8', 8, '0 200 0', 40, 1.0, '0 0 0', '0 0 0'), ('c3', 3, '200 0 0', 3, 0.9, '0 0 0', '0 0 0'),
+                                                     ('c3y', 3, '0 200 0', 3, 0.9, '0 0 0', '0 0 0'), ('cp', 8, '0 200 0', 40, 1.0, '300 0 0', '-300 0 0'),
+                                                     ('cp2', 8, '0 200 0', 40, 1.0, '300 0 0', '0 0 0'), ('cp3', 8, '0 200 0', 40, 1.0, '300 0 0', '100 -200 0'),
+                                                     ('cp4', 8, '0 200 0', 40, 1.0, '0 0 0', '100 -200 0')):
+        doc = motion_doc(8, life, rate, 200, origin=origin)
+        doc['controlpoint'][0]['offset'] = cp
+        doc['initializer'].append({'id': 4, 'name': 'mapsequencearoundcontrolpoint', 'controlpoint': 0, 'count': count, 'speedmin': speed, 'speedmax': speed})
+        outs.append(particle_probe(root, f'probe_mapseq_{tag}', doc, [image_layer(3, 'centre', '960 540 0', '10 10', color='1 0 0')]))
+    return outs
+
+
+def probe_align(root):
+    objs = [grey_bg()]
+    for i, (name, align, scale) in enumerate((('c', 'center', '1 1 1'), ('t', 'top', '1 1 1'), ('b', 'bottom', '1 1 1'), ('l', 'left', '1 1 1'),
+                                              ('r', 'right', '1 1 1'), ('ts', 'top', '2 2 1'))):
+        x = 200 + i * 300
+        objs.append(image_layer(10 + i, name, f'{x} 540 0', '200 100', color='1 0 0', scale=scale, alignment=align))
+        objs.append(image_layer(20 + i, name + '-mark', f'{x} 540 0', '6 6', color='0 0 1'))
+    return write(root, 'probe_align', white_probe_files(objs))
+
+
+def probe_ortho(root):
+    outs = []
+    for tag, auto, objs in (('off', False, [image_layer(1, 'backdrop', '300 200 0', '600 400', color='0.5 0.5 0.5')]),
+                            ('a', True, [image_layer(1, 'backdrop', '300 200 0', '600 400', color='0.5 0.5 0.5')]),
+                            ('b', True, [image_layer(1, 'backdrop', '300 200 0', '600 400', color='0.5 0.5 0.5'),
+                                         image_layer(2, 'far', '900 600 0', '100 100', color='1 0 0')]),
+                            ('c', True, [image_layer(1, 'backdrop', '300 200 0', '600 400', color='0.5 0.5 0.5'),
+                                         image_layer(2, 'wide', '400 150 0', '900 300', color='1 0 0')]),
+                            ('d', True, [image_layer(1, 'backdrop', '300 200 0', '600 400', color='0.5 0.5 0.5'),
+                                         image_layer(2, 'small', '300 200 0', '300 100', color='1 0 0')]),
+                            ('e', True, [image_layer(1, 'backdrop', '500 300 0', '600 400', color='0.5 0.5 0.5'),
+                                         image_layer(2, 'mark', '500 300 0', '40 40', color='1 0 0')])):
+        outs.append(write(root, f'probe_ortho_{tag}', white_probe_files(objs, orthogonalprojection={'auto': auto, 'height': 1080, 'width': 1920})))
+    return outs
+
+
+def probe_deps(root):
+    outs = []
+    for tag, deps in (('ab', [2]), ('self', [1]), ('none', None)):
+        a = image_layer(1, 'A', '900 540 0', '400 400', color='1 0 0')
+        b = image_layer(2, 'B', '1020 540 0', '400 400', color='0 0 1')
+        if deps:
+            a['dependencies'] = deps
+        outs.append(write(root, f'probe_deps_{tag}', white_probe_files([grey_bg(3), a, b])))
+    return outs
+
+
+def probe_brightness(root):
+    objs = [grey_bg(), image_layer(2, 'half', '400 540 0', '200 200', brightness=0.5), image_layer(3, 'one', '800 540 0', '200 200', brightness=1.0),
+            image_layer(4, 'double-grey', '1200 540 0', '200 200', color='0.4 0.4 0.4', brightness=2.0),
+            image_layer(5, 'double-white', '1600 540 0', '200 200', brightness=2.0)]
+    return write(root, 'probe_brightness', white_probe_files(objs))
+
+
+def probe_shake(root):
+    objs = [grey_bg(), image_layer(2, 'cross-h', '960 540 0', '400 6', color='1 0 0'), image_layer(3, 'cross-v', '960 540 0', '6 400', color='1 0 0')]
+    outs = []
+    for tag, amp, speed, rough in (('a1', 1.0, 1.0, 1.0), ('a3', 3.0, 1.0, 1.0), ('a1s3', 1.0, 3.0, 1.0), ('r4', 1.0, 1.0, 4.0), ('r0', 1.0, 1.0, 0.0)):
+        outs.append(write(root, f'probe_shake_{tag}', white_probe_files(objs, camerashake=True, camerashakeamplitude=amp, camerashakespeed=speed, camerashakeroughness=rough)))
+    return outs
+
+
+SCENE_GETTER_SCRIPT = """'use strict';
+export function init(value) {
+    const layer = thisLayer;
+    const fov = thisScene.fov;
+    const amount = thisScene.cameraparallaxamount;
+    const clear = thisScene.clearcolor;
+    const bloom = thisScene.bloomstrength;
+    thisLayer.origin = new Vec3(100 + (Number.isFinite(fov) ? fov * 10 : 0), 900, 0);
+    thisScene.getLayer('amount').origin = new Vec3(100 + (Number.isFinite(amount) ? amount * 1000 : 0), 700, 0);
+    thisScene.getLayer('clear').origin = new Vec3(100 + (clear && Number.isFinite(clear.x) ? clear.x * 1000 : 0), 500, 0);
+    thisScene.getLayer('bloom').origin = new Vec3(100 + (Number.isFinite(bloom) ? bloom * 100 : 0), 300, 0);
+    return value;
+}
+"""
+
+SCENE_SETTER_SCRIPT = """'use strict';
+export function init(value) {
+    thisScene.clearcolor = new Vec3(1, 0, 0);
+    return value;
+}
+"""
+
+
+def probe_scene_get(root):
+    objs = [image_layer(2, 'fov', '100 900 0', '40 40', color='1 0 0'), image_layer(3, 'amount', '100 700 0', '40 40', color='0 1 0'),
+            image_layer(4, 'clear', '100 500 0', '40 40', color='0 0 1'), image_layer(5, 'bloom', '100 300 0', '40 40', color='1 1 0')]
+    objs[0]['alpha'] = {'script': SCENE_GETTER_SCRIPT, 'value': 1.0}
+    for o in objs:
+        o['parallaxDepth'] = '0 0'
+    return write(root, 'probe_scene_get', white_probe_files(objs, clearcolor='0.3 0 0', cameraparallax=False, cameraparallaxamount=0.5, bloom=False, bloomstrength=2.5))
+
+
+def probe_scene_set(root):
+    objs = [image_layer(2, 'dot', '960 540 0', '100 100', color='0 0 1')]
+    objs[0]['alpha'] = {'script': SCENE_SETTER_SCRIPT, 'value': 1.0}
+    return write(root, 'probe_scene_set', white_probe_files(objs))
+
+
+
+PROBE_VERT = """
+uniform mat4 g_ModelViewProjectionMatrix;
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+varying vec2 v_TexCoord;
+void main() {
+	gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);
+	v_TexCoord = a_TexCoord;
+}
+"""
+
+COMPOSITE_FRAG = """
+#include "common_composite.h"
+uniform sampler2D g_Texture0; // {"material":"framebuffer","hidden":true}
+varying vec2 v_TexCoord;
+void main() {
+	gl_FragColor = vec4(g_CompositeColor, 1.0);
+}
+"""
+
+MATRIX_FRAG = """
+uniform sampler2D g_Texture0; // {"material":"framebuffer","hidden":true}
+uniform MATTYPE MATNAME;
+varying vec2 v_TexCoord;
+void main() {
+	int i = int(floor(v_TexCoord.x * 16.0));
+	float e = 0.0;
+	ELEMENTS
+	float k = v_TexCoord.y < 0.5 ? KFINE : KCOARSE;
+	float v = clamp(0.5 + e * k, 0.0, 1.0);
+	gl_FragColor = vec4(v, v, v, 1.0);
+}
+"""
+
+MATRIX_PROBES = {'etp': ('g_EffectTextureProjectionMatrix', 4, 1.0, 0.25), 'etpi': ('g_EffectTextureProjectionMatrixInverse', 4, 0.1, 0.025),
+                 'vp': ('g_ViewProjectionMatrix', 4, 200.0, 0.25), 'em': ('g_EffectModelMatrix', 4, 0.002, 0.25),
+                 'nm': ('g_NormalModelMatrix', 3, 1.0, 0.25), 'mvp': ('g_ModelViewProjectionMatrix', 4, 200.0, 0.25)}
+
+
+def matrix_frag(name, rows, kfine, kcoarse):
+    elements = []
+    for col in range(rows):
+        for row in range(rows):
+            i = col * 4 + row
+            elements.append(('if' if not elements else 'else if') + f' (i == {i}) e = {name}[{col}][{row}];')
+    return (MATRIX_FRAG.replace('MATTYPE', f'mat{rows}').replace('MATNAME', name).replace('ELEMENTS', '\n\t'.join(elements))
+            .replace('KFINE', f'{kfine:.6f}').replace('KCOARSE', f'{kcoarse:.6f}'))
+
+
+BIG_MODEL = {'material': 'materials/big.json', 'autosize': False, 'fullscreen': False, 'passthrough': False, 'puppet': None}
+BIG_MAT = {'passes': [{'alphawriting': 'default', 'blending': 'translucent', 'combos': {'VERSION': 2}, 'cullmode': 'nocull',
+                       'depthtest': 'disabled', 'depthwrite': 'disabled', 'shader': 'genericimage2', 'textures': ['util/perlin_256']}]}
+
+
+def custom_effect_files(tag, frag):
+    return {'models/big.json': BIG_MODEL, 'materials/big.json': BIG_MAT,
+            f'effects/{tag}/effect.json': {'name': tag, 'group': 'probe', 'passes': [{'material': f'materials/effects/{tag}.json'}],
+                                           'dependencies': [f'materials/effects/{tag}.json', f'shaders/effects/{tag}.frag', f'shaders/effects/{tag}.vert']},
+            f'materials/effects/{tag}.json': {'passes': [{'shader': f'effects/{tag}', 'blending': 'normal', 'depthtest': 'disabled', 'depthwrite': 'disabled', 'cullmode': 'nocull'}]},
+            f'shaders/effects/{tag}.vert': PROBE_VERT.encode(), f'shaders/effects/{tag}.frag': frag.encode()}
+
+
+def effect_layer(oid, name, origin, size, tag, color='1 1 1', angles='0 0 0', scale='1 1 1', consts=None):
+    o = image_layer(oid, name, origin, size, color=color, angles=angles, scale=scale, model='models/big.json')
+    o['effects'] = [{'file': f'effects/{tag}/effect.json', 'id': 100 + oid, 'name': '', 'passes': [{'constantshadervalues': consts or {}, 'id': 200 + oid}], 'visible': True}]
+    return o
+
+
+def probe_composite(root):
+    files = custom_effect_files('probe_composite', COMPOSITE_FRAG)
+    objs = [grey_bg(), effect_layer(2, 'grey-object', '400 540 0', '300 300', 'probe_composite', color='0.5 0.5 0.5'),
+            effect_layer(3, 'white-object', '900 540 0', '300 300', 'probe_composite'),
+            effect_layer(4, 'grey-set', '1400 540 0', '300 300', 'probe_composite', color='0.5 0.5 0.5', consts={'compositecolor': '1 0 0'})]
+    files.update(white_probe_files(objs))
+    return write(root, 'probe_composite', files)
+
+
+def probe_matrix(root):
+    outs = []
+    for tag, (name, rows, kfine, kcoarse) in MATRIX_PROBES.items():
+        files = custom_effect_files(f'probe_{tag}', matrix_frag(name, rows, kfine, kcoarse))
+        objs = [image_layer(1, 'backdrop', '960 540 0', '1920 1080', color='0 0.5 0'),
+                effect_layer(2, tag, '700 400 0', '640 320', f'probe_{tag}', angles='0 0 30', scale='1.5 1 1')]
+        files.update(white_probe_files(objs))
+        outs.append(write(root, f'probe_mat_{tag}', files))
+    return outs
+
+
+
+BRIGHT_FRAG = """
+uniform sampler2D g_Texture0; // {"material":"framebuffer","hidden":true}
+uniform float g_Brightness;
+varying vec2 v_TexCoord;
+void main() {
+	float v = clamp(g_Brightness * 0.25, 0.0, 1.0);
+	gl_FragColor = vec4(v, v, v, 1.0);
+}
+"""
+
+
+def probe_ubright(root):
+    files = custom_effect_files('probe_ubright', BRIGHT_FRAG)
+    objs = [grey_bg(), effect_layer(2, 'b2', '400 540 0', '300 300', 'probe_ubright'), effect_layer(3, 'b1', '900 540 0', '300 300', 'probe_ubright'),
+            effect_layer(4, 'b05', '1400 540 0', '300 300', 'probe_ubright')]
+    objs[1]['brightness'] = 2.0
+    objs[3]['brightness'] = 0.5
+    files.update(white_probe_files(objs))
+    return write(root, 'probe_ubright', files)
+
+
+
+def probe_brightness_legacy(root):
+    objs = [grey_bg(), image_layer(2, 'half', '400 540 0', '200 200', brightness=0.5, model='models/legacy.json'),
+            image_layer(3, 'one', '800 540 0', '200 200', brightness=1.0, model='models/legacy.json'),
+            image_layer(4, 'double-grey', '1200 540 0', '200 200', color='0.4 0.4 0.4', brightness=2.0, model='models/legacy.json'),
+            image_layer(5, 'half-v2', '1600 540 0', '200 200', brightness=0.5)]
+    files = white_probe_files(objs)
+    files['models/legacy.json'] = {'material': 'materials/legacy.json', 'autosize': False, 'fullscreen': False, 'passthrough': False, 'puppet': None}
+    files['materials/legacy.json'] = WHITE_MAT
+    return write(root, 'probe_brightness_legacy', files)
 
 
 PROBES = {name[6:]: fn for name, fn in list(globals().items()) if name.startswith('probe_') and callable(fn)}

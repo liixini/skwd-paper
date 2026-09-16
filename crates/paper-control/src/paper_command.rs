@@ -11,6 +11,8 @@ pub struct PaperCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duck: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freeze: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<SceneCapture>,
@@ -22,6 +24,42 @@ pub struct PaperCommand {
     pub outputs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<PointerState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerState {
+    pub x: u16,
+    pub y: u16,
+    #[serde(default)]
+    pub buttons: u8,
+}
+
+impl PointerState {
+    #[must_use]
+    pub fn from_normalized(x: f32, y: f32, buttons: [bool; 3]) -> Self {
+        let quantize = |value: f32| (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16;
+        Self {
+            x: quantize(x),
+            y: quantize(y),
+            buttons: buttons
+                .iter()
+                .enumerate()
+                .map(|(index, pressed)| u8::from(*pressed) << index)
+                .sum(),
+        }
+    }
+
+    #[must_use]
+    pub fn position(&self) -> [f32; 2] {
+        [f32::from(self.x) / f32::from(u16::MAX), f32::from(self.y) / f32::from(u16::MAX)]
+    }
+
+    #[must_use]
+    pub fn pressed(&self) -> [bool; 3] {
+        std::array::from_fn(|index| self.buttons & (1 << index) != 0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,12 +90,14 @@ impl PaperCommand {
             mute: Some(mute),
             volume: Some(volume.min(100)),
             pause: None,
+            duck: None,
             capture: None,
             freeze: None,
             shader: None,
             duration_ms: None,
             outputs: None,
             properties: None,
+            pointer: None,
         }
     }
 
@@ -67,12 +107,14 @@ impl PaperCommand {
             mute: Some(mute),
             volume: Some(volume.min(100)),
             pause: None,
+            duck: None,
             capture: None,
             freeze: None,
             shader: Some(shader.to_string()),
             duration_ms: Some(duration_ms),
             outputs: None,
             properties: None,
+            pointer: None,
         }
     }
 
@@ -82,12 +124,14 @@ impl PaperCommand {
             mute,
             volume: volume.map(|value| value.min(100)),
             pause: None,
+            duck: None,
             capture: None,
             freeze: None,
             shader: None,
             duration_ms: None,
             outputs: None,
             properties: None,
+            pointer: None,
         }
     }
 
@@ -97,18 +141,43 @@ impl PaperCommand {
         command
     }
 
+    pub fn pointer(x: f32, y: f32, buttons: [bool; 3]) -> Self {
+        let mut command = Self::audio(None, None);
+        command.pointer = Some(PointerState::from_normalized(x, y, buttons));
+        command
+    }
+
     pub fn pause(paused: bool) -> Self {
         Self {
             to: String::new(),
             mute: None,
             volume: None,
             pause: Some(paused),
+            duck: None,
+            pointer: None,
             capture: None,
             freeze: None,
             shader: None,
             duration_ms: None,
             outputs: None,
             properties: None,
+        }
+    }
+
+    pub fn duck(ducked: bool) -> Self {
+        Self {
+            to: String::new(),
+            mute: None,
+            volume: None,
+            pause: None,
+            duck: Some(ducked),
+            capture: None,
+            freeze: None,
+            shader: None,
+            duration_ms: None,
+            outputs: None,
+            properties: None,
+            pointer: None,
         }
     }
 
@@ -118,12 +187,14 @@ impl PaperCommand {
             mute: None,
             volume: None,
             pause: None,
+            duck: None,
             capture: None,
             freeze: Some(path.to_string()),
             shader: None,
             duration_ms: None,
             outputs: None,
             properties: None,
+            pointer: None,
         }
     }
 
@@ -133,12 +204,14 @@ impl PaperCommand {
             mute: None,
             volume: None,
             pause: None,
+            duck: None,
             capture: None,
             freeze: None,
             shader: None,
             duration_ms: None,
             outputs: Some(outputs.to_vec()),
             properties: None,
+            pointer: None,
         }
     }
 
@@ -149,19 +222,27 @@ impl PaperCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandClass {
+    Pointer(PointerState),
     Freeze(String),
     Pause(bool),
+    Duck(bool),
     RetainOutputs(Vec<String>),
     Audio { mute: Option<bool>, volume: Option<u32> },
     Swap(PaperCommand),
 }
 
 pub fn classify_command(command: PaperCommand) -> CommandClass {
+    if let Some(pointer) = command.pointer {
+        return CommandClass::Pointer(pointer);
+    }
     if let Some(path) = command.freeze {
         return CommandClass::Freeze(path);
     }
     if let Some(paused) = command.pause {
         return CommandClass::Pause(paused);
+    }
+    if let Some(ducked) = command.duck {
+        return CommandClass::Duck(ducked);
     }
     if command.to.is_empty()
         && command.mute.is_none()

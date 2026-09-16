@@ -1,3 +1,4 @@
+11	crates/paper-audio/src/pulse.rs
 7	crates/paper-cli/src/backend.rs
 1	crates/paper-cli/src/client.rs
 3	crates/paper-cli/src/manager.rs
@@ -29,7 +30,7 @@
 3	crates/paper-vk/src/decode/tests.rs
 16	crates/paper-vk/src/ffmpeg_vulkan.rs
 2	crates/paper-vk/src/freeze.rs
-1	crates/paper-vk/src/main.rs
+2	crates/paper-vk/src/main.rs
 2	crates/paper-vk/src/memory.rs
 15	crates/paper-vk/src/preview.rs
 1	crates/paper-vk/src/preview/gpu.rs

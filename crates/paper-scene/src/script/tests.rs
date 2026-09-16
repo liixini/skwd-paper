@@ -1,4 +1,4 @@
-use super::SceneScripts;
+use super::{SceneScripts, ScriptCommand, SoundOp, SpriteOp};
 use crate::model::Properties;
 use serde_json::json;
 
@@ -275,4 +275,109 @@ fn cursor_local_position_accounts_for_parent_rotation_and_scale() {
         .map(|v| v.parse::<f32>().unwrap())
         .collect::<Vec<_>>();
     assert!((p[0] - 10.0).abs() < 0.001 && (p[1] - 5.0).abs() < 0.001, "{p:?}");
+}
+
+#[test]
+fn user_properties_reach_scripts_after_init() {
+    let mut scene = json!({"objects":[{"id":1,"alpha":{"value":0.1,"script":"export function init(v){return v;} export function applyUserProperties(p){ if (p.opacity !== undefined) thisLayer.alpha = p.opacity; }"}}]});
+    let project = json!({"general":{"properties":{"opacity":{"type":"slider","value":0.7}}}});
+    let props = crate::effects::parse_properties(&project);
+    let host = SceneScripts::load(&mut scene, &props, &project).unwrap().unwrap();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert!((scene["objects"][0]["alpha"].as_f64().unwrap() - 0.7).abs() < 1e-6);
+}
+
+#[test]
+fn sound_layer_controls_queue_voice_commands() {
+    let mut scene = json!({"objects":[
+        {"id":7,"name":"BGM","sound":["sounds/a.ogg"],"startsilent":true,"volume":1.0},
+        {"id":2,"alpha":{"value":1.0,"script":"export function init(){ const s = thisScene.getLayer('BGM'); s.play(); if (!s.isPlaying()) throw Error('not playing'); s.pause(); s.stop(); s.volume = 0.5; }"}}
+    ]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    let commands = host.take_commands();
+    assert_eq!(
+        commands,
+        vec![
+            ScriptCommand::Sound { id: "7".into(), op: SoundOp::Gain(0.5) },
+            ScriptCommand::Sound { id: "7".into(), op: SoundOp::Play },
+            ScriptCommand::Sound { id: "7".into(), op: SoundOp::Pause },
+            ScriptCommand::Sound { id: "7".into(), op: SoundOp::Stop },
+        ]
+    );
+    assert!(host.take_commands().is_empty());
+}
+
+#[test]
+fn texture_animation_controls_queue_sprite_commands() {
+    let mut scene = json!({"objects":[{"id":1,"image":"models/a.json","alpha":{"value":1.0,"script":"export function init(){ const a = thisLayer.getTextureAnimation(); a.setFrame(1); a.pause(); a.rate = 2; a.play(); a.join(); }"}}]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    host.set_sprites(&[(0, 4, 2.0)]);
+    let ops: Vec<SpriteOp> = host
+        .take_commands()
+        .into_iter()
+        .map(|command| match command {
+            ScriptCommand::Sprite { object: 0, op } => op,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        ops,
+        vec![
+            SpriteOp::Frame(1),
+            SpriteOp::Pause,
+            SpriteOp::Rate(2.0),
+            SpriteOp::Play,
+            SpriteOp::Join
+        ]
+    );
+    assert_eq!(
+        scene["objects"][0]["alpha"], 1.0,
+        "sprite control must not touch the scene document"
+    );
+}
+
+#[test]
+fn destroyed_layers_hide_and_initial_config_is_a_copy() {
+    let mut scene = json!({"objects":[{"id":1,"name":"a","visible":true,"origin":"5 5 0"},{"id":2,"alpha":{"value":1.0,"script":"export function init(){ thisScene.getLayer('a').origin = new Vec3(9,9,0); const initial = thisScene.getInitialLayerConfig('a'); if (initial.origin !== '5 5 0') throw Error('initial ' + initial.origin); if (!thisScene.destroyLayer('a')) throw Error('destroy'); if (thisScene.getLayerCount() !== 2) throw Error('count'); }"}}]});
+    let host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert_eq!(scene["objects"][0]["visible"], false);
+    assert_eq!(scene["objects"][0]["origin"], "9 9 0");
+}
+
+#[test]
+fn scene_general_accessors_read_the_scene_and_report_setter_changes() {
+    let mut scene = json!({"general":{"clearcolor":"0.3 0 0","fov":50.0,"cameraparallaxamount":{"user":"p","value":0.25},"bloom":false},
+        "objects":[{"id":1,"name":"dot","origin":{"value":"0 0 0","script":"export function init(value){ thisScene.clearcolor = new Vec3(1,0,0); thisScene.bloom = true; return new Vec3(thisScene.fov, thisScene.cameraparallaxamount * 1000, thisScene.bloomstrength + thisScene.clearcolor.x); }"}}]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert_eq!(scene["objects"][0]["origin"], "50 250 3");
+    assert_eq!(scene["general"]["clearcolor"], "1 0 0");
+    assert_eq!(scene["general"]["bloom"], true);
+    let changes = host.take_general_changes();
+    assert!(changes.contains(&("clearcolor".to_string(), json!("1 0 0"))), "{changes:?}");
+    assert!(changes.contains(&("bloom".to_string(), json!(true))), "{changes:?}");
+    assert!(host.take_general_changes().is_empty());
+}
+
+#[test]
+fn destroy_hook_runs_once_and_its_changes_reach_the_scene() {
+    let mut scene = json!({"objects":[{"id":1,"visible":true,"alpha":{"value":1.0,"script":"export function destroy(){ thisLayer.visible = false; }"}}]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    assert_eq!(host.scene["objects"][0]["visible"], true);
+    host.destroy();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert_eq!(host.scene["objects"][0]["visible"], false);
 }

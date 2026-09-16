@@ -50,7 +50,9 @@ pub fn box_offset(metrics: &Metrics, halign: HAlign, valign: VAlign) -> (f32, f3
     };
     let y = match valign {
         VAlign::Top => 0.0,
-        VAlign::Center => -metrics.ascent * 0.5,
+        VAlign::Center => {
+            -metrics.ascent * 0.5 - metrics.line_height * (metrics.lines.max(1) - 1) as f32 * 0.5
+        }
         VAlign::Bottom => -metrics.height(),
     };
     (x, y)

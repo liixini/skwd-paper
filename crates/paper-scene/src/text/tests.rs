@@ -141,3 +141,17 @@ fn text_objects_become_layers_anchored_at_the_origin() {
     assert!((top - 539.0).abs() < 1.0, "top {top}");
     assert!(layer.size.1 > 270.0 && layer.size.1 < 278.0, "{:?}", layer.size);
 }
+
+#[test]
+fn centered_blocks_share_the_middle_line_with_the_engine() {
+    let one = Metrics { width: 10.0, ascent: 40.0, descent: 10.0, line_height: 91.0, lines: 1 };
+    let three = Metrics { lines: 3, ..one };
+    let (_, single) = box_offset(&one, HAlign::Left, VAlign::Center);
+    let (_, block) = box_offset(&three, HAlign::Left, VAlign::Center);
+    assert!((single - -20.0).abs() < 1e-6);
+    assert!((block - (single - 91.0)).abs() < 1e-6);
+    let (_, top) = box_offset(&three, HAlign::Left, VAlign::Top);
+    let (_, bottom) = box_offset(&three, HAlign::Left, VAlign::Bottom);
+    assert!((top - 0.0).abs() < 1e-6);
+    assert!((bottom - -three.height()).abs() < 1e-6);
+}

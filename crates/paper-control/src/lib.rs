@@ -11,7 +11,7 @@ mod still_command;
 pub use media::{VIDEO_EXTS, is_video_path};
 pub use multi_video::MultiVideoEntry;
 pub use output_target::OutputTarget;
-pub use paper_command::{CommandClass, PaperCommand, SceneCapture, classify_command};
+pub use paper_command::{CommandClass, PaperCommand, PointerState, SceneCapture, classify_command};
 pub use protocol::{
     ApplyRequest, ApplyResponse, ApplyResult, Assignment, AssignmentStatus, AudioSetRequest,
     AudioSetResponse, AudioSetResult, CapabilitiesRequest, CapabilitiesResponse,
@@ -20,8 +20,8 @@ pub use protocol::{
     PauseResponse, PauseResult, RendererCapability, RendererDiscovery, RendererFailed,
     RendererPolicy, RendererPolicyCapabilities, RendererReady, Request, RequestParams, Response,
     ResponseBody, ResponseError, RuntimeDependencyStatus, SandPolicy, SandQuality, SandScope,
-    ScenePolicy, Source, SourceKind, StatusRequest, StatusResponse, StatusResult, StopRequest,
-    StopResponse, StopResult, SurfacePolicy, TransitionCapabilities, TransitionPolicy,
+    SceneClamp, ScenePolicy, Source, SourceKind, StatusRequest, StatusResponse, StatusResult,
+    StopRequest, StopResponse, StopResult, SurfacePolicy, TransitionCapabilities, TransitionPolicy,
     ValidationError, VideoEngine, WallpaperEngineCapabilities, decode_ndjson, encode_ndjson,
 };
 pub use scene_thumbnail::{SceneThumbnailRequest, SceneThumbnailResponse};

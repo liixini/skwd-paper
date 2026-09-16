@@ -30,6 +30,75 @@ impl Scripts {
 }
 
 impl Group {
+    fn apply_general(&mut self, key: &str, value: &serde_json::Value) {
+        let numbers = paper_scene::effects::json_numbers(value);
+        let scalar = numbers.as_ref().and_then(|list| list.first().copied());
+        let flag = value.as_bool().or(scalar.map(|v| v != 0.0));
+        let rgb =
+            numbers.as_ref().filter(|list| list.len() >= 3).map(|list| [list[0], list[1], list[2]]);
+        match key {
+            "clearcolor" => {
+                if let Some(rgb) = rgb {
+                    self.clear = rgb;
+                }
+            }
+            "ambientcolor" | "skylightcolor" => {
+                let name = if key == "ambientcolor" {
+                    "g_LightAmbientColor"
+                } else {
+                    "g_LightSkylightColor"
+                };
+                if let Some(rgb) = rgb {
+                    self.scene_uniforms.insert(name.to_owned(), rgb.to_vec());
+                    for fx in &mut self.fx {
+                        fx.uniforms.insert(name.to_owned(), rgb.to_vec());
+                    }
+                }
+            }
+            "bloom" => {
+                if let Some(on) = flag
+                    && let Some(quad) =
+                        self.fx.iter().find(|fx| fx.layer_id == "@bloom").map(|fx| fx.quad)
+                {
+                    self.quads[quad].tint[3] = if on { 1.0 } else { 0.0 };
+                }
+            }
+            "bloomstrength" | "bloomthreshold" | "bloomtint" => {
+                let name = match key {
+                    "bloomstrength" => "g_BloomStrength",
+                    "bloomthreshold" => "g_BloomThreshold",
+                    _ => "g_BloomTint",
+                };
+                let value = if key == "bloomtint" {
+                    rgb.map(|c| c.to_vec())
+                } else {
+                    scalar.map(|v| vec![v])
+                };
+                if let Some(value) = value
+                    && let Some(fx) = self.fx.iter_mut().find(|fx| fx.layer_id == "@bloom")
+                {
+                    fx.uniforms.insert(name.to_owned(), value);
+                }
+            }
+            "fov" => {
+                if let Some(fov) = scalar {
+                    self.mouse.set_fov(fov.clamp(1.0, 179.0));
+                }
+            }
+            "cameraparallax"
+            | "cameraparallaxamount"
+            | "cameraparallaxdelay"
+            | "cameraparallaxmouseinfluence" => self.mouse.set_parallax(key, flag, scalar),
+            "camerashake"
+            | "camerashakeamplitude"
+            | "camerashakespeed"
+            | "camerashakeroughness" => {
+                self.mouse.set_shake(key, flag, scalar);
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn advance_scripts(&mut self, time: f32, dt: f32) -> Result<()> {
         let Some(mut scripts) = self.scripts.take() else {
             return Ok(());
@@ -67,6 +136,26 @@ impl Group {
             .collect();
         scripts.host.pointer(self.mouse.position, self.mouse.buttons, hits)?;
         let changed = scripts.host.tick(time, dt, self.mouse.position)?;
+        for command in scripts.host.take_commands() {
+            match command {
+                paper_scene::script::ScriptCommand::Sprite { object, op } => {
+                    self.sprite_command(object, op, time);
+                }
+                paper_scene::script::ScriptCommand::Sound { id, op } => {
+                    use paper_scene::script::SoundOp;
+                    let op = match op {
+                        SoundOp::Play => paper_audio::VoiceOp::Play,
+                        SoundOp::Stop => paper_audio::VoiceOp::Stop,
+                        SoundOp::Pause => paper_audio::VoiceOp::Pause,
+                        SoundOp::Gain(gain) => paper_audio::VoiceOp::Gain(gain),
+                    };
+                    self.script_sounds.push((id, op));
+                }
+            }
+        }
+        for (key, value) in scripts.host.take_general_changes() {
+            self.apply_general(&key, &value);
+        }
         if !changed && !std::mem::take(&mut scripts.pending) {
             return Ok(());
         }
@@ -106,9 +195,15 @@ impl Group {
                 continue;
             }
             let quad = &mut self.quads[index];
-            quad.rect = state.rect;
-            quad.angle = state.angle;
-            self.mouse.set_script_rect(index, state.rect);
+            if scripts.layouts[index].passthrough {
+                quad.rect =
+                    [state.rect[0], state.rect[1], state.rect[2].abs(), state.rect[3].abs()];
+                quad.angle = 0.0;
+            } else {
+                quad.rect = state.rect;
+                quad.angle = state.angle;
+            }
+            self.mouse.set_script_rect(index, quad.rect);
             if let Some(fx) = self.fx.iter_mut().find(|fx| fx.quad == index) {
                 let origin = (state.rect[0], self.canvas.1 - state.rect[1], state.depth);
                 let scale = [state.scale[0], state.scale[1], 1.0];
@@ -145,6 +240,8 @@ impl Group {
                     }
                     *ordinal += 1;
                 }
+            } else if scripts.layouts[index].hidden_without_fx {
+                quad.tint = [1.0, 1.0, 1.0, 0.0];
             } else {
                 quad.tint = state.tint;
             }

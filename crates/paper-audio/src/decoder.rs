@@ -25,15 +25,18 @@ pub(super) enum Repeat {
     Once,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn decode_loop(
     path: &str,
     producer: &mut RingProducer,
     stop: &AtomicBool,
     mute: &AtomicBool,
     paused: &AtomicBool,
+    hold: &AtomicBool,
+    restart: &AtomicBool,
     wake: &(Mutex<()>, Condvar),
     repeat: Repeat,
-) -> Result<()> {
+) -> Result<bool> {
     let mut input_options = ff::Dictionary::new();
     input_options.set("probesize", "65536");
     input_options.set("analyzeduration", "500000");
@@ -88,15 +91,21 @@ pub(super) fn decode_loop(
     let mut resampled = ff::frame::Audio::empty();
     let mut interleave_buffer = Vec::new();
     let mut traced_pushes = 0;
-    let gate = ParkGate { mute, paused, wake };
+    let gate = ParkGate { mute, paused, hold, restart, wake };
 
     while !stop.load(Ordering::Relaxed) {
-        if mute.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+        if restart.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        if mute.load(Ordering::Relaxed)
+            || paused.load(Ordering::Relaxed)
+            || hold.load(Ordering::Relaxed)
+        {
             let guard = wake.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if should_park(
-                mute.load(Ordering::Relaxed),
+                mute.load(Ordering::Relaxed) || hold.load(Ordering::Relaxed),
                 paused.load(Ordering::Relaxed),
-                stop.load(Ordering::Relaxed),
+                stop.load(Ordering::Relaxed) || restart.load(Ordering::Relaxed),
             ) {
                 let _unused = wake.1.wait(guard);
             }
@@ -123,7 +132,7 @@ pub(super) fn decode_loop(
             }
         }
     }
-    Ok(())
+    Ok(restart.load(Ordering::Relaxed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -220,6 +229,8 @@ pub(super) fn should_park(mute: bool, paused: bool, stop: bool) -> bool {
 pub(super) struct ParkGate<'a> {
     pub(super) mute: &'a AtomicBool,
     pub(super) paused: &'a AtomicBool,
+    pub(super) hold: &'a AtomicBool,
+    pub(super) restart: &'a AtomicBool,
     pub(super) wake: &'a (Mutex<()>, Condvar),
 }
 
@@ -275,7 +286,7 @@ fn interleave_planar(
 fn write_all(producer: &mut RingProducer, buffer: &[f32], stop: &AtomicBool, gate: &ParkGate<'_>) {
     let mut written = 0;
     while written < buffer.len() {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || gate.restart.load(Ordering::Relaxed) {
             return;
         }
         let pushed = producer.push_slice(&buffer[written..]);
@@ -284,15 +295,15 @@ fn write_all(producer: &mut RingProducer, buffer: &[f32], stop: &AtomicBool, gat
             continue;
         }
         if should_park(
-            gate.mute.load(Ordering::Relaxed),
+            gate.mute.load(Ordering::Relaxed) || gate.hold.load(Ordering::Relaxed),
             gate.paused.load(Ordering::Relaxed),
             false,
         ) {
             let guard = gate.wake.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if should_park(
-                gate.mute.load(Ordering::Relaxed),
+                gate.mute.load(Ordering::Relaxed) || gate.hold.load(Ordering::Relaxed),
                 gate.paused.load(Ordering::Relaxed),
-                stop.load(Ordering::Relaxed),
+                stop.load(Ordering::Relaxed) || gate.restart.load(Ordering::Relaxed),
             ) {
                 let _unused = gate.wake.1.wait(guard);
             }

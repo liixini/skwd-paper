@@ -339,7 +339,7 @@ fn instance_combos(
     combos
 }
 
-pub(crate) fn json_numbers(value: &Value) -> Option<Vec<f32>> {
+pub fn json_numbers(value: &Value) -> Option<Vec<f32>> {
     match value {
         Value::Number(num) => Some(vec![num.as_f64()? as f32]),
         Value::Bool(flag) => Some(vec![f32::from(u8::from(*flag))]),
@@ -982,6 +982,26 @@ impl PassMeta {
             values.insert("g_ModelViewProjectionMatrix".into(), mvp);
             values.insert("g_ModelViewProjectionMatrixInverse".into(), inverse);
         }
+        values.entry("g_ViewProjectionMatrix".into()).or_insert_with(|| {
+            vec![
+                2.0 / sw,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                ys * 2.0 / sh,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -1.0,
+                -ys,
+                0.5,
+                1.0,
+            ]
+        });
         let (w, h) = (width as f32, height as f32);
         values.insert("g_Resolution".into(), vec![w, h, 1.0 / w.max(1.0), 1.0 / h.max(1.0)]);
         for slot in 0..8 {

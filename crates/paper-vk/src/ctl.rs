@@ -44,6 +44,13 @@ impl AudioSink {
             Self::Scene(scene) => scene.set_pause(paused),
         }
     }
+
+    pub fn set_duck(&mut self, ducked: bool) {
+        match self {
+            Self::Media(audio) => audio.set_duck(ducked),
+            Self::Scene(scene) => scene.set_duck(ducked),
+        }
+    }
 }
 
 pub struct Ctl {
@@ -54,9 +61,12 @@ pub struct Ctl {
     pub mute: bool,
     pub volume: u32,
     pub paused: bool,
+    pub ducked: bool,
     freeze: Option<String>,
     capture: Option<paper_control::SceneCapture>,
     wake: Option<paper_runtime::wake::Pipe>,
+    pointer: Option<paper_control::PointerState>,
+    pointer_revision: u64,
 }
 
 pub fn parse_audio_opts(args: &[String]) -> (bool, u32) {
@@ -120,11 +130,14 @@ impl Ctl {
             mute,
             volume,
             paused: false,
+            ducked: false,
             freeze: None,
             capture: None,
             wake,
             output_pauses: Vec::new(),
             route_output_pauses: false,
+            pointer: None,
+            pointer_revision: 0,
         }
     }
 
@@ -136,11 +149,14 @@ impl Ctl {
             mute: true,
             volume: 80,
             paused: false,
+            ducked: false,
             freeze: None,
             capture: None,
             wake: None,
             output_pauses: Vec::new(),
             route_output_pauses: false,
+            pointer: None,
+            pointer_revision: 0,
         }
     }
 
@@ -161,11 +177,24 @@ impl Ctl {
             mute,
             volume,
             paused: false,
+            ducked: false,
             freeze: None,
             capture: None,
             wake,
             output_pauses: Vec::new(),
             route_output_pauses: false,
+            pointer: None,
+            pointer_revision: 0,
+        }
+    }
+
+    pub fn pointer(&self) -> Option<(u64, [f32; 2], [bool; 3])> {
+        self.pointer.map(|state| (self.pointer_revision, state.position(), state.pressed()))
+    }
+
+    pub fn scene_sound(&mut self, id: &str, op: paper_audio::VoiceOp) {
+        if let Some(AudioSink::Scene(scene)) = &mut self.audio {
+            scene.voice(id, op);
         }
     }
 
@@ -179,6 +208,7 @@ impl Ctl {
             _ => {
                 let mut scene = paper_audio::GatedScene::new(voices, self.mute, self.volume);
                 scene.set_pause(self.paused);
+                scene.set_duck(self.ducked);
                 self.audio = Some(AudioSink::Scene(scene));
             }
         }
@@ -257,6 +287,13 @@ impl Ctl {
             return None;
         }
         match paper_control::classify_command(cmd) {
+            paper_control::CommandClass::Pointer(state) => {
+                if self.pointer != Some(state) {
+                    self.pointer = Some(state);
+                    self.pointer_revision = self.pointer_revision.wrapping_add(1);
+                }
+                None
+            }
             paper_control::CommandClass::Freeze(path) => {
                 tracing::info!(path, "skwd-wall-vk: freeze frame requested");
                 self.paused = true;
@@ -270,6 +307,13 @@ impl Ctl {
                 self.paused = paused;
                 if let Some(audio) = &mut self.audio {
                     audio.set_pause(paused);
+                }
+                None
+            }
+            paper_control::CommandClass::Duck(ducked) => {
+                self.ducked = ducked;
+                if let Some(audio) = &mut self.audio {
+                    audio.set_duck(ducked);
                 }
                 None
             }
@@ -307,11 +351,9 @@ impl Ctl {
             match &mut self.audio {
                 Some(AudioSink::Media(audio)) => audio.swap(path, self.mute, self.volume),
                 _ => {
-                    self.audio = Some(AudioSink::Media(paper_audio::GatedAudio::new(
-                        path,
-                        self.mute,
-                        self.volume,
-                    )));
+                    let mut audio = paper_audio::GatedAudio::new(path, self.mute, self.volume);
+                    audio.set_duck(self.ducked);
+                    self.audio = Some(AudioSink::Media(audio));
                 }
             }
         } else {

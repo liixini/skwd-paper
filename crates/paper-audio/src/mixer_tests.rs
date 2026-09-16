@@ -52,8 +52,12 @@ fn partial_mixer_construction_owns_and_joins_voice_workers() {
         done_tx.send(()).unwrap();
     });
     let control = VoiceControl {
+        id: "1".into(),
         gain: Arc::new(AtomicU32::new(gain_bits(1.0))),
         stop: stop.clone(),
+        hold: Arc::new(AtomicBool::new(false)),
+        restart: Arc::new(AtomicBool::new(false)),
+        flush: Arc::new(AtomicBool::new(false)),
         wake,
         thread: Some(thread),
     };
@@ -67,12 +71,14 @@ fn partial_mixer_construction_owns_and_joins_voice_workers() {
 #[test]
 fn unplayable_clips_no_mixer() {
     let voices = vec![Voice {
+        id: "1".into(),
         name: "missing".into(),
         clips: vec!["/nonexistent/skwd-test-clip.mp3".into()],
         gain: 1.0,
         mode: VoiceMode::Loop,
         min_gap: 0.0,
         max_gap: 0.0,
+        autostart: true,
     }];
     assert!(SceneMixer::new(&voices, true, 50).unwrap().is_none());
     assert!(SceneMixer::new(&[], true, 50).unwrap().is_none());
@@ -95,20 +101,24 @@ fn real_clips_one_stream() {
 
     let voices = vec![
         Voice {
+            id: "a".into(),
             name: "a".into(),
             clips: vec![first],
             gain: 1.0,
             mode: VoiceMode::Loop,
             min_gap: 0.0,
             max_gap: 0.0,
+            autostart: true,
         },
         Voice {
+            id: "b".into(),
             name: "b".into(),
             clips: vec![second],
             gain: 0.4,
             mode: VoiceMode::Once,
             min_gap: 0.0,
             max_gap: 0.0,
+            autostart: true,
         },
     ];
     let mixer = SceneMixer::new(&voices, true, 60).unwrap().expect("mixer built");

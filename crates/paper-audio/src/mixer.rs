@@ -7,13 +7,13 @@ use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ffmpeg_the_third as ff;
 use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Split};
+use ringbuf::traits::{Consumer, Observer, Split};
 
 use crate::decoder::{Repeat, decode_loop, signal_stop, wake_parked};
 
 const TARGET_SAMPLE_RATE: u32 = 48_000;
 const RING_FRAMES: usize = TARGET_SAMPLE_RATE as usize / 5;
-const MAX_VOICES: usize = 16;
+const MAX_VOICES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VoiceMode {
@@ -24,22 +24,38 @@ pub enum VoiceMode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Voice {
+    pub id: String,
     pub name: String,
     pub clips: Vec<String>,
     pub gain: f32,
     pub mode: VoiceMode,
     pub min_gap: f32,
     pub max_gap: f32,
+    pub autostart: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VoiceOp {
+    Play,
+    Stop,
+    Pause,
+    Gain(f32),
 }
 
 struct VoiceOutput {
     consumer: ringbuf::HeapCons<f32>,
     gain: Arc<AtomicU32>,
+    hold: Arc<AtomicBool>,
+    flush: Arc<AtomicBool>,
 }
 
 struct VoiceControl {
+    id: String,
     gain: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
+    hold: Arc<AtomicBool>,
+    restart: Arc<AtomicBool>,
+    flush: Arc<AtomicBool>,
     wake: Arc<(Mutex<()>, Condvar)>,
     thread: Option<JoinHandle<()>>,
 }
@@ -140,13 +156,25 @@ impl SceneMixer {
             let (producer, consumer) = ring.split();
             let gain = Arc::new(AtomicU32::new(gain_bits(voice.gain)));
             let stop = Arc::new(AtomicBool::new(false));
+            let hold = Arc::new(AtomicBool::new(!voice.autostart));
+            let restart = Arc::new(AtomicBool::new(false));
+            let flush = Arc::new(AtomicBool::new(false));
             let wake = Arc::new((Mutex::new(()), Condvar::new()));
-            outputs.push(VoiceOutput { consumer, gain: gain.clone() });
+            outputs.push(VoiceOutput {
+                consumer,
+                gain: gain.clone(),
+                hold: hold.clone(),
+                flush: flush.clone(),
+            });
 
             let thread_stop = stop.clone();
             let thread_wake = wake.clone();
             let thread_mute = mute_flag.clone();
             let thread_paused = paused_flag.clone();
+            let thread_hold = hold.clone();
+            let thread_restart = restart.clone();
+            let thread_flush = flush.clone();
+            let id = voice.id.clone();
             let thread = std::thread::Builder::new()
                 .name("skwd-scene-voice".into())
                 .spawn(move || {
@@ -155,14 +183,28 @@ impl SceneMixer {
                         &voice,
                         index,
                         &mut producer,
-                        &thread_stop,
-                        &thread_mute,
-                        &thread_paused,
+                        &VoiceFlags {
+                            stop: &thread_stop,
+                            mute: &thread_mute,
+                            paused: &thread_paused,
+                            hold: &thread_hold,
+                            restart: &thread_restart,
+                            flush: &thread_flush,
+                        },
                         &thread_wake,
                     );
                 })
                 .map_err(|error| anyhow!("spawn scene voice thread: {error:?}"))?;
-            controls.push(VoiceControl { gain, stop, wake, thread: Some(thread) });
+            controls.push(VoiceControl {
+                id,
+                gain,
+                stop,
+                hold,
+                restart,
+                flush,
+                wake,
+                thread: Some(thread),
+            });
         }
 
         let host = cpal::default_host();
@@ -193,8 +235,18 @@ impl SceneMixer {
                         scratch.resize(data.len(), 0.0);
                     }
                     for output in &mut outputs {
+                        let flush = output.flush.load(Ordering::Relaxed);
+                        if output.hold.load(Ordering::Relaxed) && !flush {
+                            continue;
+                        }
                         let gain = f32::from_bits(output.gain.load(Ordering::Relaxed));
                         let popped = output.consumer.pop_slice(&mut scratch[..data.len()]);
+                        if flush {
+                            if output.consumer.occupied_len() == 0 {
+                                output.flush.store(false, Ordering::Relaxed);
+                            }
+                            continue;
+                        }
                         if gain == 0.0 {
                             continue;
                         }
@@ -225,7 +277,10 @@ impl SceneMixer {
     }
 
     fn refresh_stream(&self) {
-        if self.mute.load(Ordering::Relaxed) || self.paused.load(Ordering::Relaxed) {
+        let all_held = self.voices.iter().all(|voice| {
+            voice.hold.load(Ordering::Relaxed) && !voice.flush.load(Ordering::Relaxed)
+        });
+        if self.mute.load(Ordering::Relaxed) || self.paused.load(Ordering::Relaxed) || all_held {
             let _ = self.stream.pause();
         } else {
             let _ = self.stream.play();
@@ -233,6 +288,31 @@ impl SceneMixer {
         for voice in &self.voices {
             wake_parked(&voice.wake);
         }
+    }
+
+    pub fn voice(&self, id: &str, op: VoiceOp) -> bool {
+        let Some(voice) = self.voices.iter().find(|voice| voice.id == id) else {
+            return false;
+        };
+        match op {
+            VoiceOp::Play => voice.hold.store(false, Ordering::Relaxed),
+            VoiceOp::Stop => {
+                voice.hold.store(true, Ordering::Relaxed);
+                voice.restart.store(true, Ordering::Relaxed);
+                voice.flush.store(true, Ordering::Relaxed);
+            }
+            VoiceOp::Pause => voice.hold.store(true, Ordering::Relaxed),
+            VoiceOp::Gain(gain) => voice.gain.store(gain_bits(gain), Ordering::Relaxed),
+        }
+        self.refresh_stream();
+        true
+    }
+
+    pub fn voice_playing(&self, id: &str) -> bool {
+        self.voices
+            .iter()
+            .find(|voice| voice.id == id)
+            .is_some_and(|voice| !voice.hold.load(Ordering::Relaxed))
     }
 
     pub fn set_mute(&self, mute: bool) {
@@ -266,13 +346,35 @@ impl Drop for SceneMixer {
     }
 }
 
+struct VoiceFlags<'a> {
+    stop: &'a AtomicBool,
+    mute: &'a AtomicBool,
+    paused: &'a AtomicBool,
+    hold: &'a AtomicBool,
+    restart: &'a AtomicBool,
+    flush: &'a AtomicBool,
+}
+
+fn wait_while_held(flags: &VoiceFlags<'_>, wake: &(Mutex<()>, Condvar)) {
+    while flags.hold.load(Ordering::Relaxed) && !flags.stop.load(Ordering::Relaxed) {
+        let guard = wake.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flags.hold.load(Ordering::Relaxed) && !flags.stop.load(Ordering::Relaxed) {
+            let _unused = wake.1.wait(guard);
+        }
+    }
+}
+
+fn wait_while_flushing(flags: &VoiceFlags<'_>) {
+    while flags.flush.load(Ordering::Relaxed) && !flags.stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 fn run_voice(
     voice: &Voice,
     index: usize,
     producer: &mut ringbuf::HeapProd<f32>,
-    stop: &AtomicBool,
-    mute: &AtomicBool,
-    paused: &AtomicBool,
+    flags: &VoiceFlags<'_>,
     wake: &(Mutex<()>, Condvar),
 ) {
     let mut random = seed_from_clock(index as u64);
@@ -281,9 +383,12 @@ fn run_voice(
         (min, voice.max_gap.max(min))
     };
     loop {
-        if stop.load(Ordering::Relaxed) {
+        wait_while_held(flags, wake);
+        if flags.stop.load(Ordering::Relaxed) {
             return;
         }
+        flags.restart.store(false, Ordering::Relaxed);
+        wait_while_flushing(flags);
         let clip = match voice.mode {
             VoiceMode::Random if voice.clips.len() > 1 => {
                 &voice.clips[(next_random(&mut random) as usize) % voice.clips.len()]
@@ -291,12 +396,29 @@ fn run_voice(
             _ => &voice.clips[0],
         };
         let repeat = if voice.mode == VoiceMode::Loop { Repeat::Forever } else { Repeat::Once };
-        if let Err(error) = decode_loop(clip, producer, stop, mute, paused, wake, repeat) {
-            tracing::warn!("scene voice {} decode exited: {error:?}", voice.name);
-            return;
+        match decode_loop(
+            clip,
+            producer,
+            flags.stop,
+            flags.mute,
+            flags.paused,
+            flags.hold,
+            flags.restart,
+            wake,
+            repeat,
+        ) {
+            Err(error) => {
+                tracing::warn!("scene voice {} decode exited: {error:?}", voice.name);
+                return;
+            }
+            Ok(true) => continue,
+            Ok(false) => {}
         }
         match voice.mode {
-            VoiceMode::Loop | VoiceMode::Once => return,
+            VoiceMode::Loop | VoiceMode::Once => {
+                flags.hold.store(true, Ordering::Relaxed);
+                flags.restart.store(true, Ordering::Relaxed);
+            }
             VoiceMode::Random => {
                 let span = f64::from(max_gap - min_gap);
                 let jitter = if span > 0.0 {
@@ -304,7 +426,7 @@ fn run_voice(
                 } else {
                     0.0
                 };
-                park(wake, stop, Duration::from_secs_f64(f64::from(min_gap) + jitter));
+                park(wake, flags.stop, Duration::from_secs_f64(f64::from(min_gap) + jitter));
             }
         }
     }

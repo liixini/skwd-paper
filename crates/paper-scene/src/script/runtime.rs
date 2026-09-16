@@ -9,8 +9,62 @@ use std::time::{Duration, Instant};
 const HEAP_LIMIT: usize = 32 * 1024 * 1024;
 const FRAME_BUDGET: Duration = Duration::from_millis(4);
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SoundOp {
+    Play,
+    Stop,
+    Pause,
+    Gain(f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpriteOp {
+    Play,
+    Stop,
+    Pause,
+    Frame(usize),
+    Rate(f32),
+    Join,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScriptCommand {
+    Sound { id: String, op: SoundOp },
+    Sprite { object: usize, op: SpriteOp },
+}
+
+fn parse_command(kind: &str, target: &str, op: &str, value: &Value) -> Option<ScriptCommand> {
+    let number = value.as_f64().map(|v| v as f32);
+    match kind {
+        "sound" => {
+            let op = match op {
+                "play" => SoundOp::Play,
+                "stop" => SoundOp::Stop,
+                "pause" => SoundOp::Pause,
+                _ => return None,
+            };
+            Some(ScriptCommand::Sound { id: target.to_owned(), op })
+        }
+        "sprite" => {
+            let op = match op {
+                "play" => SpriteOp::Play,
+                "stop" => SpriteOp::Stop,
+                "pause" => SpriteOp::Pause,
+                "join" => SpriteOp::Join,
+                "frame" => SpriteOp::Frame(number?.max(0.0) as usize),
+                "rate" => SpriteOp::Rate(number?),
+                _ => return None,
+            };
+            Some(ScriptCommand::Sprite { object: target.parse().ok()?, op })
+        }
+        _ => None,
+    }
+}
+
 pub struct SceneScripts {
     storage: Option<super::Storage>,
+    commands: Vec<ScriptCommand>,
+    general: Vec<(String, Value)>,
     context: Context,
     runtime: Runtime,
     deadline: Rc<Cell<Instant>>,
@@ -63,6 +117,8 @@ impl SceneScripts {
         let context = Context::full(&runtime).map_err(|e| anyhow!("SceneScript context: {e}"))?;
         let mut host = Self {
             storage,
+            commands: Vec::new(),
+            general: Vec::new(),
             context,
             runtime,
             deadline,
@@ -90,6 +146,7 @@ impl SceneScripts {
                 host.disable_module(index);
             }
         }
+        host.apply_user_properties();
         host.scene = scene.clone();
         host.drain()?;
         host.tick(0.0, 0.0, [0.5; 2])?;
@@ -162,6 +219,61 @@ impl SceneScripts {
             self.updates.push(index);
         }
         Ok(())
+    }
+
+    fn apply_user_properties(&mut self) {
+        self.deadline.set(Instant::now() + Duration::from_millis(100));
+        let result = self.context.with(|ctx| {
+            ctx.globals()
+                .get::<_, Function>("__applyUserProperties")
+                .and_then(|f| f.call::<_, ()>(()))
+                .map_err(|e| js_error(&ctx, &e))
+        });
+        if let Err(error) = result {
+            self.diagnostics.push(format!("applyUserProperties: {error:#}"));
+        }
+    }
+
+    pub fn set_sprites(&mut self, sprites: &[(usize, usize, f32)]) {
+        if self.disabled || sprites.is_empty() {
+            return;
+        }
+        let json = serde_json::to_string(sprites).unwrap_or_else(|_| "[]".into());
+        self.deadline.set(Instant::now() + FRAME_BUDGET);
+        let result = self.context.with(|ctx| {
+            ctx.globals()
+                .get::<_, Function>("__setSprites")
+                .and_then(|f| f.call::<_, ()>((json,)))
+                .map_err(|e| js_error(&ctx, &e))
+        });
+        if let Err(error) = result {
+            self.stop(format!("sprite table stopped: {error:#}"));
+        }
+    }
+
+    pub fn take_commands(&mut self) -> Vec<ScriptCommand> {
+        std::mem::take(&mut self.commands)
+    }
+
+    pub fn take_general_changes(&mut self) -> Vec<(String, Value)> {
+        std::mem::take(&mut self.general)
+    }
+
+    pub fn destroy(&mut self) {
+        if self.disabled {
+            return;
+        }
+        self.deadline.set(Instant::now() + FRAME_BUDGET);
+        let result = self.context.with(|ctx| {
+            ctx.globals()
+                .get::<_, Function>("__destroyAll")
+                .and_then(|f| f.call::<_, ()>(()))
+                .map_err(|e| js_error(&ctx, &e))
+        });
+        match result.and_then(|()| self.drain()) {
+            Ok(_) => {}
+            Err(error) => self.diagnostics.push(format!("destroy: {error:#}")),
+        }
     }
 
     pub fn needs_audio(&self) -> bool {
@@ -338,7 +450,39 @@ impl SceneScripts {
             {
                 map.insert(key.replace("~1", "/").replace("~0", "~"), value.clone());
             }
+            if let Some(command) = self.volume_command(path, value) {
+                self.commands.push(command);
+            }
+            if let Some(key) = path.strip_prefix("/general/")
+                && !key.contains('/')
+            {
+                self.general.push((key.to_owned(), value.clone()));
+            }
         }
+        let queued: String = self.context.with(|ctx| {
+            ctx.globals()
+                .get::<_, Function>("__drainCommands")
+                .and_then(|f| f.call(()))
+                .map_err(|e| js_error(&ctx, &e))
+        })?;
+        let queued: Vec<(String, String, String, Value)> = serde_json::from_str(&queued)?;
+        self.commands.extend(
+            queued
+                .iter()
+                .filter_map(|(kind, target, op, value)| parse_command(kind, target, op, value)),
+        );
         Ok(!changes.is_empty())
+    }
+
+    fn volume_command(&self, path: &str, value: &Value) -> Option<ScriptCommand> {
+        let (parent, key) = path.rsplit_once('/')?;
+        if key != "volume" {
+            return None;
+        }
+        let object = self.scene.pointer(parent)?;
+        object.get("sound")?;
+        let id = object.get("id").map(|id| id.to_string().trim_matches('"').to_owned())?;
+        let gain = crate::effects::json_numbers(value)?.first().copied()?;
+        Some(ScriptCommand::Sound { id, op: SoundOp::Gain(gain.max(0.0)) })
     }
 }

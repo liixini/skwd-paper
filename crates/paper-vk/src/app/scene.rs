@@ -87,11 +87,79 @@ struct LiveText {
 
 struct LayerAnimation {
     quad: usize,
+    object: usize,
     frames: Vec<paper_scene::model::SpriteFrame>,
     total: f32,
     pages: Vec<usize>,
     slot: usize,
     image: i32,
+    control: SpriteControl,
+    rate: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SpriteControl {
+    Follow,
+    Hold(usize),
+    Play { frame: usize, since: f32 },
+}
+
+fn frame_start(frames: &[paper_scene::model::SpriteFrame], index: usize) -> f32 {
+    let index = if frames.is_empty() { 0 } else { index % frames.len() };
+    frames.iter().take(index).map(|frame| frame.time).sum::<f32>()
+        + frames.get(index).map_or(0.0, |frame| frame.time * 0.5)
+}
+
+impl LayerAnimation {
+    fn time(&self, time: f32) -> f32 {
+        match self.control {
+            SpriteControl::Follow => time,
+            SpriteControl::Hold(frame) => frame_start(&self.frames, frame),
+            SpriteControl::Play { frame, since } => {
+                frame_start(&self.frames, frame) + (time - since) * self.rate
+            }
+        }
+    }
+
+    fn current_frame(&self, time: f32) -> usize {
+        let wanted = self.time(time);
+        let mut cursor = if self.total > 0.0 { wanted.rem_euclid(self.total) } else { 0.0 };
+        for (index, frame) in self.frames.iter().enumerate() {
+            if cursor < frame.time {
+                return index;
+            }
+            cursor -= frame.time;
+        }
+        self.frames.len().saturating_sub(1)
+    }
+
+    fn apply(&mut self, op: paper_scene::script::SpriteOp, time: f32) {
+        use paper_scene::script::SpriteOp;
+        let current = self.current_frame(time);
+        self.control = match op {
+            SpriteOp::Play => match self.control {
+                SpriteControl::Hold(frame) => SpriteControl::Play { frame, since: time },
+                other => other,
+            },
+            SpriteOp::Stop => SpriteControl::Hold(0),
+            SpriteOp::Pause => SpriteControl::Hold(current),
+            SpriteOp::Frame(frame) => match self.control {
+                SpriteControl::Hold(_) => SpriteControl::Hold(frame),
+                _ => SpriteControl::Play { frame, since: time },
+            },
+            SpriteOp::Rate(rate) => {
+                self.rate = rate;
+                match self.control {
+                    SpriteControl::Hold(frame) => SpriteControl::Hold(frame),
+                    _ => SpriteControl::Play { frame: current, since: time },
+                }
+            }
+            SpriteOp::Join => {
+                self.rate = 1.0;
+                SpriteControl::Follow
+            }
+        };
+    }
 }
 
 fn animation_frame(
@@ -624,17 +692,103 @@ fn layer_uniforms(
     lights: ([f32; 3], [f32; 3]),
 ) -> std::collections::BTreeMap<String, Vec<f32>> {
     let (matrix, inverse) = layer_model_matrix(layer, canvas);
+    let (texture_projection, texture_projection_inverse) = effect_texture_projection(layer, canvas);
     std::collections::BTreeMap::from([
         ("g_LayerModelMatrix".to_string(), matrix.to_vec()),
         ("g_ModelMatrix".to_string(), matrix.to_vec()),
+        ("g_EffectModelMatrix".to_string(), matrix.to_vec()),
         ("g_ModelMatrixInverse".to_string(), inverse.to_vec()),
         (
             "g_ModelViewProjectionMatrixInverse".to_string(),
             layer_projection_inverse(&inverse, canvas).to_vec(),
         ),
+        ("g_EffectTextureProjectionMatrix".to_string(), texture_projection.to_vec()),
+        ("g_EffectTextureProjectionMatrixInverse".to_string(), texture_projection_inverse.to_vec()),
+        ("g_NormalModelMatrix".to_string(), layer_normal_matrix(layer).to_vec()),
+        ("g_ViewProjectionMatrix".to_string(), scene_view_projection(canvas).to_vec()),
         ("g_LightAmbientColor".to_string(), lights.0.to_vec()),
         ("g_LightSkylightColor".to_string(), lights.1.to_vec()),
     ])
+}
+
+fn layer_normal_matrix(layer: &paper_scene::model::Layer) -> [f32; 12] {
+    let (n, c) = (-layer.angle).sin_cos();
+    [c, n, 0.0, 0.0, -n, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+}
+
+fn scene_view_projection(canvas: (f32, f32)) -> Mat4 {
+    let (w, h) = (canvas.0.max(1.0), canvas.1.max(1.0));
+    [2.0 / w, 0.0, 0.0, 0.0, 0.0, 2.0 / h, 0.0, 0.0, 0.0, 0.0, 2.0e-4, 0.0, -1.0, -1.0, 0.5, 1.0]
+}
+
+fn effect_texture_projection(
+    layer: &paper_scene::model::Layer,
+    canvas: (f32, f32),
+) -> (Mat4, Mat4) {
+    let (w, h) = (canvas.0.max(1.0), canvas.1.max(1.0));
+    let (qw, qh) = (layer.size.0, layer.size.1);
+    let (cx, cy) = (layer.center.0, h - layer.center.1);
+    let angle = -layer.angle;
+    let (sin, cos) = angle.sin_cos();
+    let inv = |s: f32| if s.abs() < 1e-6 { 0.0 } else { 1.0 / s };
+    let quad_to_canvas: Mat4 = [
+        qw * 0.5 * cos,
+        qw * 0.5 * sin,
+        0.0,
+        0.0,
+        -qh * 0.5 * sin,
+        qh * 0.5 * cos,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        cx,
+        cy,
+        0.0,
+        1.0,
+    ];
+    let canvas_to_ndc: Mat4 =
+        [2.0 / w, 0.0, 0.0, 0.0, 0.0, 2.0 / h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0, 0.5, 1.0];
+    let ndc_to_canvas: Mat4 = [
+        w * 0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        h * 0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        w * 0.5,
+        h * 0.5,
+        0.0,
+        1.0,
+    ];
+    let (iw, ih) = (inv(qw * 0.5), inv(qh * 0.5));
+    let canvas_to_quad: Mat4 = [
+        cos * iw,
+        -sin * ih,
+        0.0,
+        0.0,
+        sin * iw,
+        cos * ih,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        -(cos * cx + sin * cy) * iw,
+        -(-sin * cx + cos * cy) * ih,
+        0.0,
+        1.0,
+    ];
+    (mat4_mul(&canvas_to_ndc, &quad_to_canvas), mat4_mul(&canvas_to_quad, &ndc_to_canvas))
 }
 
 fn model_matrix(origin: (f32, f32, f32), scale: [f32; 3], angle: f32) -> Mat4 {
@@ -785,6 +939,19 @@ fn particle_frame(
             });
             FrameSample { uv, ratio, extra, next }
         }
+        paper_scene::particles::Animation::Once => {
+            let life = (particle.age / particle.lifetime).clamp(0.0, 1.0);
+            let pos =
+                (life * count as f32 * group.system.sequence_multiplier).min(count as f32 - 1.0);
+            let index = (pos as usize).min(count - 1);
+            let blend = pos - index as f32;
+            let (uv, ratio, extra) = frame_of(group, index);
+            let next = (blend > 0.01 && index + 1 < count).then(|| {
+                let (uv2, _, extra2) = frame_of(group, index + 1);
+                (uv2, extra2, blend)
+            });
+            FrameSample { uv, ratio, extra, next }
+        }
     }
 }
 
@@ -832,6 +999,7 @@ struct Group {
     ndc_quad_d3d: Option<vk::QuadBuffer>,
     particles: Vec<ParticleGroup>,
     animations: Vec<LayerAnimation>,
+    script_sounds: Vec<(String, paper_audio::VoiceOp)>,
     audio: Option<paper_audio::Analyser>,
     audio_fx: Vec<usize>,
     bands: paper_audio::Bands,
@@ -1164,9 +1332,26 @@ impl Group {
         self.renderer.read_scene_target(&self.target)
     }
 
+    pub(super) fn sprite_command(
+        &mut self,
+        object: usize,
+        op: paper_scene::script::SpriteOp,
+        time: f32,
+    ) {
+        for animation in &mut self.animations {
+            if animation.object == object {
+                animation.apply(op, time);
+            }
+        }
+    }
+
+    pub(super) fn take_script_sounds(&mut self) -> Vec<(String, paper_audio::VoiceOp)> {
+        std::mem::take(&mut self.script_sounds)
+    }
+
     fn advance_layer_animations(&mut self, time: f32) {
         for animation in &mut self.animations {
-            let frame = animation_frame(&animation.frames, animation.total, time);
+            let frame = animation_frame(&animation.frames, animation.total, animation.time(time));
             let uv = frame.uv;
             if frame.image != animation.image {
                 let page = &self.textures[animation.pages[frame.image as usize]];
@@ -1566,6 +1751,9 @@ impl Group {
             scene_targets.insert((layer.layer_id.clone(), CompositeBuffer::B), sample);
         }
         for fx_index in 0..self.fx.len() {
+            if self.scripts.is_some() && self.quads[self.fx[fx_index].quad].tint[3] <= 0.0 {
+                continue;
+            }
             let (needs_snapshot, scene_order) = {
                 let fx = &self.fx[fx_index];
                 (fx.snapshot, fx.scene_order)
@@ -1899,14 +2087,19 @@ impl Group {
 
     fn bake_static_effects(&mut self) -> Result<EffectBakeReport> {
         for fx in &self.fx {
-            fx.target_bytes().context("effect output missing before static bake")?;
+            if fx.output.is_some() {
+                fx.target_bytes().context("effect output missing before static bake")?;
+            }
         }
 
         let old_fx = std::mem::take(&mut self.fx);
         let mut live_fx = Vec::with_capacity(old_fx.len());
         let mut report = EffectBakeReport::default();
         for fx in old_fx {
-            let bytes = fx.target_bytes().expect("effect output validated");
+            let Some(bytes) = fx.target_bytes() else {
+                live_fx.push(fx);
+                continue;
+            };
             if fx.passes.iter().any(paper_scene::effects::PassMeta::time_dependent)
                 || fx.frame_state_dependent()
                 || fx.retain_targets
@@ -1951,6 +2144,12 @@ impl Group {
         let mut candidates: Vec<Vec<(FxTargetId, FxTargetClass)>> =
             Vec::with_capacity(self.fx.len());
         for (layer, fx) in self.fx.iter().enumerate() {
+            if fx.output.is_none() {
+                report.fallback_layers += 1;
+                plans.push(None);
+                candidates.push(Vec::new());
+                continue;
+            }
             let plan = match fx.plan() {
                 Ok(plan) if Some(plan.output) == fx.output => plan,
                 Ok(plan) => {
@@ -2090,6 +2289,9 @@ impl Group {
     }
 
     fn destroy(mut self) {
+        if let Some(scripts) = &mut self.scripts {
+            scripts.host.destroy();
+        }
         self.drop_from();
         self.release_composition_inputs();
         for group in std::mem::take(&mut self.particles) {
@@ -2113,14 +2315,14 @@ fn quads(model: &SceneModel, layer_slots: &[usize]) -> Vec<vk::SceneQuad> {
             vk::SceneQuad {
                 projection: None,
                 order_bias: 0,
-                rect: [layer.center.0, layer.center.1, layer.size.0, layer.size.1],
+                rect: screen_rect(layer.passthrough, layer.center, layer.size),
                 uv: [0.0, 0.0, uvw, uvh],
                 tint: if !layer.passthrough && !layer.effects.is_empty() {
                     [1.0, 1.0, 1.0, if layer.visible { 1.0 } else { 0.0 }]
                 } else {
                     layer_tint(layer)
                 },
-                angle: layer.angle,
+                angle: if layer.passthrough { 0.0 } else { layer.angle },
                 texture: layer_slots[idx],
                 blend: match layer.color_blend {
                     6 => vk::SceneBlend::Screen,
@@ -2213,6 +2415,19 @@ fn layer_tint(layer: &paper_scene::model::Layer) -> [f32; 4] {
     [layer.color[0], layer.color[1], layer.color[2], if layer.visible { layer.alpha } else { 0.0 }]
 }
 
+const DEFAULT_DYNAMIC_CHAINS: usize = 16;
+
+fn chain_admission_order(layers: &[paper_scene::model::Layer], scripted: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..layers.len())
+        .filter(|&index| {
+            let layer = &layers[index];
+            (layer.visible || scripted) && !layer.effects.is_empty()
+        })
+        .collect();
+    order.sort_by_key(|&index| !layers[index].visible);
+    order
+}
+
 fn fallback_tint(layer: &paper_scene::model::Layer) -> [f32; 4] {
     if layer.passthrough || (layer.solid && !layer.effects.is_empty()) {
         [1.0, 1.0, 1.0, 0.0]
@@ -2221,14 +2436,18 @@ fn fallback_tint(layer: &paper_scene::model::Layer) -> [f32; 4] {
     }
 }
 
+fn screen_rect(passthrough: bool, center: (f32, f32), size: (f32, f32)) -> [f32; 4] {
+    if passthrough {
+        [center.0, center.1, size.0.abs(), size.1.abs()]
+    } else {
+        [center.0, center.1, size.0, size.1]
+    }
+}
+
 fn passthrough_uv(layer: &paper_scene::model::Layer, canvas: (f32, f32)) -> [f32; 4] {
     let (cw, ch) = (canvas.0.max(1.0), canvas.1.max(1.0));
-    [
-        (layer.center.0 - layer.size.0 * 0.5) / cw,
-        (layer.center.1 - layer.size.1 * 0.5) / ch,
-        layer.size.0 / cw,
-        layer.size.1 / ch,
-    ]
+    let (w, h) = (layer.size.0.abs(), layer.size.1.abs());
+    [(layer.center.0 - w * 0.5) / cw, (layer.center.1 - h * 0.5) / ch, w / cw, h / ch]
 }
 
 fn passive_target_quad(
@@ -2553,7 +2772,7 @@ fn build_group(
     let fx_limit = std::env::var("SKWD_VK_SCENE_FX")
         .ok()
         .and_then(|text| text.parse::<usize>().ok())
-        .unwrap_or(8);
+        .unwrap_or(DEFAULT_DYNAMIC_CHAINS);
     let pass_cap = std::env::var("SKWD_VK_FX_PASSES")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
@@ -2660,11 +2879,14 @@ fn build_group(
             let total = frames.iter().map(|frame| frame.time).sum();
             Some(LayerAnimation {
                 quad: index,
+                object: layer.scene_order,
                 frames,
                 total,
                 pages: layer_pages.remove(&index).unwrap_or_else(|| vec![layer_slots[index]]),
                 slot: layer_slots[index],
                 image: -1,
+                control: SpriteControl::Follow,
+                rate: 1.0,
             })
         })
         .collect();
@@ -2694,11 +2916,8 @@ fn build_group(
                     .flat_map(|effect| &effect.passes)
                     .any(|pass| paper_scene::effects::PassMeta::of(pass).pointer_dependent())
         });
-    for (index, layer) in model.layers.iter_mut().enumerate() {
-        if (!layer.visible && !scripted) || layer.effects.is_empty() {
-            continue;
-        }
-
+    for index in chain_admission_order(&model.layers, scripted) {
+        let layer = &mut model.layers[index];
         let (fx_w, fx_h) = layer_effect_dimensions(layer, dimensions);
         let mut pipelines = Vec::new();
         let mut inputs = Vec::new();
@@ -2861,7 +3080,7 @@ fn build_group(
             .unwrap_or(true);
         let chain_bytes = u64::from(fx_w) * u64::from(fx_h) * 4 * 2
             + fbos.iter().map(|(_, target)| target.allocation_bytes).sum::<u64>();
-        let over_dynamic_cap = intrinsic_dynamic && dynamic_chains >= fx_limit;
+        let over_dynamic_cap = intrinsic_dynamic && layer.visible && dynamic_chains >= fx_limit;
         let over_bytes = admitted_bytes + chain_bytes > byte_limit;
         if over_dynamic_cap || over_bytes {
             tracing::info!(
@@ -2881,7 +3100,7 @@ fn build_group(
             quads[index].tint = fallback_tint(layer);
             continue;
         }
-        if intrinsic_dynamic {
+        if intrinsic_dynamic && layer.visible {
             dynamic_chains += 1;
         }
         admitted_bytes += chain_bytes;
@@ -3281,6 +3500,7 @@ fn build_group(
         ndc_quad_d3d,
         particles,
         animations,
+        script_sounds: Vec::new(),
         audio,
         audio_fx,
         bands: paper_audio::Bands::default(),
@@ -3597,7 +3817,11 @@ impl SceneAudio {
         pkg: &paper_scene::pkg::Package,
         properties: &paper_scene::model::Properties,
     ) -> Result<Option<Self>> {
-        let sounds = paper_scene::sound::scene_sounds(pkg, properties)?;
+        let sounds = paper_scene::sound::scene_sounds_with_silent(
+            pkg,
+            properties,
+            paper_scene::sound::scripts_drive_sounds(pkg),
+        )?;
         if sounds.is_empty() {
             return Ok(None);
         }
@@ -3621,6 +3845,7 @@ impl SceneAudio {
             }
             let (min_gap, max_gap) = sound.gap_range();
             voices.push(paper_audio::Voice {
+                id: sound.id,
                 name: sound.name,
                 clips,
                 gain: sound.volume,
@@ -3631,6 +3856,7 @@ impl SceneAudio {
                 },
                 min_gap,
                 max_gap,
+                autostart: sound.autostart,
             });
         }
         if voices.is_empty() {
@@ -3956,6 +4182,7 @@ pub(super) fn run_scene(
         }
         if let Some(req) = ctl.poll() {
             tracing::info!("skwd-wall-vk: scene swap to {}", req.to);
+            let swap_started = Instant::now();
             let next_properties = req
                 .properties
                 .as_ref()
@@ -3999,6 +4226,7 @@ pub(super) fn run_scene(
                 signal_swap_failure(&req.to, &format!("{error:#}"));
                 continue;
             }
+            let load_ms = swap_started.elapsed().as_millis();
             let next_group = match build_group(&sd, &mut next, strict, &dims, mode) {
                 Ok(built) => built,
                 Err(error) => {
@@ -4006,6 +4234,12 @@ pub(super) fn run_scene(
                     continue;
                 }
             };
+            tracing::info!(
+                load_ms,
+                build_ms = swap_started.elapsed().as_millis() - load_ms,
+                same_scene = req.to == active_dir,
+                "skwd-wall-vk: scene swap built"
+            );
             drop(next);
             active_dir.clone_from(&req.to);
             active_properties = next_properties;
@@ -4139,6 +4373,9 @@ pub(super) fn run_scene(
                 let dt = now.duration_since(last_sim).as_secs_f32().clamp(1.0 / 240.0, 0.1);
                 last_sim = now;
                 group.compose(time, dt)?;
+                for (id, op) in group.take_script_sounds() {
+                    ctl.scene_sound(&id, op);
+                }
                 render_pending.fill(true);
             }
         }
@@ -4471,6 +4708,7 @@ pub(super) fn stream_scene(
             }
         }
         if let Some(req) = ctl.poll() {
+            let swap_started = Instant::now();
             let next_properties = req
                 .properties
                 .as_ref()
@@ -4504,6 +4742,7 @@ pub(super) fn stream_scene(
                 signal_swap_failure(&req.to, &format!("{error:#}"));
                 continue;
             }
+            let load_ms = swap_started.elapsed().as_millis();
             let next_group = match build_group(&sd, &mut next, strict, &sizes, fill_mode()) {
                 Ok(group) => group,
                 Err(error) => {
@@ -4511,6 +4750,11 @@ pub(super) fn stream_scene(
                     continue;
                 }
             };
+            tracing::info!(
+                load_ms,
+                build_ms = swap_started.elapsed().as_millis() - load_ms,
+                "skwd-wall-vk: scene stream swap built"
+            );
             let mut old = std::mem::replace(&mut group, next_group);
             ctl.set_scene_voices(next_audio.as_ref().map(SceneAudio::voices).unwrap_or_default());
             _scene_audio = next_audio;
@@ -4544,6 +4788,10 @@ pub(super) fn stream_scene(
             let all_paused = crate::preview::apply_output_pauses(&mut targets, pauses);
             ctl.set_paused(all_paused);
         }
+        if let Some((revision, position, buttons)) = ctl.pointer() {
+            group.mouse.update(revision, position, buttons, sizes[0], fill_mode());
+        }
+        let mouse_driven = group.mouse.pending();
         if ctl.paused && presented {
             suspended_at.get_or_insert_with(Instant::now);
             if let Some(fd) = ctl.wake_fd() {
@@ -4573,6 +4821,7 @@ pub(super) fn stream_scene(
         }
         if presented
             && !animated
+            && !mouse_driven
             && fade_start.is_none()
             && !group.media.as_ref().is_some_and(media::Media::has_pending)
         {
@@ -4607,10 +4856,13 @@ pub(super) fn stream_scene(
         }
         let now = Instant::now();
         next_frame = now + frame_gap;
-        if animated {
+        if animated || mouse_driven {
             let dt = now.duration_since(last_frame).as_secs_f32().clamp(1.0 / 240.0, 0.1);
             last_frame = now;
             group.compose(epoch.elapsed().as_secs_f32(), dt)?;
+            for (id, op) in group.take_script_sounds() {
+                ctl.scene_sound(&id, op);
+            }
         }
         let fade_step = scene_fade_step(
             fade_start.map(|started| started.elapsed().as_secs_f32() * 1000.0 / fade_ms as f32),

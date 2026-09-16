@@ -26,7 +26,7 @@ const __modules = [];
 const __timers = new Map();
 let __timerId = 0;
 let __current = null;
-const __vectors = new Set(['origin', 'scale', 'angles', 'color', 'size', 'parallaxDepth']);
+const __vectors = new Set(['origin', 'scale', 'angles', 'color', 'size', 'parallaxDepth', 'clearcolor', 'ambientcolor', 'skylightcolor', 'bloomtint']);
 function __coerce(value, key) {
     if (__vectors.has(key)) {
         const a = typeof value === 'string' ? value.trim().split(/\s+/).map(Number) : Array.isArray(value) ? value : null;
@@ -61,20 +61,78 @@ function __wrap(value, path, key) {
         return true;
     }});
 }
+const __commands = [];
+const __sprites = new Map();
+function __command(kind, target, op, value) {
+    if (__commands.length < 4096) __commands.push([kind, String(target), op, value === undefined ? null : value]);
+}
+function __drainCommands() { const out = JSON.stringify(__commands); __commands.length = 0; return out; }
+function __setSprites(json) {
+    __sprites.clear();
+    for (const [index, frames, duration] of JSON.parse(json)) __sprites.set(index, {frames, duration});
+}
+function __textureAnimation(index) {
+    const info = () => __sprites.get(index) || {frames: 1, duration: 0};
+    const state = {frame: 0, playing: true, rate: 1, since: 0};
+    const push = (op, value) => __command('sprite', index, op, value);
+    const estimate = () => {
+        const {frames, duration} = info();
+        if (!state.playing || duration <= 0 || frames <= 1) return state.frame;
+        return (state.frame + Math.floor((engine.runtime - state.since) * frames / duration * state.rate)) % frames;
+    };
+    return {
+        get frameCount() { return info().frames; },
+        get duration() { return info().duration; },
+        get rate() { return state.rate; },
+        set rate(value) { state.frame = estimate(); state.since = engine.runtime; state.rate = Number(value) || 0; push('rate', state.rate); },
+        play() { if (!state.playing) { state.playing = true; state.since = engine.runtime; } push('play'); },
+        stop() { state.playing = false; state.frame = 0; push('stop'); },
+        pause() { state.frame = estimate(); state.playing = false; push('pause'); },
+        isPlaying() { return state.playing; },
+        getFrame() { return estimate(); },
+        setFrame(frame) { state.frame = Math.max(0, Math.floor(Number(frame) || 0)); state.since = engine.runtime; push('frame', state.frame); },
+        join() { state.playing = true; state.rate = 1; state.frame = 0; state.since = engine.runtime; push('join'); }
+    };
+}
+function __applyUserProperties() {
+    for (let i = 0; i < __modules.length; i++) {
+        const m = __modules[i];
+        if (!m || m.disabled || typeof m.ns.applyUserProperties !== 'function') continue;
+        __current = m;
+        try { m.ns.applyUserProperties(engine.userProperties); } catch (e) { m.disabled = true; __log('applyUserProperties ' + i + ': ' + String(e)); }
+        __current = null;
+    }
+}
 function __setup(json, props) {
+    globalThis.__initial = JSON.parse(json).objects || [];
     globalThis.__scene = __wrap(JSON.parse(json), '', '');
     globalThis.__layers = __scene.objects || [];
+    globalThis.__byId = new Map(__layers.map(l => [String(l.id), l]));
     engine.userProperties = {};
     for (const [name,entry] of Object.entries(JSON.parse(props))) if (entry.value !== undefined) engine.userProperties[name] = entry.type === 'color' ? __coerce(entry.value, 'color') : entry.value;
     engine.canvasSize = new Vec2(__scene.general?.orthogonalprojection?.width ?? 1920, __scene.general?.orthogonalprojection?.height ?? 1080);
     for (const layer of __layers) {
         for (const [key,value] of Object.entries({visible:true, origin:'0 0 0', scale:'1 1 1', angles:'0 0 0', color:'1 1 1', alpha:1}))
             if (layer[key] === undefined) layer[key] = value;
-        Object.defineProperty(layer, 'getParent', {value: () => __layers.find(l => String(l.id) === String(layer.parent))});
+        Object.defineProperty(layer, 'getParent', {value: () => layer.parent === undefined || layer.parent === null ? undefined : __byId.get(String(layer.parent))});
         Object.defineProperty(layer, 'getChildren', {value: () => __layers.filter(l => String(l.parent) === String(layer.id))});
         Object.defineProperty(layer, 'getEffect', {value: key => (layer.effects || []).find(e => e.name === key || e.id === key)});
         Object.defineProperty(layer, 'getAnimation', {value: () => { throw Error('SceneScript timeline control is not implemented'); }});
     }
+    __layers.forEach((layer, index) => {
+        if (layer.image !== undefined) {
+            let animation;
+            Object.defineProperty(layer, 'getTextureAnimation', {value: () => animation ??= __textureAnimation(index)});
+            Object.defineProperty(layer, 'getEffectCount', {value: () => (layer.effects || []).length});
+        }
+        if (layer.sound !== undefined) {
+            let playing = layer.startsilent !== true;
+            Object.defineProperty(layer, 'play', {value: () => { playing = true; __command('sound', layer.id, 'play'); }});
+            Object.defineProperty(layer, 'stop', {value: () => { playing = false; __command('sound', layer.id, 'stop'); }});
+            Object.defineProperty(layer, 'pause', {value: () => { playing = false; __command('sound', layer.id, 'pause'); }});
+            Object.defineProperty(layer, 'isPlaying', {value: () => playing});
+        }
+    });
     __changes.clear();
 }
 function __owner(path) {
@@ -83,7 +141,8 @@ function __owner(path) {
     for (const p of parts) object = object[p];
     return [object, key];
 }
-function __register(index, ns, path) { const [object,key] = __owner(path); __modules[index] = {ns, object, key, layer:path.startsWith('/objects/') ? __layers[Number(path.split('/')[2])] : null, disabled:false}; }
+const __cursorHooks = ['cursorEnter','cursorLeave','cursorMove','cursorDown','cursorUp','cursorClick'];
+function __register(index, ns, path) { const [object,key] = __owner(path); __modules[index] = {ns, object, key, layer:path.startsWith('/objects/') ? __layers[Number(path.split('/')[2])] : null, disabled:false, cursor:__cursorHooks.some(name => typeof ns[name] === 'function')}; }
 function __disable(index) { if (__modules[index]) __modules[index].disabled = true; }
 function __invoke(index, name) {
     const m = __modules[index];
@@ -110,6 +169,9 @@ const engine = {
     runtime:0, frametime:0, canvasSize:new Vec2(1920,1080), screenResolution:new Vec2(1920,1080), userProperties:{}, isRunningInEditor:()=>false,
     AUDIO_RESOLUTION_16:16,AUDIO_RESOLUTION_32:32,AUDIO_RESOLUTION_64:64,
     isDesktopDevice:()=>true,isMobileDevice:()=>false,isWallpaper:()=>true,isScreensaver:()=>false,
+    isPortrait:()=>engine.canvasSize.y>engine.canvasSize.x,isLandscape:()=>engine.canvasSize.y<=engine.canvasSize.x,
+    registerAsset:file=>({file:String(file)}),
+    openUserShortcut:()=>false,
     get timeOfDay(){const d=new Date();return (d.getHours()*3600+d.getMinutes()*60+d.getSeconds())/86400;},
     registerAudioBuffers: size => { if (!Number.isInteger(size) || size < 1 || size > 128) throw Error('Invalid audio buffer size'); const b = {left:new Array(size).fill(0),right:new Array(size).fill(0),average:new Array(size).fill(0)}; __audio.push(b); return b; },
     setTimeout: (fn, delay=0) => __timer(fn, delay, false), setInterval: (fn, delay=0) => __timer(fn, delay, true),
@@ -126,14 +188,40 @@ function __tickTimers() {
         timer.fn();
     }
 }
-const input = {cursorWorldPosition:new Vec3(),cursorScreenPosition:new Vec2()};
+const input = {cursorWorldPosition:new Vec3(),cursorScreenPosition:new Vec2(),cursorLeftDown:false};
+const __layerOf = key => typeof key === 'object' && key !== null ? key : (typeof key === 'number' ? __layers[key] : __layers.find(l => l.name === key || String(l.id) === String(key)));
 const thisScene = {
     getLayer: key => __layers.find(l => l.name === key || String(l.id) === String(key)),
+    getLayerCount: () => __layers.length,
     enumerateLayers: () => [...__layers],
-    getLayerIndex: layer => __layers.indexOf(layer),
+    getLayerIndex: layer => __layers.indexOf(__layerOf(layer)),
     getLayerByIndex: index => __layers[index],
+    getInitialLayerConfig: layer => { const i = __layers.indexOf(__layerOf(layer)); return i >= 0 ? JSON.parse(JSON.stringify(__initial[i] ?? {})) : undefined; },
+    destroyLayer: layer => { const l = __layerOf(layer); if (!l) return false; l.visible = false; return true; },
+    sortLayer: () => { throw Error('SceneScript layer reordering is not implemented'); },
     createLayer: () => { throw Error('SceneScript dynamic layer creation is not implemented'); }
 };
+const __generalDefaults = {bloom:false, bloomstrength:2, bloomthreshold:0.65, bloomtint:'1 1 1', clearenabled:true, clearcolor:'0 0 0', ambientcolor:'0.3 0.3 0.3', skylightcolor:'0.3 0.3 0.3',
+    fov:50, nearz:0.01, farz:10000, zoom:1, camerafade:false, camerashake:false, camerashakespeed:1, camerashakeamplitude:1, camerashakeroughness:1,
+    cameraparallax:false, cameraparallaxamount:0.5, cameraparallaxdelay:0.1, cameraparallaxmouseinfluence:0.5};
+for (const [key, fallback] of Object.entries(__generalDefaults)) Object.defineProperty(thisScene, key, {
+    enumerable: true,
+    get() {
+        const general = globalThis.__scene?.general;
+        let value = general ? general[key] : undefined;
+        if (value && typeof value === 'object' && !(value instanceof Vec2) && 'value' in value) value = __coerce(value.value, key);
+        return value === undefined || value === null ? __coerce(fallback, key) : value;
+    },
+    set(value) { const general = globalThis.__scene?.general; if (general) general[key] = value; }
+});
+function __destroyAll() {
+    for (const m of __modules) {
+        if (!m || m.disabled || typeof m.ns.destroy !== 'function') continue;
+        __current = m;
+        try { m.ns.destroy(); } catch (e) { __log('destroy: ' + String(e)); }
+        __current = null;
+    }
+}
 const shared = {};
 const console = {log: (...args) => __log(args.map(String).join(' ')), warn: (...args) => __log(args.map(String).join(' ')), error: (...args) => __log(args.map(String).join(' '))};
 Object.assign(globalThis, {engine,input,thisScene,shared,console,createScriptProperties:__createScriptProperties});
@@ -161,9 +249,10 @@ function __pointer(x,y,buttons,hits) {
     if(!moved && buttons.every((v,i)=>v===__lastButtons[i])) return;
     input.cursorWorldPosition=new Vec3(x*engine.canvasSize.x,(1-y)*engine.canvasSize.y,0);
     input.cursorScreenPosition=new Vec2(x*engine.canvasSize.x,y*engine.canvasSize.y);
+    input.cursorLeftDown=!!buttons[0];
     const hovered=new Set(hits);
     for(let i=0;i<__modules.length;i++) {
-        const m=__modules[i]; if(!m || m.disabled || !m.layer) continue;
+        const m=__modules[i]; if(!m || m.disabled || !m.layer || !m.cursor) continue;
         const id=String(m.layer.id), inside=hovered.has(id), was=__hover.has(id);
         const worldPosition=input.cursorWorldPosition.copy();
         const event={worldPosition, localPosition:__localPosition(m.layer,worldPosition), cursorWorldPosition:worldPosition, cursorScreenPosition:input.cursorScreenPosition.copy()};

@@ -11,6 +11,7 @@ description = "Shared cpal + ffmpeg audio playback for skwd wallpaper renderers"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 cpal = "0.16"
+libloading = "0.8"
 ringbuf = "0.4"
 ffmpeg-the-third = { version = "6", default-features = false, features = ["codec", "format", "software-resampling"] }
 

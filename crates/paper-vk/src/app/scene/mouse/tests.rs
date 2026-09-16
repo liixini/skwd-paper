@@ -4,6 +4,11 @@ fn mouse() -> SceneMouse {
     SceneMouse {
         enabled: true,
         config: Parallax::default(),
+        base: Parallax::default(),
+        shake: Shake::default(),
+        shake_on: false,
+        shake_time: 0.0,
+        shake_offset: [0.0; 2],
         layers: Vec::new(),
         position: [0.5; 2],
         previous: [0.5; 2],

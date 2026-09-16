@@ -26,6 +26,7 @@ const localStorage = {
         __storage=JSON.parse(json);__storageDirty=true;
     },
     delete(key,location='screen') { const data=__storageLocation(location);if(!Object.hasOwn(data,String(key)))return false;delete data[String(key)];__storageDirty=true;return true; },
+    remove(key,location='screen') { return localStorage.delete(key,location); },
     clear(location='screen') { __storageLocation(location);__storage[location]={};__storageDirty=true; }
 };
 function __storageLoad(json) { __storage=JSON.parse(json);__storageDirty=false; }

@@ -15,6 +15,8 @@ fn command_variants_round_trip() {
         PaperCommand::audio(None, None),
         PaperCommand::pause(true),
         PaperCommand::pause(false),
+        PaperCommand::duck(true),
+        PaperCommand::duck(false),
         PaperCommand::freeze("/cache/frame.ppm"),
         PaperCommand::retain_outputs(&["DP-1".into(), "DP-2".into()]),
     ] {
@@ -46,6 +48,7 @@ fn wire_and_legacy_alias() {
         "{\"to\":\"/v/b.mp4\",\"mute\":true,\"volume\":100,\"shader\":\"fade\",\"duration_ms\":600}\n"
     );
     assert_eq!(PaperCommand::pause(true).line(), "{\"to\":\"\",\"pause\":true}\n");
+    assert_eq!(PaperCommand::duck(true).line(), "{\"to\":\"\",\"duck\":true}\n");
     assert_eq!(
         PaperCommand::freeze("/cache/frame.ppm").line(),
         "{\"to\":\"\",\"freeze\":\"/cache/frame.ppm\"}\n"
@@ -61,6 +64,10 @@ fn classify_priority_order() {
         CommandClass::Freeze("/cache/frame.ppm".into())
     );
     assert_eq!(classify_command(PaperCommand::pause(true)), CommandClass::Pause(true));
+    assert_eq!(classify_command(PaperCommand::duck(true)), CommandClass::Duck(true));
+    let mut ducked_pause = PaperCommand::pause(false);
+    ducked_pause.duck = Some(true);
+    assert_eq!(classify_command(ducked_pause), CommandClass::Pause(false));
     assert_eq!(
         classify_command(PaperCommand::retain_outputs(&["DP-2".into()])),
         CommandClass::RetainOutputs(vec!["DP-2".into()])
@@ -83,4 +90,19 @@ fn capture_round_trip_keeps_source_and_destination_without_pause() {
         command.capture.unwrap(),
         crate::SceneCapture { source: "/scenes/42".into(), path: "/cache/frame.png".into() }
     );
+}
+
+#[test]
+fn pointer_commands_quantize_and_classify() {
+    let command = PaperCommand::pointer(0.25, 1.5, [true, false, true]);
+    let state = command.pointer.unwrap();
+    assert_eq!(state.buttons, 0b101);
+    assert_eq!(state.pressed(), [true, false, true]);
+    assert!((state.position()[0] - 0.25).abs() < 1e-4);
+    assert!((state.position()[1] - 1.0).abs() < 1e-6);
+    assert_eq!(round_trip(&command), command);
+    assert!(command.line().contains("\"pointer\":{\"x\":16384,\"y\":65535,\"buttons\":5}"));
+    assert!(matches!(classify_command(command), CommandClass::Pointer(_)));
+    let plain: PaperCommand = serde_json::from_str("{\"to\":\"DP-1\",\"pause\":true}").unwrap();
+    assert!(plain.pointer.is_none());
 }

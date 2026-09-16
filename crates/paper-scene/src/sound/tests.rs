@@ -167,3 +167,27 @@ fn inventory_covers_authored_sound_semantics() {
         }
     );
 }
+
+#[test]
+fn silent_sounds_join_only_when_scripts_drive_them() {
+    let scripted = br#"{"objects":[
+        {"id":3,"name":"Silent","sound":["s/a.ogg"],"startsilent":true},
+        {"id":4,"name":"Loud","sound":["s/a.ogg"]},
+        {"id":5,"alpha":{"value":1,"script":"export function init(){thisScene.getLayer('Silent').play();}"}}
+    ]}"#;
+    let plain = br#"{"objects":[{"id":3,"name":"Silent","sound":["s/a.ogg"],"startsilent":true}]}"#;
+    let files: &[(&str, &[u8])] = &[("s/a.ogg", b"a")];
+    let mut all: Vec<(&str, &[u8])> = vec![("scene.json", scripted)];
+    all.extend_from_slice(files);
+    let pkg = package(&all);
+    assert!(scripts_drive_sounds(&pkg));
+    let found = scene_sounds_with_silent(&pkg, &Properties::new(), true).unwrap();
+    assert_eq!(
+        found.iter().map(|sound| (sound.id.as_str(), sound.autostart)).collect::<Vec<_>>(),
+        [("3", false), ("4", true)]
+    );
+    assert_eq!(scene_sounds(&pkg, &Properties::new()).unwrap().len(), 1);
+    let mut plain_files: Vec<(&str, &[u8])> = vec![("scene.json", plain)];
+    plain_files.extend_from_slice(files);
+    assert!(!scripts_drive_sounds(&package(&plain_files)));
+}

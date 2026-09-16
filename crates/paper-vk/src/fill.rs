@@ -20,8 +20,19 @@ fn flag_for(mode: FillMode) -> i32 {
     }
 }
 
+static CLAMP_OVERRIDE: OnceLock<Option<i32>> = OnceLock::new();
+
+fn clamp_override() -> Option<i32> {
+    *CLAMP_OVERRIDE.get_or_init(|| match std::env::var("SKWD_VK_SCENE_CLAMP").ok().as_deref() {
+        Some("clamp") => Some(0),
+        Some("border") => Some(1),
+        Some("repeat") => Some(2),
+        _ => None,
+    })
+}
+
 pub(crate) fn fill_flag() -> i32 {
-    flag_for(fill_mode())
+    clamp_override().unwrap_or_else(|| flag_for(fill_mode()))
 }
 
 fn mode_uv_for(
