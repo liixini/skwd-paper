@@ -10,11 +10,11 @@ use crate::vk::Src;
 
 fn wait_stream_control(ctl: &mut crate::ctl::Ctl) -> Result<std::time::Duration> {
     let _ = ctl.poll();
-    if !ctl.paused {
+    if !ctl.paused || !ctl.output_pauses.is_empty() {
         return Ok(std::time::Duration::ZERO);
     }
     let started = Instant::now();
-    while ctl.paused {
+    while ctl.paused && ctl.output_pauses.is_empty() {
         let Some(fd) = ctl.wake_fd() else {
             std::thread::sleep(std::time::Duration::from_millis(50));
             let _ = ctl.poll();
