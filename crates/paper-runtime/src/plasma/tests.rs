@@ -14,6 +14,15 @@ fn acknowledgements_cannot_cross_producer_handoffs() {
 }
 
 #[test]
+fn ready_packets_advertise_late_acknowledgements() {
+    let ready = ready_packet(2);
+    assert_eq!(&ready[..8], &packet(6, 0, 2)[..8]);
+    assert_eq!(ready[8] & LATE_ACKS, LATE_ACKS);
+    assert!(ready[9..].iter().all(|byte| *byte == 0));
+    assert_eq!(acknowledged_slot(&ready, 2), None);
+}
+
+#[test]
 fn ready_fds_accept_one_or_many_sockets() {
     assert_eq!(ready_fds(Some("3")), vec![3]);
     assert_eq!(ready_fds(Some("3,4, 5")), vec![3, 4, 5]);

@@ -29,6 +29,24 @@ fn free_slots_short_circuit_the_wait() {
     assert!(wait_any_free(&[-1, -1], &mut free, &[true, true]).is_ok());
 }
 
+#[test]
+fn late_acks_free_their_slots_without_blocking() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let (mut plugin, paper) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut free = [false; 3];
+    drain_acks(paper.as_raw_fd(), &mut free).unwrap();
+    assert_eq!(free, [false; 3]);
+    let epoch = paper_runtime::plasma::stream_epoch();
+    plugin.write_all(&paper_runtime::plasma::packet(3, 2, epoch)).unwrap();
+    plugin.write_all(&paper_runtime::plasma::packet(3, 0, epoch.wrapping_add(1))).unwrap();
+    plugin.write_all(&paper_runtime::plasma::packet(3, 0, epoch)).unwrap();
+    drain_acks(paper.as_raw_fd(), &mut free).unwrap();
+    assert_eq!(free, [true, false, true]);
+    drop(plugin);
+    assert!(drain_acks(paper.as_raw_fd(), &mut free).is_err());
+}
+
 fn check_output_resume(delayed: bool, with_wake: bool) {
     let (send, receive) = std::sync::mpsc::channel();
     let wake = with_wake.then(paper_runtime::wake::make_pipe).flatten();

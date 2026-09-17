@@ -4700,12 +4700,8 @@ pub(super) fn stream_scene(
     let mut free = vec![[true; 3]; targets.len()];
     let mut emitted = vec![false; targets.len()];
     loop {
-        for (index, socket) in sockets.iter().enumerate() {
-            while let Some(slot) = crate::preview::receive_ack(*socket, false)? {
-                if let Some(value) = free[index].get_mut(slot) {
-                    *value = true;
-                }
-            }
+        for (socket, slots) in sockets.iter().zip(free.iter_mut()) {
+            crate::preview::drain_acks(*socket, slots)?;
         }
         if let Some(req) = ctl.poll() {
             let swap_started = Instant::now();
@@ -4869,6 +4865,7 @@ pub(super) fn stream_scene(
             fade_first_frame,
         );
         for (index, target) in targets.iter().enumerate() {
+            crate::preview::drain_acks(target.socket, &mut free[index])?;
             if target.paused {
                 continue;
             }

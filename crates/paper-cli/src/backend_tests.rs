@@ -531,3 +531,27 @@ fn backdrop_surface_reaches_still_and_vulkan_workers() {
         assert_eq!(env[std::ffi::OsStr::new(key)], Some(std::ffi::OsStr::new(value)));
     }
 }
+
+#[test]
+fn plasma_still_transitions_stream_on_the_gpu_when_plasma_can_import() {
+    let route = super::PlasmaRoute::new(true, true);
+    assert!(route.prelude_gpu);
+    assert!(!route.presenter_gpu);
+    assert!(route.presenter_writes_header(true));
+    assert!(route.presenter_writes_header(false));
+    assert!(route.presenter_rebases_stream(true));
+    assert!(!route.presenter_rebases_stream(false));
+}
+
+#[test]
+fn plasma_cpu_only_host_keeps_the_prelude_header() {
+    let still = super::PlasmaRoute::new(true, false);
+    assert!(!still.prelude_gpu && !still.presenter_gpu);
+    assert!(!still.presenter_writes_header(true));
+    assert!(still.presenter_writes_header(false));
+    assert!(!still.presenter_rebases_stream(true));
+    let video = super::PlasmaRoute::new(false, true);
+    assert!(video.prelude_gpu && video.presenter_gpu);
+    assert!(video.presenter_writes_header(true));
+    assert!(video.presenter_rebases_stream(false));
+}

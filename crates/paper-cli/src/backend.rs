@@ -457,10 +457,34 @@ fn stream_fd_list(streams: &[PlasmaStream]) -> String {
         .join(",")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlasmaRoute {
+    pub(crate) prelude_gpu: bool,
+    pub(crate) presenter_gpu: bool,
+}
+
+impl PlasmaRoute {
+    pub(crate) fn new(still: bool, gpu_import: bool) -> Self {
+        Self { prelude_gpu: gpu_import, presenter_gpu: gpu_import && !still }
+    }
+
+    pub(crate) fn presenter_writes_header(self, prefaced: bool) -> bool {
+        !prefaced || self.prelude_gpu
+    }
+
+    pub(crate) fn presenter_rebases_stream(self, prefaced: bool) -> bool {
+        self.presenter_gpu || (self.prelude_gpu && prefaced)
+    }
+}
+
 pub(crate) fn present_plasma(assignment: &Assignment, streams: &[PlasmaStream]) -> Result<()> {
     let backends = BackendPaths::discover();
     let still = assignment.source.kind == SourceKind::Static;
-    let gpu_stream = !still && std::env::var("SKWD_PAPER_PLASMA_GPU_STREAM").as_deref() == Ok("1");
+    let route = PlasmaRoute::new(
+        still,
+        std::env::var("SKWD_PAPER_PLASMA_GPU_STREAM").as_deref() == Ok("1"),
+    );
+    let gpu_stream = route.presenter_gpu;
     if streams.len() > 1 {
         if still {
             anyhow::ensure!(
@@ -482,7 +506,7 @@ pub(crate) fn present_plasma(assignment: &Assignment, streams: &[PlasmaStream]) 
             .ok()
             .flatten();
         let Some(mut transition) = transition else { continue };
-        if gpu_stream {
+        if route.prelude_gpu {
             paper_runtime::plasma::begin_stream(stream.fd, 1)?;
             transition.arg("--stream-fd").arg(stream.fd.to_string());
             transition.env("SKWD_PAPER_STREAM_EPOCH", "1");
@@ -508,8 +532,9 @@ pub(crate) fn present_plasma(assignment: &Assignment, streams: &[PlasmaStream]) 
             Err(error) => tracing::warn!(%error, "Plasma transition prelude did not finish"),
         }
     }
-    let mut command = plasma_command(&backends, assignment, streams, !prefaced || gpu_stream)?;
-    if gpu_stream {
+    let mut command =
+        plasma_command(&backends, assignment, streams, route.presenter_writes_header(prefaced))?;
+    if route.presenter_rebases_stream(prefaced) {
         for stream in streams {
             paper_runtime::plasma::begin_stream(stream.fd, 2)?;
         }

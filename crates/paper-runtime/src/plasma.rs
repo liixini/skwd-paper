@@ -84,8 +84,16 @@ pub fn frame_ready() -> std::io::Result<()> {
     Ok(())
 }
 
+pub const LATE_ACKS: u8 = 1;
+
+pub fn ready_packet(epoch: u16) -> [u8; 32] {
+    let mut ready = packet(6, 0, epoch);
+    ready[8] = LATE_ACKS;
+    ready
+}
+
 pub fn frame_ready_on(fd: i32) -> std::io::Result<()> {
-    send(fd, packet(6, 0, stream_epoch()))
+    send(fd, ready_packet(stream_epoch()))
 }
 
 pub fn ready_fds(value: Option<&str>) -> Vec<i32> {

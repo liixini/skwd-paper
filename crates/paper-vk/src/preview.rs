@@ -445,6 +445,15 @@ pub(crate) fn apply_output_pauses(
     targets.iter().all(|target| target.paused)
 }
 
+pub(crate) fn drain_acks(socket: RawFd, free: &mut [bool; 3]) -> std::io::Result<()> {
+    while let Some(slot) = receive_ack(socket, false)? {
+        if let Some(value) = free.get_mut(slot) {
+            *value = true;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn wait_any_free(
     sockets: &[RawFd],
     free: &mut [[bool; 3]],
@@ -478,11 +487,7 @@ pub(crate) fn wait_any_free(
             if event.revents == 0 {
                 continue;
             }
-            while let Some(slot) = receive_ack(sockets[index], false)? {
-                if let Some(value) = free[index].get_mut(slot) {
-                    *value = true;
-                }
-            }
+            drain_acks(sockets[index], &mut free[index])?;
         }
     }
 }
@@ -503,12 +508,7 @@ struct Sink {
 
 impl Sink {
     fn drain_acks(&mut self) -> Result<()> {
-        while let Some(slot) = receive_ack(self.target.socket, false)? {
-            if let Some(value) = self.free.get_mut(slot) {
-                *value = true;
-            }
-        }
-        Ok(())
+        Ok(drain_acks(self.target.socket, &mut self.free)?)
     }
 
     fn announce(&self) -> Result<()> {
@@ -737,6 +737,7 @@ impl VideoStreamer {
             Src::Views(transition.upload.luma_view, transition.upload.chroma_view)
         });
         for sink in &mut self.sinks {
+            sink.drain_acks()?;
             if sink.target.paused || !sink.due(relative) {
                 continue;
             }
