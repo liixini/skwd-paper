@@ -11,17 +11,35 @@ pub(super) fn open_shared_decoder(
     video: &str,
     shared: &crate::shared::SharedDevice,
     force_software: bool,
+    dims: &[(u32, u32)],
 ) -> Result<Option<decode::AnyDecoder>> {
     if pattern.is_some() {
         return Ok(None);
     }
-    Ok(Some(open_decoder(
+    Ok(Some(open_present_decoder(
         video,
-        Some(shared.hwdev),
+        shared.hwdev,
         shared.video_decode,
         shared.render_node.as_deref(),
         force_software,
+        dims,
     )?))
+}
+
+fn open_present_decoder(
+    path: &str,
+    hwdev: *mut ffmpeg_the_third::ffi::AVBufferRef,
+    vulkan_decode: bool,
+    render_node: Option<&std::path::Path>,
+    force_software: bool,
+    dims: &[(u32, u32)],
+) -> Result<decode::AnyDecoder> {
+    if !paper_control::is_video_path(path)
+        && let Ok(decoder) = decode::still::StillDecoder::open(path, dims, crate::fill::fill_mode())
+    {
+        return Ok(decode::AnyDecoder::Still(decoder));
+    }
+    open_decoder(path, Some(hwdev), vulkan_decode, render_node, force_software)
 }
 
 pub(super) fn init_free_buffers(target: &mut wayland::Target, n_exports: usize) {
@@ -55,25 +73,20 @@ pub(super) struct RgbaStillSource {
     pub(super) uvs: Vec<[f32; 4]>,
 }
 
-pub(super) fn load_rgba_still(
+pub(super) fn upload_rgba_still(
     renderer: &mut vk::Renderer,
-    path: &str,
+    frame: &decode::RenderFrame,
     dims: &[(u32, u32)],
-) -> Result<RgbaStillSource> {
-    // Ordinary video presenters do not otherwise allocate scene descriptors.
-    // Reserve enough slots for startup endpoints and later warm swaps before
-    // creating the first RGBA texture.
+) -> Result<Option<RgbaStillSource>> {
+    let Some(pixels) = frame.still_pixels() else {
+        return Ok(None);
+    };
     renderer.ensure_scene_pool(16)?;
-    let image = image::ImageReader::open(path)
-        .with_context(|| format!("open transition still {path}"))?
-        .with_guessed_format()?
-        .decode()
-        .with_context(|| format!("decode transition still {path}"))?
-        .to_rgba8();
-    let (width, height) = image.dimensions();
-    let texture = renderer.create_scene_texture(width, height, image.as_raw())?;
+    let image = &pixels.image;
+    let texture = renderer.create_scene_texture(image.width(), image.height(), image.as_raw())?;
+    let (width, height) = pixels.source;
     let uvs = dims.iter().map(|&(w, h)| mode_uv(width, height, w, h)).collect();
-    Ok(RgbaStillSource { texture, uvs })
+    Ok(Some(RgbaStillSource { texture, uvs }))
 }
 
 impl PendingSwap {
@@ -92,6 +105,7 @@ pub(super) fn begin_swap(
     vulkan_decode: bool,
     render_node: Option<std::path::PathBuf>,
     force_software: bool,
+    dims: &[(u32, u32)],
 ) -> PendingSwap {
     let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let still = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -100,16 +114,18 @@ pub(super) fn begin_swap(
     unsafe impl Send for HwPtr {}
     let hw = HwPtr(hwdev);
     let path = req.to.clone();
+    let dims = dims.to_vec();
     let abort_thread = abort.clone();
     let still_thread = still.clone();
     let worker = std::thread::spawn(move || {
         let hw = hw;
-        let mut dec = match open_decoder(
+        let mut dec = match open_present_decoder(
             &path,
-            Some(hw.0),
+            hw.0,
             vulkan_decode,
             render_node.as_deref(),
             force_software,
+            &dims,
         ) {
             Ok(decoder) => decoder,
             Err(error) => {
@@ -489,6 +505,7 @@ pub(super) fn start_swap(
     shared: &crate::shared::SharedDevice,
     force_software: bool,
     dims: &[(u32, u32)],
+    target_dims: &[(u32, u32)],
     ctl: &mut ctl::Ctl,
 ) -> Option<FadeState> {
     let pending = begin_swap(
@@ -497,6 +514,7 @@ pub(super) fn start_swap(
         shared.video_decode,
         shared.render_node.clone(),
         force_software,
+        target_dims,
     );
     let received = pending.rx.recv_timeout(pending.timeout);
     let Ok(frame) = received else {
@@ -543,7 +561,8 @@ fn finish_swap(
 ) -> FadeState {
     let (bw, bh) = (frame.width(), frame.height());
     let uvs_b: Vec<[f32; 4]> = dims.iter().map(|&(w, h)| mode_uv(bw, bh, w, h)).collect();
-    ctl.swap_audio(&pending.req.to, true);
+    let still_b = pending.still.load(std::sync::atomic::Ordering::Relaxed);
+    ctl.swap_audio(&pending.req.to, !still_b);
     let shader = pending.req.shader.as_deref().map(|name| {
         if name == "random" {
             let nanos = std::time::SystemTime::now()
@@ -583,7 +602,7 @@ fn finish_swap(
         uvs: uvs_b,
         style,
         effect,
-        still_b: pending.still.load(std::sync::atomic::Ordering::Relaxed),
+        still_b,
         first_frame: true,
         path: pending.req.to,
     }
@@ -697,14 +716,14 @@ pub(super) fn render_video(
     rgba_a: Option<&RgbaStillSource>,
     rgba_b: Option<&RgbaStillSource>,
 ) -> Result<()> {
-    let fallback_a = src_of(frame, sw_a);
-    let src_a = rgba_a.map_or(fallback_a, |still| vk::Src::Rgba(still.texture.view));
+    let src_a =
+        rgba_a.map_or_else(|| src_of(frame, sw_a), |still| vk::Src::Rgba(still.texture.view));
     let uv_a = rgba_a.map_or(uv, |still| still.uvs[si]);
     let (Some(fade), Some(t)) = (fade, fade_mix) else {
         return renderer.render_to(rt, export, &src_a, uv_a);
     };
-    let fallback_b = src_of(&fade.cur.0, sw_b);
-    let src_b = rgba_b.map_or(fallback_b, |still| vk::Src::Rgba(still.texture.view));
+    let src_b =
+        rgba_b.map_or_else(|| src_of(&fade.cur.0, sw_b), |still| vk::Src::Rgba(still.texture.view));
     let uv_b = rgba_b.map_or(fade.uvs[si], |still| still.uvs[si]);
     if t <= 0.0 {
         return renderer.render_to(rt, export, &src_a, uv_a);

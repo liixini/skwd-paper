@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use ffmpeg_the_third as ff;
 
+pub(crate) mod still;
+
 const HW_THREAD_COUNT: i32 = 1;
 const CONSECUTIVE_PACKET_ERROR_LIMIT: usize = 16;
 const EMPTY_CONTAINER_WRAP_LIMIT: usize = 2;
@@ -16,6 +18,11 @@ fn container_wrap_is_fatal(wraps: &mut usize) -> bool {
 }
 
 pub fn probe_dims(path: &str) -> Option<(u32, u32)> {
+    if !paper_control::is_video_path(path)
+        && let Ok(dims) = image::image_dimensions(path)
+    {
+        return Some(dims);
+    }
     ff::format::input(path).ok().and_then(|ictx| {
         let stream = ictx.streams().best(ff::media::Type::Video)?;
         let parameters = stream.parameters();
@@ -688,6 +695,7 @@ unsafe extern "C" fn interrupt_cb(opaque: *mut std::ffi::c_void) -> i32 {
 }
 
 pub enum AnyDecoder {
+    Still(still::StillDecoder),
     Vk(VulkanDecoder),
     Vaapi(VaapiDecoder),
     Sw(SwDecoder),
@@ -697,15 +705,20 @@ pub enum AnyDecoder {
 pub struct RenderFrame {
     frame: ff::frame::Video,
     mapped: Option<std::sync::Arc<MappedFrame>>,
+    still: Option<std::sync::Arc<still::StillPixels>>,
 }
 
 impl RenderFrame {
     pub(crate) fn plain(frame: ff::frame::Video) -> Self {
-        Self { frame, mapped: None }
+        Self { frame, mapped: None, still: None }
     }
 
     fn mapped(frame: ff::frame::Video, mapped: MappedFrame) -> Self {
-        Self { frame, mapped: Some(std::sync::Arc::new(mapped)) }
+        Self { frame, mapped: Some(std::sync::Arc::new(mapped)), still: None }
+    }
+
+    pub(crate) fn still_pixels(&self) -> Option<&still::StillPixels> {
+        self.still.as_deref()
     }
 
     pub fn video(&self) -> &ff::frame::Video {
@@ -731,6 +744,7 @@ impl AnyDecoder {
             AnyDecoder::Vk(dec) => (dec.width, dec.height),
             AnyDecoder::Vaapi(dec) => (dec.width, dec.height),
             AnyDecoder::Sw(dec) => (dec.width, dec.height),
+            AnyDecoder::Still(dec) => dec.source,
         }
     }
 
@@ -739,6 +753,7 @@ impl AnyDecoder {
             AnyDecoder::Vk(_) => false,
             AnyDecoder::Vaapi(_) => false,
             AnyDecoder::Sw(dec) => dec.still,
+            AnyDecoder::Still(_) => true,
         }
     }
 
@@ -747,6 +762,7 @@ impl AnyDecoder {
             AnyDecoder::Vk(dec) => dec.next_hw_frame(),
             AnyDecoder::Vaapi(dec) => dec.next(),
             AnyDecoder::Sw(dec) => dec.next(),
+            AnyDecoder::Still(dec) => dec.next().map(|(frame, pts)| (frame.frame, pts)),
         }
     }
 
@@ -756,6 +772,7 @@ impl AnyDecoder {
                 dec.next_hw_frame().map(|(frame, pts)| (RenderFrame::plain(frame), pts))
             }
             AnyDecoder::Vaapi(dec) => dec.next_render(),
+            AnyDecoder::Still(dec) => dec.next(),
             AnyDecoder::Sw(dec) => dec.next().map(|(frame, pts)| (RenderFrame::plain(frame), pts)),
         }
     }
@@ -774,6 +791,10 @@ impl AnyDecoder {
             AnyDecoder::Vk(dec) => &mut dec.ictx,
             AnyDecoder::Vaapi(dec) => &mut dec.ictx,
             AnyDecoder::Sw(dec) => &mut dec.ictx,
+            AnyDecoder::Still(dec) => {
+                dec.abort = Some(flag);
+                return;
+            }
         };
         unsafe {
             (*ictx.as_mut_ptr()).interrupt_callback = ff::ffi::AVIOInterruptCB {
@@ -785,6 +806,7 @@ impl AnyDecoder {
             AnyDecoder::Vk(dec) => dec.abort = Some(flag),
             AnyDecoder::Vaapi(dec) => dec.abort = Some(flag),
             AnyDecoder::Sw(dec) => dec.abort = Some(flag),
+            AnyDecoder::Still(_) => unreachable!(),
         }
     }
 }
