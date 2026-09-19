@@ -92,8 +92,8 @@ fn tone(index: usize) -> Option<String> {
 }
 
 #[test]
-#[ignore = "needs an output device: SKWD_AUDIO_TEST_CLIPS=a.wav,b.wav cargo test -p paper-audio -- --ignored"]
-fn real_clips_one_stream() {
+#[ignore = "checks lifecycle with an output device: SKWD_AUDIO_TEST_CLIPS=a.wav,b.wav cargo test -p paper-audio -- --ignored"]
+fn real_clips_mixer_lifecycle() {
     let (Some(first), Some(second)) = (tone(0), tone(1)) else {
         panic!("set SKWD_AUDIO_TEST_CLIPS to two decodable audio files");
     };

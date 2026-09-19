@@ -15,5 +15,8 @@ libloading = "0.8"
 ringbuf = "0.4"
 ffmpeg-the-third = { version = "6", default-features = false, features = ["codec", "format", "software-resampling"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints.rust]
 dead_code = "allow"

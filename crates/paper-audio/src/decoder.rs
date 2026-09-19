@@ -69,7 +69,14 @@ pub(super) fn decode_loop(
         (index, decoder, format, rate, channels)
     };
 
-    let input_layout = ff::ChannelLayout::default_for_channels(input_channels);
+    let input_layout = if decoder.ch_layout().order() == ff::ChannelOrder::Unspecified {
+        ff::ChannelLayout::default_for_channels(input_channels)
+    } else {
+        decoder.ch_layout()
+    };
+    if input_layout.mask().is_none() {
+        return Err(anyhow!("unsupported audio channel layout: {}", input_layout.description()));
+    }
     let target_layout = ff::ChannelLayout::default_for_channels(2);
     let target_format = ff::format::Sample::F32(ff::format::sample::Type::Planar);
     tracing::info!(
@@ -152,6 +159,11 @@ fn decode_packet(
         return;
     }
     while !stop.load(Ordering::Relaxed) && decoder.receive_frame(decoded).is_ok() {
+        if decoded.ch_layout().order() == ff::ChannelOrder::Unspecified {
+            decoded.set_ch_layout(ff::ChannelLayout::default_for_channels(
+                decoded.ch_layout().channels(),
+            ));
+        }
         if resampler.run(decoded, resampled).is_err() {
             continue;
         }

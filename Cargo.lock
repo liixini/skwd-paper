@@ -1452,6 +1452,7 @@ dependencies = [
  "ffmpeg-the-third",
  "libloading",
  "ringbuf",
+ "tempfile",
  "tracing",
 ]
 
