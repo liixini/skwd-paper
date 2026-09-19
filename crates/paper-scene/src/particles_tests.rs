@@ -1,5 +1,106 @@
 use super::*;
 
+#[test]
+fn emitter_audio_uses_selected_stereo_peak_then_smoothed_bounds_and_exponent() {
+    let response = AudioResponse::parse(&serde_json::json!({"audioprocessingmode":3})).unwrap();
+    let mut left = [0.0; 16];
+    let mut right = [0.0; 16];
+    left[7] = 4.0;
+    right[7] = 4.0;
+    assert_eq!(response.amount(&left, &right), 0.0);
+    left[0] = 1.0;
+    right[1] = 1.0;
+    assert_eq!(response.amount(&left, &right), 0.0);
+    left[0] = 0.9;
+    right[0] = 0.9;
+    assert!((response.amount(&left, &right) - 0.25).abs() < 1e-5);
+    left[0] = 1.0;
+    right[0] = 1.0;
+    assert_eq!(response.amount(&left, &right), 1.0);
+    assert!(AudioResponse::parse(&serde_json::json!({"audioprocessingmode":0})).is_none());
+
+    for (mode, expected) in [(1, 0.15625), (2, 0.84375), (3, 0.5)] {
+        let response = AudioResponse::parse(&serde_json::json!({
+            "audioprocessingmode":mode,"audioprocessingexponent":1,
+            "audioprocessingbounds":"0 1","audioprocessingfrequencystart":15,
+            "audioprocessingfrequencyend":14
+        }))
+        .unwrap();
+        left[14] = 0.25;
+        right[14] = 0.75;
+        assert_eq!(response.amount(&left, &right), expected);
+    }
+}
+
+#[test]
+fn equal_audio_bounds_activate_only_above_the_threshold() {
+    let response = AudioResponse::parse(&serde_json::json!({
+        "audioprocessingmode":3,"audioprocessingbounds":"0.8 0.8"
+    }))
+    .unwrap();
+    for (level, expected) in [(0.7, 0.0), (0.8, 0.0), (0.9, 1.0)] {
+        assert_eq!(response.amount(&[level; 16], &[level; 16]), expected);
+    }
+}
+
+#[test]
+fn audio_emitters_start_and_prewarm_silently_then_emit_only_with_matching_audio() {
+    let mut sys = system();
+    sys.start_time = 2.0;
+    sys.emitters = vec![
+        parse_emitter(&serde_json::json!({
+            "name":"boxrandom","rate":40,"audioprocessingmode":3
+        }))
+        .unwrap(),
+    ];
+    sys.initializers = vec![Initializer::Lifetime { min: 3.0, max: 3.0, exponent: 1.0 }];
+    assert!(sys.needs_audio());
+    let mut sim = Sim::new(7);
+    sim.prewarm(&sys, 0.1);
+    sim.step(&sys, 0.0);
+    assert!(sim.particles.is_empty());
+    let mut bass = [0.0; 16];
+    bass[0] = 1.0;
+    for _ in 0..4 {
+        sim.step_with_audio(&sys, 0.25, &bass, &bass);
+    }
+    assert_eq!(sim.particles.len(), 40);
+    let age = sim.particles[0].age;
+    sim.step_with_audio(&sys, 0.0, &bass, &bass);
+    assert_eq!(sim.particles.len(), 40);
+    assert_eq!(sim.particles[0].age, age);
+    for _ in 0..16 {
+        sim.step(&sys, 0.25);
+    }
+    assert!(sim.particles.is_empty());
+
+    sys.emitters = vec![
+        parse_emitter(&serde_json::json!({
+            "name":"boxrandom","rate":40,"audioprocessingmode":0
+        }))
+        .unwrap(),
+    ];
+    let mut unbound = Sim::new(7);
+    unbound.prewarm(&sys, 0.1);
+    assert!(!sys.needs_audio());
+    assert!(!unbound.particles.is_empty());
+}
+
+#[test]
+fn inactive_audio_emitter_never_receives_another_emitters_particles() {
+    let mut sys = system();
+    sys.emitters = [
+        serde_json::json!({"name":"boxrandom","rate":40,"origin":"-100 0 0","audioprocessingmode":1}),
+        serde_json::json!({"name":"boxrandom","rate":40,"origin":"100 0 0","audioprocessingmode":2}),
+    ].iter().map(|entry| parse_emitter(entry).unwrap()).collect();
+    let mut bass = [0.0; 16];
+    bass[0] = 1.0;
+    let mut sim = Sim::new(7);
+    sim.step_with_audio(&sys, 0.25, &bass, &[]);
+    assert_eq!(sim.particles.len(), 10);
+    assert!(sim.particles.iter().all(|particle| particle.pos[0] == -100.0));
+}
+
 fn system() -> ParticleSystem {
     ParticleSystem {
         renderer: Renderer::Sprite,
@@ -10,6 +111,7 @@ fn system() -> ParticleSystem {
         start_time: 0.0,
         control_points: [ControlPoint::default(); 8],
         emitters: vec![Emitter::Box {
+            audio: None,
             control_point: None,
             instantaneous: 0,
             origin: [0.0, 0.0, 0.0],
@@ -37,6 +139,41 @@ fn system() -> ParticleSystem {
         grab_slot: None,
         world: false,
     }
+}
+
+#[test]
+fn zero_delta_initializes_particles_once_and_preserves_ribbon_history() {
+    let mut continuous = Sim::new(7);
+    continuous.step(&system(), 0.0);
+    assert_eq!(continuous.particles.len(), 1);
+    let mut sys = system();
+    sys.renderer = Renderer::Ribbon;
+    sys.emitters = vec![Emitter::Box {
+        audio: None,
+        control_point: None,
+        instantaneous: 2,
+        origin: [0.0; 3],
+        extent: [0.0; 3],
+        rate: 0.0,
+    }];
+    sys.operators = vec![Operator::Movement { gravity: [0.0; 3], drag: 0.0 }];
+    let mut sim = Sim::new(7);
+    sim.step(&sys, 0.0);
+    assert_eq!(sim.particles.len(), 2);
+    assert!(sim.particles.iter().all(|particle| particle.size == 5.0));
+    for particle in &mut sim.particles {
+        particle.vel = [10.0, 0.0, 0.0];
+    }
+    sim.step(&sys, 0.1);
+    let history = sim.history.clone();
+    for _ in 0..3 {
+        sim.step(&sys, 0.0);
+        assert_eq!(sim.history, history);
+        assert_eq!(sim.particles.len(), 2);
+        assert_eq!(sim.time, 0.1);
+    }
+    sim.step(&sys, 0.1);
+    assert_ne!(sim.history, history);
 }
 
 #[test]
@@ -69,6 +206,7 @@ fn particles_expire_after_lifetime() {
 fn alpha_fades_late() {
     let mut sys = system();
     sys.emitters = vec![Emitter::Box {
+        audio: None,
         control_point: None,
         instantaneous: 0,
         origin: [0.0, 0.0, 0.0],
@@ -91,6 +229,7 @@ fn alpha_fades_late() {
 fn single(op: Operator) -> ParticleSystem {
     let mut sys = system();
     sys.emitters = vec![Emitter::Box {
+        audio: None,
         control_point: None,
         instantaneous: 0,
         origin: [0.0, 0.0, 0.0],
@@ -309,6 +448,7 @@ fn color_random_lerps_all_channels_with_one_parameter() {
 fn sphere_emitter_renormalises_scaled_directions_and_honours_sign() {
     let mut sys = system();
     sys.emitters = vec![Emitter::Sphere {
+        audio: None,
         control_point: None,
         instantaneous: 0,
         origin: [0.0, 0.0, 0.0],
@@ -328,6 +468,7 @@ fn sphere_emitter_renormalises_scaled_directions_and_honours_sign() {
             && sim.particles.iter().any(|p| p.pos[0] < 0.0)
     );
     sys.emitters = vec![Emitter::Sphere {
+        audio: None,
         control_point: None,
         instantaneous: 0,
         origin: [0.0, 0.0, 0.0],
@@ -364,6 +505,7 @@ fn emitter_rate_and_capacity_cover_engine_downpours() {
 fn a_system_emits_its_first_particle_on_the_first_step_regardless_of_rate() {
     let mut sys = system();
     sys.emitters = vec![Emitter::Box {
+        audio: None,
         control_point: None,
         instantaneous: 0,
         origin: [0.0; 3],
@@ -385,6 +527,7 @@ fn sphere_emitter_distance_follows_the_scaled_ball_length() {
     let mut sys = system();
     sys.max_count = 4000;
     sys.emitters = vec![Emitter::Sphere {
+        audio: None,
         control_point: None,
         instantaneous: 0,
         origin: [0.0; 3],
@@ -435,6 +578,7 @@ fn world_space_systems_keep_object_scale_off_positions_and_sizes_but_on_velocity
     assert!((sim.particles[0].vel[0] - 600.0).abs() < 1e-3, "{:?}", sim.particles[0].vel);
     let mut shell = system;
     shell.emitters = vec![Emitter::Sphere {
+        audio: None,
         control_point: None,
         instantaneous: 0,
         origin: [100.0, 0.0, 0.0],
@@ -468,6 +612,7 @@ fn initializer_exponent_biases_toward_min_or_max_and_bursts_spawn_instantly() {
     let mut sys = system();
     sys.max_count = 2000;
     sys.emitters = vec![Emitter::Box {
+        audio: None,
         control_point: None,
         origin: [0.0; 3],
         extent: [0.0; 3],
@@ -496,6 +641,7 @@ fn oscillate_position_integrates_a_radians_per_second_wave_on_particle_age_with_
     let mut sys = system();
     sys.max_count = 1;
     sys.emitters = vec![Emitter::Box {
+        audio: None,
         control_point: None,
         origin: [0.0; 3],
         extent: [0.0; 3],
@@ -575,6 +721,7 @@ fn explicit_control_points_respect_rotation_world_space_and_static_offsets() {
     sys.control_points[2] = ControlPoint { flags: 2, offset: [120.0, 230.0, 0.0] };
     sys.control_points[3] = ControlPoint { flags: 0, offset: [4.0, 5.0, 0.0] };
     sys.emitters = vec![Emitter::Box {
+        audio: None,
         control_point: Some(1),
         origin: [0.0; 3],
         extent: [0.0; 3],
@@ -626,7 +773,7 @@ fn turbulent(scale: f32, offset: f32, phase: (f32, f32)) -> Turbulent {
 }
 
 fn point_emitter(origin: [f32; 3], rate: f32, instantaneous: u32) -> Emitter {
-    Emitter::Box { control_point: None, instantaneous, origin, extent: [0.0; 3], rate }
+    Emitter::Box { audio: None, control_point: None, instantaneous, origin, extent: [0.0; 3], rate }
 }
 
 #[test]

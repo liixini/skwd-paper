@@ -1,5 +1,6 @@
 mod media;
 mod mouse;
+mod properties;
 mod script;
 mod video;
 
@@ -65,12 +66,14 @@ struct LayerFx {
     passes: Vec<paper_scene::effects::PassMeta>,
     output: Option<FxTargetId>,
     source_dynamic: bool,
+    audio_dependent: bool,
     source_clock: bool,
     source_pointer: bool,
     dependency_dynamic: bool,
     retain_targets: bool,
     snapshot: bool,
     passthrough: bool,
+    copy_background: bool,
     snapshot_slot: Option<usize>,
     crop: Option<FxTargetStorage>,
     crop_quad: Option<vk::SceneQuad>,
@@ -87,7 +90,7 @@ struct LiveText {
 
 struct LayerAnimation {
     quad: usize,
-    object: usize,
+    object: Option<usize>,
     frames: Vec<paper_scene::model::SpriteFrame>,
     total: f32,
     pages: Vec<usize>,
@@ -422,8 +425,9 @@ impl LayerFx {
         }
     }
 
-    fn intrinsic_dynamic(&self) -> bool {
+    fn intrinsic_dynamic(&self, include_audio: bool) -> bool {
         self.source_dynamic
+            || (include_audio && self.audio_dependent)
             || self.passes.iter().any(paper_scene::effects::PassMeta::time_dependent)
             || self
                 .plan()
@@ -434,7 +438,7 @@ impl LayerFx {
     fn frame_state_dependent(&self) -> bool {
         self.source_clock
             || self.source_pointer
-            || self.intrinsic_dynamic()
+            || self.intrinsic_dynamic(true)
             || self.dependency_dynamic
     }
 }
@@ -572,6 +576,8 @@ struct ParticleEngine {
 }
 
 struct ParticleGroup {
+    id: String,
+    visible: bool,
     system: paper_scene::particles::ParticleSystem,
     sim: paper_scene::particles::Sim,
     texture: usize,
@@ -983,6 +989,7 @@ struct Group {
     scene_snapshot: Option<vk::SceneTarget>,
     scene_grab: Option<vk::SceneTarget>,
     frozen: bool,
+    composed_at: f32,
     from: Option<FadeSource>,
     quads: Vec<vk::SceneQuad>,
     quad_scene_order: Vec<usize>,
@@ -1001,7 +1008,6 @@ struct Group {
     animations: Vec<LayerAnimation>,
     script_sounds: Vec<(String, paper_audio::VoiceOp)>,
     audio: Option<paper_audio::Analyser>,
-    audio_fx: Vec<usize>,
     bands: paper_audio::Bands,
     live_text: Vec<LiveText>,
     live_text_due: f32,
@@ -1214,9 +1220,9 @@ impl Group {
                 scene_order: fx.scene_order,
                 local_targets: &local_targets[index],
                 binds: &fx.binds,
-                dynamic: fx.intrinsic_dynamic()
+                dynamic: fx.intrinsic_dynamic(include_clocks || self.audio.is_some())
                     || (include_clocks && (fx.source_clock || fx.source_pointer)),
-                passthrough: fx.passthrough,
+                passthrough: fx.copy_background,
                 prefix_dynamic: self
                     .particles
                     .iter()
@@ -1339,7 +1345,7 @@ impl Group {
         time: f32,
     ) {
         for animation in &mut self.animations {
-            if animation.object == object {
+            if animation.object == Some(object) {
                 animation.apply(op, time);
             }
         }
@@ -1431,11 +1437,13 @@ impl Group {
             return;
         };
         analyser.fill(&mut self.bands, dt);
+        self.apply_audio_bands();
+    }
+
+    fn apply_audio_bands(&mut self) {
         write_bands(&mut self.scene_uniforms, &self.bands);
-        for index in &self.audio_fx {
-            if let Some(fx) = self.fx.get_mut(*index) {
-                write_bands(&mut fx.uniforms, &self.bands);
-            }
+        for fx in self.fx.iter_mut().filter(|fx| fx.audio_dependent) {
+            write_bands(&mut fx.uniforms, &self.bands);
         }
     }
 
@@ -1450,11 +1458,19 @@ impl Group {
         let screen = (self.target.extent.width, self.target.extent.height);
         let canvas = self.canvas;
         for (group_index, group) in self.particles.iter_mut().enumerate() {
+            if !group.visible {
+                continue;
+            }
             group.sim.set_pointer([
                 self.mouse.position[0] * canvas.0,
                 (1.0 - self.mouse.position[1]) * canvas.1,
             ]);
-            group.sim.step(&group.system, dt);
+            group.sim.step_with_audio(
+                &group.system,
+                dt,
+                self.bands.slice(16, false).unwrap_or(&[]),
+                self.bands.slice(16, true).unwrap_or(&[]),
+            );
             if let Some(engine) = group.engine.as_mut() {
                 let system = &group.system;
                 let count = paper_scene::particles::pack_sprites(
@@ -1682,6 +1698,7 @@ impl Group {
         if self.frozen {
             return Ok(());
         }
+        self.composed_at = time;
         let logical_canvas = [self.canvas.0.max(1.0), self.canvas.1.max(1.0)];
         let clock = self.frame_clock(time, dt);
         let screen = (self.target.extent.width, self.target.extent.height);
@@ -1696,11 +1713,11 @@ impl Group {
                 &self.textures,
             )?;
         }
-        self.advance_layer_animations(time);
         self.advance_live_text(time)?;
         self.advance_audio(dt);
         self.advance_media()?;
         self.advance_scripts(time, dt)?;
+        self.advance_layer_animations(time);
         self.advance_mouse(dt);
         let debug_fx = std::env::var("SKWD_VK_FX_DEBUG").is_ok();
         let batched = !debug_fx && (!self.fx.is_empty() || !self.puppets.is_empty());
@@ -1802,7 +1819,15 @@ impl Group {
                     );
                 }
             }
+            let quad = &self.quads[self.fx[fx_index].quad];
+            let projection = background_projection(quad.rect, quad.angle, self.canvas);
             let fx = &mut self.fx[fx_index];
+            if fx.copy_background {
+                fx.base_quad.projection = Some(projection);
+            }
+            if let Some(crop_quad) = &mut fx.crop_quad {
+                crop_quad.projection = Some(projection);
+            }
             let ping = fx.ping.get(fx_scratch);
             let pong = fx.pong.get(fx_scratch);
             if let (Some(crop), Some(crop_quad)) = (&fx.crop, &fx.crop_quad) {
@@ -2097,6 +2122,11 @@ impl Group {
         let mut report = EffectBakeReport::default();
         for fx in old_fx {
             let Some(bytes) = fx.target_bytes() else {
+                report.transient_bytes += fx
+                    .target_ids()
+                    .filter_map(|target| fx.target_storage(target).owned())
+                    .map(|target| target.allocation_bytes)
+                    .sum::<u64>();
                 live_fx.push(fx);
                 continue;
             };
@@ -2315,14 +2345,14 @@ fn quads(model: &SceneModel, layer_slots: &[usize]) -> Vec<vk::SceneQuad> {
             vk::SceneQuad {
                 projection: None,
                 order_bias: 0,
-                rect: screen_rect(layer.passthrough, layer.center, layer.size),
+                rect: [layer.center.0, layer.center.1, layer.size.0, layer.size.1],
                 uv: [0.0, 0.0, uvw, uvh],
                 tint: if !layer.passthrough && !layer.effects.is_empty() {
                     [1.0, 1.0, 1.0, if layer.visible { 1.0 } else { 0.0 }]
                 } else {
                     layer_tint(layer)
                 },
-                angle: if layer.passthrough { 0.0 } else { layer.angle },
+                angle: layer.angle,
                 texture: layer_slots[idx],
                 blend: match layer.color_blend {
                     6 => vk::SceneBlend::Screen,
@@ -2436,18 +2466,18 @@ fn fallback_tint(layer: &paper_scene::model::Layer) -> [f32; 4] {
     }
 }
 
-fn screen_rect(passthrough: bool, center: (f32, f32), size: (f32, f32)) -> [f32; 4] {
-    if passthrough {
-        [center.0, center.1, size.0.abs(), size.1.abs()]
-    } else {
-        [center.0, center.1, size.0, size.1]
-    }
-}
-
-fn passthrough_uv(layer: &paper_scene::model::Layer, canvas: (f32, f32)) -> [f32; 4] {
-    let (cw, ch) = (canvas.0.max(1.0), canvas.1.max(1.0));
-    let (w, h) = (layer.size.0.abs(), layer.size.1.abs());
-    [(layer.center.0 - w * 0.5) / cw, (layer.center.1 - h * 0.5) / ch, w / cw, h / ch]
+fn background_projection(rect: [f32; 4], angle: f32, canvas: (f32, f32)) -> [[f32; 4]; 3] {
+    let (sin, cos) = angle.sin_cos();
+    let inverse = |size: f32| if size.abs() < 1e-6 { 0.0 } else { 2.0 / size };
+    let sx = inverse(rect[2]);
+    let sy = inverse(rect[3]);
+    let dx = canvas.0 * 0.5 - rect[0];
+    let dy = canvas.1 * 0.5 - rect[1];
+    [
+        [cos * canvas.0 * sx, sin * canvas.1 * sx, 0.0, (cos * dx + sin * dy) * sx],
+        [-sin * canvas.0 * sy, cos * canvas.1 * sy, 0.0, (-sin * dx + cos * dy) * sy],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
 }
 
 fn passive_target_quad(
@@ -2563,6 +2593,11 @@ fn layer_effect_dimensions(
     layer: &paper_scene::model::Layer,
     dimensions: SceneDimensions,
 ) -> (u32, u32) {
+    if layer.visible
+        && let Some((width, height)) = layer.composition_size
+    {
+        return bounded_effect_dimensions(f64::from(width.abs()), f64::from(height.abs()));
+    }
     if layer.is_text {
         return bounded_effect_dimensions(
             f64::from(layer.texture.width),
@@ -2570,6 +2605,22 @@ fn layer_effect_dimensions(
         );
     }
     effect_dimensions_for(layer.size, dimensions)
+}
+
+fn deferred_composition_layers(
+    layers: &[paper_scene::model::Layer],
+    dimensions: SceneDimensions,
+) -> Vec<String> {
+    layers
+        .iter()
+        .filter(|layer| !layer.visible && !layer.effects.is_empty())
+        .filter_map(|layer| {
+            let (width, height) = layer.composition_size?;
+            let authored =
+                bounded_effect_dimensions(f64::from(width.abs()), f64::from(height.abs()));
+            (layer_effect_dimensions(layer, dimensions) != authored).then(|| layer.id.clone())
+        })
+        .collect()
 }
 
 fn effect_dimensions_for(size: (f32, f32), dimensions: SceneDimensions) -> (u32, u32) {
@@ -2879,7 +2930,10 @@ fn build_group(
             let total = frames.iter().map(|frame| frame.time).sum();
             Some(LayerAnimation {
                 quad: index,
-                object: layer.scene_order,
+                object: model
+                    .scripts
+                    .as_ref()
+                    .and_then(|scripts| layer.object_index(&scripts.scene)),
                 frames,
                 total,
                 pages: layer_pages.remove(&index).unwrap_or_else(|| vec![layer_slots[index]]),
@@ -3069,7 +3123,9 @@ fn build_group(
             quads[index].tint = fallback_tint(layer);
             continue;
         }
-        let intrinsic_dynamic = metas.iter().any(paper_scene::effects::PassMeta::time_dependent)
+        let audio_dependent = metas.iter().any(paper_scene::effects::PassMeta::audio_dependent);
+        let intrinsic_dynamic = audio_dependent
+            || metas.iter().any(paper_scene::effects::PassMeta::time_dependent)
             || lifetime::plan_targets(
                 &fbos.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
                 &pass_targets,
@@ -3119,7 +3175,7 @@ fn build_group(
             .iter()
             .flatten()
             .any(|(_, bind)| matches!(bind, EffectBind::SceneUnderLayer));
-        let snapshot_slot = if layer.passthrough || needs_crop {
+        let snapshot_slot = if layer.copy_background || needs_crop {
             let slot_texture = renderer.create_view_slot()?;
             textures.push(slot_texture);
             Some(textures.len() - 1)
@@ -3128,7 +3184,7 @@ fn build_group(
         };
         let atlas = layer.texture.atlas_frames().map(|frames| frames[0].uv);
         let (base_texture, base_uv) = match snapshot_slot {
-            Some(slot) if layer.passthrough => (slot, passthrough_uv(layer, canvas)),
+            Some(slot) if layer.copy_background => (slot, [0.0, 0.0, 1.0, 1.0]),
             _ => (layer_slots[index], atlas.unwrap_or([0.0, 0.0, uvw, uvh])),
         };
         let full_rect = [fx_w as f32 / 2.0, fx_h as f32 / 2.0, fx_w as f32, fx_h as f32];
@@ -3138,7 +3194,7 @@ fn build_group(
             rect: full_rect,
             uv: base_uv,
             tint: if layer.passthrough {
-                [1.0, 1.0, 1.0, 1.0]
+                [f32::from(layer.copy_background); 4]
             } else {
                 [layer.color[0], layer.color[1], layer.color[2], layer.alpha]
             },
@@ -3161,7 +3217,7 @@ fn build_group(
             projection: None,
             order_bias: 0,
             rect: full_rect,
-            uv: passthrough_uv(layer, canvas),
+            uv: [0.0, 0.0, 1.0, 1.0],
             tint: [1.0, 1.0, 1.0, 1.0],
             angle: 0.0,
             texture: slot,
@@ -3203,6 +3259,7 @@ fn build_group(
             passes: metas,
             output: None,
             source_dynamic,
+            audio_dependent,
             source_clock: layer.live_text.is_some(),
             source_pointer: layer
                 .effects
@@ -3214,6 +3271,7 @@ fn build_group(
             retain_targets: false,
             snapshot: false,
             passthrough: layer.passthrough,
+            copy_background: layer.copy_background,
             snapshot_slot,
             crop,
             crop_quad,
@@ -3329,6 +3387,8 @@ fn build_group(
             None => None,
         };
         particles.push(ParticleGroup {
+            id: layer.id,
+            visible: layer.visible,
             system,
             sim,
             texture: slot,
@@ -3447,12 +3507,12 @@ fn build_group(
     let audio_fx: Vec<usize> = fx
         .iter()
         .enumerate()
-        .filter(|(_, layer)| {
-            layer.passes.iter().any(paper_scene::effects::PassMeta::audio_dependent)
-        })
+        .filter(|(_, layer)| layer.audio_dependent)
         .map(|(index, _)| index)
         .collect();
-    let audio = if model.scripts.as_ref().is_some_and(|s| s.needs_audio()) {
+    let audio = if model.scripts.as_ref().is_some_and(|s| s.needs_audio())
+        || particles.iter().any(|particle| particle.system.needs_audio())
+    {
         start_audio(&[0])
     } else {
         start_audio(&audio_fx)
@@ -3473,6 +3533,10 @@ fn build_group(
         } else {
             None
         };
+    let deferred_compositions = deferred_composition_layers(&model.layers, dimensions);
+    if let Some(scripts) = &mut model.scripts {
+        scripts.restrict_hidden_layer_updates(&deferred_compositions);
+    }
     let scripts = script::Scripts::take(model, &layer_slots);
     let mut group = Group {
         scripts,
@@ -3484,6 +3548,7 @@ fn build_group(
         scene_snapshot: None,
         scene_grab: None,
         frozen: false,
+        composed_at: 0.0,
         from: None,
         quads,
         quad_scene_order,
@@ -3502,7 +3567,6 @@ fn build_group(
         animations,
         script_sounds: Vec::new(),
         audio,
-        audio_fx,
         bands: paper_audio::Bands::default(),
         live_text,
         live_text_due: 0.0,
@@ -3529,12 +3593,13 @@ fn build_group(
     group.compose(0.0, 1.0 / 30.0)?;
     let effect_layers = group.fx.len();
     let effect_target_bytes_before = group.effect_target_allocation_bytes();
-    let was_animated = group.animated()
+    let retain_composition_inputs = group.animated()
+        || group.fx.iter().any(|fx| fx.audio_dependent)
         || !group.live_text.is_empty()
         || group.mouse.enabled
         || group.scripts.is_some()
         || group.media.is_some();
-    let memory = if was_animated {
+    let memory = if retain_composition_inputs {
         group.bake_static_effects()?
     } else {
         group.release_composition_inputs();
@@ -3547,7 +3612,7 @@ fn build_group(
     };
     group.release_unused_scene_snapshot();
     let alias_enabled = std::env::var("SKWD_VK_FX_ALIAS").as_deref() != Ok("0");
-    let alias = if was_animated && alias_enabled {
+    let alias = if retain_composition_inputs && alias_enabled {
         group.alias_dynamic_effect_scratch()
     } else {
         EffectAliasReport::default()
@@ -3582,7 +3647,7 @@ fn build_group(
             "skwd-wall-vk: effect target allocation accounting"
         );
     }
-    if !was_animated {
+    if !retain_composition_inputs {
         tracing::info!(
             "skwd-wall-vk: static scene frozen; released layer/effect composition resources"
         );
@@ -4151,6 +4216,8 @@ pub(super) fn run_scene(
     target.ctl_fd = ctl.wake_fd();
     let mut active_dir = dir.to_string();
     let mut active_properties = properties.clone();
+    let mut property_source = properties::PropertySource::new(dir, properties);
+    let mut property_frame = false;
     target.enable_pointer();
     let mut presented = false;
     let mut committed_outputs = vec![false; n_surf];
@@ -4188,6 +4255,25 @@ pub(super) fn run_scene(
                 .as_ref()
                 .map(paper_scene::effects::parse_property_overrides)
                 .unwrap_or_default();
+            if req.duration_ms == 0
+                && group.update_properties(
+                    &mut property_source,
+                    &req.to,
+                    &next_properties,
+                    |id, op| ctl.scene_sound(id, op),
+                )
+            {
+                active_properties = next_properties;
+                group.drop_from();
+                fade_start = None;
+                property_frame = true;
+                presented = false;
+                committed_outputs.fill(false);
+                render_pending.fill(true);
+                animated = group.animated();
+                next_frame = Instant::now();
+                continue;
+            }
             let loaded = locate_pkg(&req.to)
                 .and_then(|path| paper_scene::pkg::Package::open(&path))
                 .and_then(|pkg| {
@@ -4243,6 +4329,8 @@ pub(super) fn run_scene(
             drop(next);
             active_dir.clone_from(&req.to);
             active_properties = next_properties;
+            property_source = properties::PropertySource::new(&active_dir, &active_properties);
+            property_frame = false;
             let mut old = std::mem::replace(&mut group, next_group);
             ctl.set_scene_voices(next_audio.as_ref().map(SceneAudio::voices).unwrap_or_default());
             scene_audio = next_audio;
@@ -4319,7 +4407,7 @@ pub(super) fn run_scene(
                 audio.set_pause(ctl.paused);
             }
         }
-        if ctl.render_paused(fade_start.is_some()) || idle_should_pause {
+        if (presented && ctl.render_paused(fade_start.is_some())) || idle_should_pause {
             if idle_should_pause {
                 idle_paused = true;
                 if let Some(audio) = &mut ctl.audio {
@@ -4331,7 +4419,7 @@ pub(super) fn run_scene(
             target.dispatch_wait_events(Instant::now() + Duration::from_secs(30))?;
             continue;
         }
-        if let Some(started) = suspended_at.take() {
+        if !property_frame && let Some(started) = suspended_at.take() {
             let now = Instant::now();
             let suspended_for = now.saturating_duration_since(started);
             epoch += suspended_for;
@@ -4361,7 +4449,7 @@ pub(super) fn run_scene(
         }
         let mouse_driven = group.mouse.pending();
         let frame_driven = animated || fade_start.is_some() || mouse_driven;
-        if frame_driven {
+        if frame_driven && !property_frame {
             let now = Instant::now();
             if now < next_frame {
                 target.dispatch_until(next_frame)?;
@@ -4522,6 +4610,7 @@ pub(super) fn run_scene(
                 .all(|(si, surface)| surface.closed || committed_outputs[si])
         {
             presented = true;
+            property_frame = false;
             tracing::info!(
                 "skwd-wall-vk: first scene frame committed on {n_surf} output(s){}",
                 if fade_start.is_some() { " (transition started)" } else { "" }
@@ -4694,6 +4783,8 @@ pub(super) fn stream_scene(
     let mut suspended_at = None;
     let mut presented = false;
     let mut fade_start: Option<Instant> = None;
+    let mut property_source = properties::PropertySource::new(dir, properties);
+    let mut property_frame = false;
     let mut fade_ms = 0u64;
     let mut fade_first_frame = false;
     let mut trans_style = TransitionStyle::Fade;
@@ -4710,6 +4801,23 @@ pub(super) fn stream_scene(
                 .as_ref()
                 .map(paper_scene::effects::parse_property_overrides)
                 .unwrap_or_default();
+            if req.duration_ms == 0
+                && group.update_properties(
+                    &mut property_source,
+                    &req.to,
+                    &next_properties,
+                    |id, op| ctl.scene_sound(id, op),
+                )
+            {
+                group.drop_from();
+                fade_start = None;
+                property_frame = true;
+                presented = false;
+                emitted.fill(false);
+                animated = group.animated();
+                next_frame = Instant::now();
+                continue;
+            }
             let loaded = locate_pkg(&req.to)
                 .and_then(|path| paper_scene::pkg::Package::open(&path))
                 .and_then(|pkg| {
@@ -4752,6 +4860,8 @@ pub(super) fn stream_scene(
                 "skwd-wall-vk: scene stream swap built"
             );
             let mut old = std::mem::replace(&mut group, next_group);
+            property_source = properties::PropertySource::new(&req.to, &next_properties);
+            property_frame = false;
             ctl.set_scene_voices(next_audio.as_ref().map(SceneAudio::voices).unwrap_or_default());
             _scene_audio = next_audio;
             old.drop_from();
@@ -4778,6 +4888,7 @@ pub(super) fn stream_scene(
             last_frame = now;
             next_frame = now;
             presented = false;
+            emitted.fill(false);
         }
         let pauses = ctl.take_output_pauses();
         if !pauses.is_empty() {
@@ -4806,7 +4917,7 @@ pub(super) fn stream_scene(
             }
             continue;
         }
-        if let Some(started) = suspended_at.take() {
+        if !property_frame && let Some(started) = suspended_at.take() {
             let suspended = Instant::now().saturating_duration_since(started);
             epoch += suspended;
             last_frame += suspended;
@@ -4844,7 +4955,11 @@ pub(super) fn stream_scene(
             }
             continue;
         }
-        let active: Vec<bool> = targets.iter().map(|target| !target.paused).collect();
+        let active: Vec<bool> = targets
+            .iter()
+            .zip(&emitted)
+            .map(|(target, emitted)| !target.paused || !emitted)
+            .collect();
         crate::preview::wait_any_free(&sockets, &mut free, &active)?;
         let now = Instant::now();
         if now < next_frame {
@@ -4852,7 +4967,7 @@ pub(super) fn stream_scene(
         }
         let now = Instant::now();
         next_frame = now + frame_gap;
-        if animated || mouse_driven {
+        if (animated || mouse_driven) && !property_frame {
             let dt = now.duration_since(last_frame).as_secs_f32().clamp(1.0 / 240.0, 0.1);
             last_frame = now;
             group.compose(epoch.elapsed().as_secs_f32(), dt)?;
@@ -4866,7 +4981,7 @@ pub(super) fn stream_scene(
         );
         for (index, target) in targets.iter().enumerate() {
             crate::preview::drain_acks(target.socket, &mut free[index])?;
-            if target.paused {
+            if !active[index] {
                 continue;
             }
             let Some(slot) = free[index].iter().position(|value| *value) else {
@@ -4891,7 +5006,10 @@ pub(super) fn stream_scene(
                 paper_runtime::plasma::frame_ready_on(target.socket)?;
                 emitted[index] = true;
             }
-            presented = true;
+        }
+        presented = emitted.iter().all(|emitted| *emitted);
+        if presented {
+            property_frame = false;
         }
         if fade_first_frame {
             fade_first_frame = false;
@@ -4903,6 +5021,16 @@ pub(super) fn stream_scene(
     }
 }
 
+#[cfg(test)]
+#[path = "scene/audio_tests.rs"]
+mod audio_tests;
+
+#[cfg(test)]
+#[path = "scene/effect_lifetime_tests.rs"]
+mod effect_lifetime_tests;
+#[cfg(test)]
+#[path = "scene/sprite_tests.rs"]
+mod sprite_tests;
 #[cfg(test)]
 mod tests;
 pub(super) mod thumbnail;

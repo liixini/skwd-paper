@@ -305,6 +305,8 @@ fn passive_target_quad_crops_padded_texture_at_layer_extent() {
         color: [1.0; 3],
         color_blend: 0,
         passthrough: false,
+        composition_size: None,
+        copy_background: false,
         solid: false,
         effects: Vec::new(),
     };
@@ -338,6 +340,8 @@ fn active_and_passive_duplicate_ids_remain_ambiguous() {
         color: [1.0; 3],
         color_blend: 0,
         passthrough: false,
+        composition_size: None,
+        copy_background: false,
         solid: false,
         effects: Vec::new(),
     };
@@ -644,6 +648,8 @@ fn layer_model_matrix_composes_origin_rotation_and_scale_without_size() {
         color: [1.0, 1.0, 1.0],
         color_blend: 0,
         passthrough: false,
+        composition_size: None,
+        copy_background: false,
         solid: false,
         effects: Vec::new(),
     };
@@ -778,6 +784,8 @@ fn test_layer(visible: bool, effects: usize) -> paper_scene::model::Layer {
         color: [1.0; 3],
         color_blend: 0,
         passthrough: false,
+        composition_size: None,
+        copy_background: false,
         solid: false,
         live_text: None,
         script_text: None,
@@ -820,7 +828,7 @@ fn sprite_controls_hold_play_and_rejoin_the_shared_clock() {
     };
     let mut animation = LayerAnimation {
         quad: 0,
-        object: 0,
+        object: Some(0),
         frames: vec![frame(0.5), frame(0.5), frame(0.5)],
         total: 1.5,
         pages: vec![0],
@@ -842,4 +850,71 @@ fn sprite_controls_hold_play_and_rejoin_the_shared_clock() {
     assert_eq!(animation.current_frame(9.0), 0);
     animation.apply(SpriteOp::Join, 9.0);
     assert_eq!(animation.current_frame(0.6), 1);
+}
+
+#[test]
+fn background_projection_inverts_translated_rotated_and_mirrored_layer_corners() {
+    let canvas = (3840.0, 2160.0);
+    for rect in [[1920.0, 440.0, -600.0, 240.0], [3460.0, 220.0, -380.0, 280.0]] {
+        for angle in [0.0, std::f32::consts::FRAC_PI_2, std::f32::consts::PI, 0.3] {
+            let matrix = background_projection(rect, angle, canvas);
+            let (sin, cos) = angle.sin_cos();
+            for corner in [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]] {
+                let x = corner[0] * rect[2];
+                let y = corner[1] * rect[3];
+                let world = [rect[0] + x * cos - y * sin, rect[1] + x * sin + y * cos];
+                let source = [world[0] / canvas.0 - 0.5, world[1] / canvas.1 - 0.5, 0.0, 1.0];
+                let projected =
+                    matrix.map(|row| row.iter().zip(source).map(|(a, b)| a * b).sum::<f32>());
+                assert!((projected[0] - corner[0] * 2.0).abs() < 1e-5);
+                assert!((projected[1] - corner[1] * 2.0).abs() < 1e-5);
+                assert_eq!(projected[2], 1.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn composition_effects_keep_authored_resolution_when_geometry_or_output_shrinks() {
+    let mut layer = test_layer(true, 1);
+    layer.passthrough = true;
+    layer.copy_background = true;
+    layer.size = (-1920.0 * 0.30868, 1080.0 * 0.21645);
+    layer.scale = (-0.30868, 0.21645);
+    layer.composition_size = Some((1920.0, 1080.0));
+    let mut low_resolution = scene_dimensions_for((3840.0, 2160.0), 4096);
+    low_resolution.raster = (1920, 1080);
+    assert_eq!(layer_effect_dimensions(&layer, low_resolution), (1920, 1080));
+    low_resolution.raster = (960, 540);
+    assert_eq!(layer_effect_dimensions(&layer, low_resolution), (1920, 1080));
+    layer.scale = (-0.61736, 0.43290);
+    layer.composition_size = Some((960.0, 540.0));
+    assert_eq!(layer_effect_dimensions(&layer, low_resolution), (960, 540));
+    layer.copy_background = false;
+    assert_eq!(layer_effect_dimensions(&layer, low_resolution), (960, 540));
+    layer.composition_size = Some((3840.0, 2160.0));
+    assert_eq!(layer_effect_dimensions(&layer, low_resolution), (2048, 1152));
+    layer.composition_size = None;
+    low_resolution.raster = (1920, 1080);
+    assert_eq!(layer_effect_dimensions(&layer, low_resolution), (296, 117));
+}
+
+#[test]
+fn hidden_compositions_defer_authored_targets_until_a_visibility_reload() {
+    let mut layer = test_layer(false, 1);
+    layer.id = "composition".into();
+    layer.size = (-592.6656, 233.766);
+    layer.composition_size = Some((1920.0, 1080.0));
+    let dimensions = SceneDimensions { logical: [3840.0, 2160.0], raster: (1920, 1080) };
+    assert_eq!(layer_effect_dimensions(&layer, dimensions), (296, 117));
+    assert_eq!(
+        deferred_composition_layers(std::slice::from_ref(&layer), dimensions),
+        ["composition"]
+    );
+    layer.visible = true;
+    assert_eq!(layer_effect_dimensions(&layer, dimensions), (1920, 1080));
+    assert!(deferred_composition_layers(std::slice::from_ref(&layer), dimensions).is_empty());
+    layer.visible = false;
+    layer.effects.clear();
+    assert!(deferred_composition_layers(std::slice::from_ref(&layer), dimensions).is_empty());
 }

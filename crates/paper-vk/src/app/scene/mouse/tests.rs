@@ -166,6 +166,7 @@ fn pointer_shader_survives_baking_and_receives_position_and_button() {
         fbos: Vec::new(),
         swaps: Vec::new(),
         passes: vec![EffectPass {
+            property_source: None,
             name: "Pointer probe".into(),
             vertex: translate(
                 "attribute vec3 a_Position;\nvoid main() { gl_Position = vec4(a_Position, 1.0); }",

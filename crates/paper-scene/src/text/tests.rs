@@ -127,7 +127,7 @@ fn text_objects_become_layers_anchored_at_the_origin() {
     }
     let scene = br#"{"general":{"orthogonalprojection":{"width":1920,"height":1080}},
         "objects":[{"id":1,"name":"t","origin":"300 540 0","text":"H","pointsize":48,
-        "font":"systemfont_consolas","horizontalalign":"left","verticalalign":"top","color":"1 0 0","alpha":0.5}]}"#;
+        "font":"fonts/NotoSans-Regular.ttf","horizontalalign":"left","verticalalign":"top","color":"1 0 0","alpha":0.5}]}"#;
     let bytes = crate::tests::build_pkg(&[("scene.json", scene)]);
     let package = crate::pkg::Package::parse(bytes).unwrap();
     let model = crate::model::load_with(&package, &assets).unwrap();

@@ -62,6 +62,8 @@ fn parse_command(kind: &str, target: &str, op: &str, value: &Value) -> Option<Sc
 }
 
 pub struct SceneScripts {
+    property_bindings: super::properties::PropertyBindings,
+    properties_changed: bool,
     storage: Option<super::Storage>,
     commands: Vec<ScriptCommand>,
     general: Vec<(String, Value)>,
@@ -102,7 +104,10 @@ impl SceneScripts {
             return Ok(None);
         }
         let mut bindings = Vec::new();
+        let original = scene.clone();
         source::collect(scene, "", &mut bindings, props);
+        let property_bindings =
+            super::properties::PropertyBindings::new(&original, project, &bindings);
         if bindings.len() > 4096
             || bindings.iter().map(|b| b.source.len()).sum::<usize>() > 4 * 1024 * 1024
         {
@@ -116,6 +121,8 @@ impl SceneScripts {
         runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= interrupt.get())));
         let context = Context::full(&runtime).map_err(|e| anyhow!("SceneScript context: {e}"))?;
         let mut host = Self {
+            property_bindings,
+            properties_changed: false,
             storage,
             commands: Vec::new(),
             general: Vec::new(),
@@ -131,7 +138,7 @@ impl SceneScripts {
             audio_registered: false,
             timers_pending: false,
         };
-        host.setup(scene, props, project)?;
+        host.setup(scene, props)?;
         let initialization_deadline = Instant::now() + Duration::from_secs(2);
         for (index, binding) in bindings.iter().enumerate() {
             if Instant::now() >= initialization_deadline {
@@ -162,12 +169,7 @@ impl SceneScripts {
         Ok(Some(host))
     }
 
-    fn setup(
-        &self,
-        scene: &Value,
-        props: &crate::model::Properties,
-        project: &Value,
-    ) -> Result<()> {
+    fn setup(&self, scene: &Value, props: &crate::model::Properties) -> Result<()> {
         let mut resolved = scene.clone();
         source::resolve_wrappers(&mut resolved, props);
         self.context.with(|ctx| {
@@ -179,14 +181,8 @@ impl SceneScripts {
                     ctx.globals().get::<_, Function>("__storageLoad")?.call::<_, ()>((storage.data.to_string(),))?;
                 }
                 let setup: Function = ctx.globals().get("__setup")?;
-                let mut values = project.pointer("/general/properties").and_then(Value::as_object).cloned().unwrap_or_default();
-                for (key, numbers) in props {
-                    let name = values.keys().find(|name| name.eq_ignore_ascii_case(key)).cloned().unwrap_or_else(|| key.clone());
-                    let entry = values.entry(name).or_insert_with(|| serde_json::json!({}));
-                    let value = if entry["type"] == "bool" { Value::Bool(numbers.first().is_some_and(|n| *n != 0.0)) } else if numbers.len() == 1 { Value::from(numbers[0]) } else { serde_json::json!(numbers) };
-                    entry["value"] = value;
-                }
-                setup.call::<_, ()>((resolved.to_string(), Value::Object(values).to_string()))?;
+                let values = self.property_bindings.user_properties(props);
+                setup.call::<_, ()>((resolved.to_string(), values.to_string()))?;
                 for (name, source) in [
                     ("WEColor", include_str!("color.js")),
                     ("WEMath", "export const mix=(a,b,t)=>a+(b-a)*t; export const clamp=(x,a,b)=>Math.min(b,Math.max(a,x)); export const smoothstep=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t)}; export const random=(a=0,b=1)=>mix(a,b,Math.random()); export const radians=x=>x*Math.PI/180; export const degrees=x=>x*180/Math.PI; export const deg2rad=radians; export const rad2deg=degrees; export const smoothStep=smoothstep;"),
@@ -199,10 +195,12 @@ impl SceneScripts {
     }
 
     fn compile(&mut self, index: usize, binding: &source::Binding) -> Result<()> {
+        let mut properties = binding.properties.clone();
+        source::resolve_wrappers(&mut properties, &self.properties);
         let has_update = self.context.with(|ctx| {
             let result = (|| -> rquickjs::Result<bool> {
                 let layer = binding.layer.map_or("undefined".to_owned(), |i| format!("__layers[{i}]"));
-                let source = format!("const thisLayer = {layer}; const thisObject = __owner({})[0]; const createScriptProperties = () => __createScriptProperties({});\n{}", serde_json::to_string(&binding.path).unwrap(), binding.properties, binding.source);
+                let source = format!("const thisLayer = {layer}; const thisObject = __owner({})[0]; const createScriptProperties = () => __createScriptProperties({properties}, {index});\n{}", serde_json::to_string(&binding.path).unwrap(), binding.source);
                 let (module, promise) = Module::declare(ctx.clone(), format!("scene-{index}.js"), source)?.eval()?;
                 promise.finish::<()>()?;
                 let namespace = module.namespace()?;
@@ -232,6 +230,49 @@ impl SceneScripts {
         if let Err(error) = result {
             self.diagnostics.push(format!("applyUserProperties: {error:#}"));
         }
+    }
+
+    pub(crate) fn restrict_property_updates(
+        &mut self,
+        package: &crate::pkg::Package,
+        assets: &crate::effects::Assets,
+    ) {
+        self.property_bindings.restrict_package(package);
+        self.property_bindings.restrict_assets(assets.property_dependencies().as_ref());
+    }
+
+    pub fn update_properties(&mut self, overrides: &crate::model::Properties) -> Result<bool> {
+        if self.disabled {
+            return Ok(false);
+        }
+        let desired = self.property_bindings.desired(overrides);
+        let Some(update) = self.property_bindings.update(&self.properties, &desired) else {
+            return Ok(false);
+        };
+        self.deadline.set(Instant::now() + Duration::from_millis(100));
+        self.context.with(|ctx| {
+            ctx.globals()
+                .get::<_, Function>("__updateUserProperties")
+                .and_then(|function| function.call::<_, ()>((update.to_string(),)))
+                .map_err(|error| js_error(&ctx, &error))
+        })?;
+        self.properties = desired;
+        self.properties_changed = true;
+        Ok(true)
+    }
+
+    pub fn restrict_hidden_layer_updates(&mut self, layers: &[String]) {
+        if layers.is_empty() {
+            return;
+        }
+        self.deadline.set(Instant::now() + FRAME_BUDGET);
+        let callbacks = self.context.with(|ctx| {
+            ctx.eval::<bool, _>(
+                "__modules.some(m => m && !m.disabled && typeof m.ns.applyUserProperties === 'function')",
+            )
+            .unwrap_or(true)
+        });
+        self.property_bindings.restrict_hidden_layers(&self.scene, layers, callbacks);
     }
 
     pub fn set_sprites(&mut self, sprites: &[(usize, usize, f32)]) {
@@ -392,7 +433,10 @@ impl SceneScripts {
             return Ok(false);
         }
         match self.drain() {
-            Ok(changed) => Ok(changed),
+            Ok(changed) => {
+                let properties_changed = std::mem::take(&mut self.properties_changed);
+                Ok(changed || properties_changed)
+            }
             Err(error) => {
                 self.stop(format!("changes stopped: {error:#}"));
                 Ok(false)

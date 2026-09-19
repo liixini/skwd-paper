@@ -2,6 +2,10 @@ use crate::pkg::Package;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+#[path = "particles_audio.rs"]
+mod audio;
+pub use audio::AudioResponse;
+
 const MAX_PARTICLES: usize = 32_768;
 pub const TRAIL_POINTS: usize = 12;
 const MAX_PREWARM_STEPS: usize = 600;
@@ -114,6 +118,7 @@ pub enum Emitter {
         max: f32,
         rate: f32,
         instantaneous: u32,
+        audio: Option<AudioResponse>,
     },
     Box {
         control_point: Option<usize>,
@@ -121,6 +126,7 @@ pub enum Emitter {
         extent: [f32; 3],
         rate: f32,
         instantaneous: u32,
+        audio: Option<AudioResponse>,
     },
 }
 
@@ -135,6 +141,16 @@ impl Emitter {
         match self {
             Self::Sphere { rate, .. } | Self::Box { rate, .. } => *rate,
         }
+    }
+
+    fn audio(&self) -> Option<AudioResponse> {
+        match self {
+            Self::Sphere { audio, .. } | Self::Box { audio, .. } => *audio,
+        }
+    }
+
+    fn active_rate(&self, left: &[f32], right: &[f32]) -> f32 {
+        self.rate() * self.audio().map_or(1.0, |response| response.amount(left, right))
     }
 
     fn origin(&self) -> [f32; 3] {
@@ -508,6 +524,11 @@ pub struct ParticleSystem {
 
 impl ParticleSystem {
     #[must_use]
+    pub fn needs_audio(&self) -> bool {
+        self.emitters.iter().any(|emitter| emitter.audio().is_some())
+    }
+
+    #[must_use]
     pub fn follows_mouse(&self) -> bool {
         self.control_points.iter().any(|point| point.flags & 1 != 0)
     }
@@ -632,6 +653,7 @@ fn parse_emitter(entry: &Value) -> Option<Emitter> {
             max: num_of(entry.get("distancemax"), 0.0),
             rate,
             instantaneous,
+            audio: AudioResponse::parse(entry),
         }),
         "boxrandom" => Some(Emitter::Box {
             control_point: entry
@@ -643,6 +665,7 @@ fn parse_emitter(entry: &Value) -> Option<Emitter> {
             extent: vec3_of(entry.get("distancemax"), [0.0, 0.0, 0.0]),
             rate,
             instantaneous,
+            audio: AudioResponse::parse(entry),
         }),
         _ => None,
     }
@@ -1122,7 +1145,7 @@ impl Sim {
         }
     }
 
-    fn emit(&mut self, system: &ParticleSystem) {
+    fn emit(&mut self, system: &ParticleSystem, emitter_index: Option<usize>) {
         let mut particle = Particle {
             pos: [0.0, 0.0, 0.0],
             vel: [0.0, 0.0, 0.0],
@@ -1137,7 +1160,8 @@ impl Sim {
             lifetime: 1.0,
             phase: self.rng.unit() * std::f32::consts::TAU,
         };
-        let index = (self.rng.next_u32() as usize) % system.emitters.len();
+        let index =
+            emitter_index.unwrap_or_else(|| (self.rng.next_u32() as usize) % system.emitters.len());
         let emitter = &system.emitters[index];
         particle.pos = emitter.spawn(&mut self.rng);
         if system.world {
@@ -1239,7 +1263,20 @@ impl Sim {
     }
 
     pub fn step(&mut self, system: &ParticleSystem, dt: f32) {
+        self.step_with_audio(system, dt, &[], &[]);
+    }
+
+    pub fn step_with_audio(
+        &mut self,
+        system: &ParticleSystem,
+        dt: f32,
+        left: &[f32],
+        right: &[f32],
+    ) {
         let dt = dt.clamp(0.0, 0.25);
+        if dt == 0.0 && self.burst_done {
+            return;
+        }
         self.update_control_points(system);
         self.ribbon = system.renderer == Renderer::Ribbon;
         self.time += dt;
@@ -1247,22 +1284,34 @@ impl Sim {
         if !self.burst_done {
             self.burst_done = true;
             let burst: u32 = system.emitters.iter().map(Emitter::instantaneous).sum();
-            if burst > 0 {
+            if burst > 0 || system.emitters.iter().all(|emitter| emitter.audio().is_some()) {
                 self.pending = 0.0;
             }
             for _ in 0..burst {
                 if self.particles.len() >= capacity {
                     break;
                 }
-                self.emit(system);
+                self.emit(system, None);
             }
         }
-        let rate: f32 = system.emitters.iter().map(Emitter::rate).sum::<f32>() * system.rate_scale;
-        self.pending += rate * dt;
+        let rate: f32 =
+            system.emitters.iter().map(|emitter| emitter.active_rate(left, right)).sum();
+        self.pending += rate * system.rate_scale * dt;
         while self.pending >= 1.0 {
             self.pending -= 1.0;
             if self.particles.len() < capacity {
-                self.emit(system);
+                let emitter_index = if system.needs_audio() {
+                    let mut choice = self.rng.unit() * rate;
+                    system.emitters.iter().position(|emitter| {
+                        choice -= emitter.active_rate(left, right);
+                        choice < 0.0
+                    })
+                } else {
+                    None
+                };
+                if !system.needs_audio() || emitter_index.is_some() {
+                    self.emit(system, emitter_index);
+                }
             }
         }
         let time = self.time;

@@ -639,6 +639,45 @@ fn image_and_particle_layers_draw_in_authored_order_regardless_of_depth() {
 }
 
 #[test]
+fn sprite_scripts_keep_original_object_indices_after_render_order_is_compacted() {
+    let scene = br#"{"objects":[
+        {"id":10,"name":"Group"},
+        {"id":20,"alpha":1,"image":"models/sprite.json","visible":{"value":true,
+        "script":"export function update(value) { const a = thisLayer.getTextureAnimation(); thisLayer.alpha = a.frameCount; a.setFrame(1); return value; }"}}
+    ]}"#;
+    let mut texture = build_tex("TEXB0003", 0, tex::FLAG_IS_GIF as i32, &[255; 64], false, None);
+    push_nul_str(&mut texture, "TEXS0003");
+    for value in [2, 4, 2] {
+        push_i32(&mut texture, value);
+    }
+    for y in [0.0f32, 2.0] {
+        push_i32(&mut texture, 0);
+        for value in [1.0f32, 0.0, y, 4.0, 0.0, 0.0, 2.0] {
+            texture.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let package = pkg::Package::parse(build_pkg(&[
+        ("scene.json", scene),
+        ("models/sprite.json", br#"{"material":"materials/sprite.json"}"#),
+        ("materials/sprite.json", br#"{"passes":[{"textures":["sprite"]}]}"#),
+        ("materials/sprite.tex", &texture),
+    ]))
+    .unwrap();
+    let mut scene = model::load(&package).unwrap();
+    let layer = &scene.layers[0];
+    assert_eq!(layer.scene_order, 0);
+    let scripts = scene.scripts.as_mut().unwrap();
+    assert_eq!(layer.object_index(&scripts.scene), Some(1));
+    scripts.take_commands();
+    scripts.tick(0.1, 0.1, [0.5; 2]).unwrap();
+    assert_eq!(scripts.scene["objects"][1]["alpha"], 2);
+    assert_eq!(
+        scripts.take_commands(),
+        [crate::script::ScriptCommand::Sprite { object: 1, op: crate::script::SpriteOp::Frame(1) }]
+    );
+}
+
+#[test]
 fn scalar_property_broadcast() {
     let scene = br#"{"general":{"orthogonalprojection":{"width":1000,"height":1000}},"objects":[{"id":1,"name":"L","image":"models/bg.json","size":"100.000 50.000","scale":{"user":"zoom","value":"1.000 1.000 1.000"}}]}"#;
     let build = |overrides: model::Properties| {
@@ -671,14 +710,16 @@ fn passthrough_util_layers_sample_the_scene_and_need_effects() {
         "objects": [
             {"id": 1, "name": "bg", "image": "models/bg.json"},
             {"id": 2, "name": "compose", "image": "models/util/composelayer.json",
-             "origin": "100 200 0", "size": "300 100",
+             "origin": "100 200 0", "size": "300 100", "scale":"-0.5 0.25 1",
              "effects": [{"file": "effects/e.json"}]},
             {"id": 3, "name": "idle", "image": "models/util/composelayer.json", "size": "10 10"},
             {"id": 4, "name": "full", "image": "models/util/fullscreenlayer.json",
              "origin": "5 5 0", "size": "10 10", "angles": "0 0 45",
              "effects": [{"file": "effects/e.json"}]},
             {"id": 5, "name": "broken", "image": "models/util/composelayer.json",
-             "effects": [{"file": "effects/missing.json"}]}
+             "effects": [{"file": "effects/missing.json"}]},
+            {"id": 6, "name": "clear", "image": "models/util/composelayer.json",
+             "copybackground": false, "effects": [{"file": "effects/e.json"}]}
         ]
     }"#;
     let bytes = build_pkg(&[
@@ -711,19 +752,26 @@ fn passthrough_util_layers_sample_the_scene_and_need_effects() {
         model::load_with(&package, &effects::Assets::discover(Some("/nonexistent"))).unwrap();
 
     let ids: Vec<&str> = scene.layers.iter().map(|layer| layer.id.as_str()).collect();
-    assert_eq!(ids, ["1", "2", "4"]);
+    assert_eq!(ids, ["1", "2", "4", "6"]);
     assert!(scene.skipped.is_empty(), "{:?}", scene.skipped);
     let compose = &scene.layers[1];
     assert!(compose.passthrough);
-    assert_eq!(compose.size, (300.0, 100.0));
+    assert!(compose.copy_background);
+    assert_eq!(compose.size, (-150.0, 25.0));
+    assert_eq!(compose.composition_size, Some((300.0, 100.0)));
     assert_eq!(compose.center, (100.0, 400.0));
     assert_eq!(compose.effects.len(), 1);
     let full = &scene.layers[2];
     assert!(full.passthrough);
     assert_eq!(full.size, (800.0, 600.0));
+    assert_eq!(full.composition_size, None);
     assert_eq!(full.center, (400.0, 300.0));
     assert_eq!(full.angle, 0.0);
     assert!(!scene.layers[0].passthrough);
+    assert!(!scene.layers[0].copy_background);
+    assert!(scene.layers[3].passthrough);
+    assert!(!scene.layers[3].copy_background);
+    assert_eq!(scene.layers[3].composition_size, Some((800.0, 600.0)));
 }
 
 #[test]

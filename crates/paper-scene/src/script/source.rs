@@ -79,9 +79,10 @@ pub(super) fn needs_runtime(value: &Value, key: &str) -> bool {
 }
 
 pub(super) fn effective(value: &Value, props: &crate::model::Properties) -> Value {
-    let base = value.get("value").unwrap_or(&Value::Null);
+    let mut base = value.get("value").cloned().unwrap_or(Value::Null);
+    resolve_wrappers(&mut base, props);
     if value.get("user").is_none() {
-        return base.clone();
+        return base;
     }
     if let Some(numbers) = crate::effects::bound_value(value, props) {
         if numbers.len() == 1 {
@@ -93,7 +94,7 @@ pub(super) fn effective(value: &Value, props: &crate::model::Properties) -> Valu
         }
         return serde_json::json!(numbers);
     }
-    base.clone()
+    base
 }
 
 pub(super) fn resolve_wrappers(value: &mut Value, props: &crate::model::Properties) {

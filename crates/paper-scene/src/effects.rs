@@ -35,7 +35,32 @@ pub(crate) fn read_confined_bytes(root: &Path, relative: &str, max: usize) -> Op
 
 pub struct Assets {
     root: Option<PathBuf>,
+    pub(crate) system_fonts: std::sync::Mutex<crate::text::system_font::Cache>,
     pub properties: BTreeMap<String, Vec<f32>>,
+    property_dependencies: std::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
+}
+
+pub(crate) fn property_dependencies(value: &Value) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    match value {
+        Value::Object(map) => {
+            if let Some(user) = map.get("user")
+                && let Some(name) = user.as_str().or_else(|| user.get("name")?.as_str())
+            {
+                names.insert(name.to_ascii_lowercase());
+            }
+            for child in map.values() {
+                names.extend(property_dependencies(child));
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                names.extend(property_dependencies(child));
+            }
+        }
+        _ => {}
+    }
+    names
 }
 
 #[must_use]
@@ -93,7 +118,12 @@ impl Assets {
             .into_iter()
             .find(|path| path.join("shaders").is_dir())
             .and_then(|path| std::fs::canonicalize(path).ok());
-        Self { root, properties: BTreeMap::new() }
+        Self {
+            root,
+            system_fonts: std::sync::Mutex::default(),
+            properties: BTreeMap::new(),
+            property_dependencies: std::sync::Mutex::new(Some(std::collections::BTreeSet::new())),
+        }
     }
 
     #[must_use]
@@ -108,21 +138,43 @@ impl Assets {
         self
     }
 
+    pub(crate) fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
     pub fn available(&self) -> bool {
         self.root.is_some()
     }
 
     pub fn read(&self, relative: &str) -> Option<String> {
-        String::from_utf8(read_confined_bytes(
+        let text = String::from_utf8(read_confined_bytes(
             self.root.as_ref()?,
             relative,
             crate::json::MAX_JSON_BYTES,
         )?)
-        .ok()
+        .ok()?;
+        if relative.ends_with(".json") {
+            let mut dependencies = self
+                .property_dependencies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(names) = &mut *dependencies {
+                match crate::json::parse(text.as_bytes()) {
+                    Ok(value) => names.extend(property_dependencies(&value)),
+                    Err(_) => *dependencies = None,
+                }
+            }
+        }
+        Some(text)
+    }
+
+    pub(crate) fn property_dependencies(&self) -> Option<std::collections::BTreeSet<String>> {
+        self.property_dependencies.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
 pub struct EffectPass {
+    pub property_source: Option<(usize, usize)>,
     pub name: String,
     pub vertex: Translated,
     pub fragment: Translated,
@@ -348,8 +400,11 @@ pub fn json_numbers(value: &Value) -> Option<Vec<f32>> {
                 text.split_whitespace().filter_map(|part| part.parse().ok()).collect();
             (!parts.is_empty()).then_some(parts)
         }
+        Value::Array(values) => {
+            values.iter().map(|value| value.as_f64().map(|number| number as f32)).collect()
+        }
         Value::Object(obj) => obj.get("value").and_then(json_numbers),
-        _ => None,
+        Value::Null => None,
     }
 }
 
@@ -494,7 +549,7 @@ pub fn color_blend_effect(
     let material = serde_json::json!({
         "passes": [{"shader": COLOR_BLEND_SHADER, "combos": {"BLENDMODE": mode}}]
     });
-    let mut passes = build_material(pkg, assets, &material, None, own_id)?;
+    let mut passes = build_material(pkg, assets, &material, None, own_id, None)?;
     let pass = passes.last_mut()?;
     pass.binds.retain(|(slot, _)| *slot != 4);
     pass.binds.push((4, EffectBind::SceneUnderLayer));
@@ -509,7 +564,7 @@ pub fn particle_pass(
     combos: &BTreeMap<String, i64>,
 ) -> Option<EffectPass> {
     let overrides = Value::Array(vec![serde_json::json!({ "combos": combos })]);
-    let mut passes = build_material(pkg, assets, material, Some(&overrides), None)?;
+    let mut passes = build_material(pkg, assets, material, Some(&overrides), None, None)?;
     passes.pop()
 }
 
@@ -556,11 +611,12 @@ fn build_pass(
     material_path: &str,
     overrides: Option<&Value>,
     own_id: Option<&str>,
+    property_source: (usize, usize),
 ) -> Option<Vec<EffectPass>> {
     let material = pkg.find_json(material_path).ok().flatten().or_else(|| {
         assets.read(material_path).and_then(|text| crate::json::parse(text.as_bytes()).ok())
     })?;
-    build_material(pkg, assets, &material, overrides, own_id)
+    build_material(pkg, assets, &material, overrides, own_id, Some(property_source))
 }
 
 fn build_copy_pass(
@@ -575,7 +631,7 @@ fn build_copy_pass(
     let source = def.get("source").and_then(Value::as_str)?;
     let target = def.get("target").and_then(Value::as_str)?;
     let material = serde_json::json!({"passes": [{"shader": "passthrough"}]});
-    let mut built = build_material(pkg, assets, &material, None, own_id)?;
+    let mut built = build_material(pkg, assets, &material, None, own_id, None)?;
     let pass = built.last_mut()?;
     pass.name = "copy".to_string();
     pass.target = Some(target.to_string());
@@ -600,6 +656,7 @@ fn build_material(
     material: &Value,
     overrides: Option<&Value>,
     own_id: Option<&str>,
+    property_source: Option<(usize, usize)>,
 ) -> Option<Vec<EffectPass>> {
     let passes = material.get("passes")?.as_array()?;
     let mut out = Vec::new();
@@ -759,6 +816,7 @@ fn build_material(
             self_binds.push((slot, EffectBind::parse(name, own_id)));
         }
         out.push(EffectPass {
+            property_source: property_source.filter(|_| index == 0),
             name: shader_name.to_string(),
             vertex,
             fragment,
@@ -808,6 +866,7 @@ pub fn daytime(hour: i32, minute: i32, second: i32, millisecond: i32) -> f32 {
 }
 
 pub struct PassMeta {
+    property_source: Option<(usize, usize)>,
     pub name: String,
     uniforms: Vec<crate::shader::Uniform>,
     constants: BTreeMap<String, Vec<f32>>,
@@ -816,6 +875,19 @@ pub struct PassMeta {
 }
 
 impl PassMeta {
+    pub fn apply_object_values(&mut self, object: &Value, props: &BTreeMap<String, Vec<f32>>) {
+        if let Some((effect, pass)) = self.property_source
+            && let Some(values) = object
+                .get("effects")
+                .and_then(|effects| effects.get(effect))
+                .and_then(|effect| effect.get("passes"))
+                .and_then(|passes| passes.get(pass))
+                .and_then(|pass| pass.get("constantshadervalues"))
+        {
+            self.apply_script_values(values, props);
+        }
+    }
+
     pub fn apply_script_values(&mut self, values: &Value, props: &BTreeMap<String, Vec<f32>>) {
         let values = constants_of(Some(values), props);
         self.constants.extend(resolve_material_names(&values, &self.uniforms));
@@ -838,6 +910,7 @@ impl PassMeta {
             })
             .collect();
         Self {
+            property_source: pass.property_source,
             name: pass.name.clone(),
             uniforms: pass.fragment.uniforms.clone(),
             constants: pass.values.clone(),
@@ -1081,7 +1154,7 @@ pub fn load_effects(pkg: &Package, assets: &Assets, object: &Value) -> (Vec<Effe
         other => other.to_string(),
     });
     let own_id = own.as_deref();
-    for entry in entries {
+    for (effect_index, entry) in entries.iter().enumerate() {
         let Some(file) = entry.get("file").and_then(Value::as_str) else {
             continue;
         };
@@ -1142,9 +1215,14 @@ pub fn load_effects(pkg: &Package, assets: &Assets, object: &Value) -> (Vec<Effe
                 .and_then(Value::as_array)
                 .and_then(|arr| arr.get(index))
                 .map(|value| Value::Array(vec![value.clone()]));
-            if let Some(mut built) =
-                build_pass(pkg, assets, material, slot_override.as_ref(), own_id)
-            {
+            if let Some(mut built) = build_pass(
+                pkg,
+                assets,
+                material,
+                slot_override.as_ref(),
+                own_id,
+                (effect_index, index),
+            ) {
                 let target = def.get("target").and_then(Value::as_str).map(str::to_string);
                 let binds: Vec<(usize, EffectBind)> = def
                     .get("bind")

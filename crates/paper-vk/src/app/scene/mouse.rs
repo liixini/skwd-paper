@@ -46,7 +46,7 @@ impl SceneMouse {
                 .layers
                 .iter()
                 .map(|layer| {
-                    (layer.mouse, super::screen_rect(layer.passthrough, layer.center, layer.size))
+                    (layer.mouse, [layer.center.0, layer.center.1, layer.size.0, layer.size.1])
                 })
                 .collect(),
             position: [0.5; 2],

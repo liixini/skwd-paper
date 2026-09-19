@@ -4,8 +4,7 @@ use ringbuf::traits::{Consumer, Producer, Split};
 
 pub const BAND_COUNTS: [usize; 3] = [16, 32, 64];
 const WINDOW: usize = 2048;
-const LOW_HZ: f32 = 30.0;
-const HIGH_HZ: f32 = 20_000.0;
+const SPECTRUM_BINS: usize = 640;
 const HOLD: f32 = 0.25;
 const ATTACK_TAU: f32 = 0.045;
 const RELEASE_TAU: f32 = 0.28;
@@ -32,6 +31,22 @@ impl Bands {
     pub fn slice(&self, count: usize, right: bool) -> Option<&[f32]> {
         let index = BAND_COUNTS.iter().position(|known| *known == count)?;
         Some(if right { &self.right[index] } else { &self.left[index] })
+    }
+
+    fn update(&mut self, right: bool, levels: &[f32; 64], dt: f32, attack: f32, release: f32) {
+        let lanes = if right { &mut self.right } else { &mut self.left };
+        for (current, &target) in lanes[2].iter_mut().zip(levels) {
+            let tau = if target > *current { attack } else { release };
+            let blend = 1.0 - (-dt / tau.max(1.0e-4)).exp();
+            *current += (target - *current) * blend;
+        }
+        let (reduced, full) = lanes.split_at_mut(2);
+        for lane in reduced {
+            let width = full[0].len() / lane.len();
+            for (value, group) in lane.iter_mut().zip(full[0].chunks_exact(width)) {
+                *value = group.iter().copied().fold(0.0, f32::max);
+            }
+        }
     }
 
     fn silence(&mut self, dt: f32) {
@@ -99,20 +114,37 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
 }
 
 fn band_edges(count: usize, rate: f32) -> Vec<(usize, usize)> {
-    let nyquist = rate * 0.5;
-    let high = HIGH_HZ.min(nyquist);
-    let ratio = (high / LOW_HZ).ln();
-    let bin_of = |hz: f32| ((hz / rate) * WINDOW as f32).round() as usize;
-    (0..count)
-        .map(|index| {
-            let lo = LOW_HZ * (ratio * index as f32 / count as f32).exp();
-            let hi = LOW_HZ * (ratio * (index + 1) as f32 / count as f32).exp();
-            let (mut a, mut b) = (bin_of(lo), bin_of(hi));
-            a = a.clamp(1, WINDOW / 2 - 1);
-            b = b.clamp(a + 1, WINDOW / 2);
-            (a, b)
+    let source_window = ((rate / 44_100.0).max(1.0) * 1920.0).floor();
+    let bin_of = |bin: usize| (bin as f32 * WINDOW as f32 / source_window).round() as usize;
+    let mut ranges = vec![(usize::MAX, 0); count];
+    let mut band = 0;
+    for bin in 1..SPECTRUM_BINS {
+        let position = ((bin - 1) as f32 / (SPECTRUM_BINS - 1) as f32).powf(0.25);
+        band = (band + 1).min((position * 64.0) as usize);
+        let range = &mut ranges[band * count / 64];
+        range.0 = range.0.min(bin);
+        range.1 = bin + 1;
+    }
+    ranges
+        .into_iter()
+        .map(|(from, to)| {
+            let from = bin_of(from).clamp(1, WINDOW / 2 - 1);
+            let to = bin_of(to).clamp(from + 1, WINDOW / 2);
+            (from, to)
         })
         .collect()
+}
+
+fn spectrum_levels(re: &[f32], im: &[f32], edges: &[(usize, usize)], gain: f32) -> [f32; 64] {
+    let mut levels = [0.0; 64];
+    let scale = 2.0 / WINDOW as f32;
+    for (level, &(from, to)) in levels.iter_mut().zip(edges) {
+        let magnitude = (from..to).map(|bin| re[bin].hypot(im[bin])).sum::<f32>();
+        let width = (to - from).max(1) as f32;
+        let value = (magnitude * scale / width.sqrt() * gain).sqrt();
+        *level = if value.is_nan() { 0.0 } else { value.clamp(0.0, 1.0) };
+    }
+    levels
 }
 
 enum Capture {
@@ -124,7 +156,7 @@ pub struct Analyser {
     _capture: Capture,
     consumer: ringbuf::HeapCons<f32>,
     channels: usize,
-    edges: Vec<Vec<(usize, usize)>>,
+    edges: Vec<(usize, usize)>,
     window: Vec<f32>,
     left: Vec<f32>,
     right: Vec<f32>,
@@ -177,7 +209,7 @@ impl Analyser {
             _capture: capture,
             consumer,
             channels,
-            edges: BAND_COUNTS.iter().map(|count| band_edges(*count, rate)).collect(),
+            edges: band_edges(64, rate),
             window: hann(),
             left: vec![0.0; WINDOW],
             right: vec![0.0; WINDOW],
@@ -261,21 +293,8 @@ impl Analyser {
             self.im[index] = 0.0;
         }
         fft(&mut self.re, &mut self.im);
-        let scale = 2.0 / WINDOW as f32;
-        for (slot, edges) in self.edges.iter().enumerate() {
-            let lane = if right { &mut bands.right[slot] } else { &mut bands.left[slot] };
-            for (band, (from, to)) in edges.iter().enumerate() {
-                let mut sum = 0.0f32;
-                for bin in *from..*to {
-                    sum += (self.re[bin] * self.re[bin] + self.im[bin] * self.im[bin]).sqrt();
-                }
-                let width = (to - from).max(1) as f32;
-                let value = (sum * scale / width.sqrt() * self.gain).sqrt().min(4.0);
-                let tau = if value > lane[band] { self.attack } else { self.release };
-                let blend = 1.0 - (-dt / tau.max(1.0e-4)).exp();
-                lane[band] += (value - lane[band]) * blend;
-            }
-        }
+        let levels = spectrum_levels(&self.re, &self.im, &self.edges, self.gain);
+        bands.update(right, &levels, dt, self.attack, self.release);
     }
 
     pub fn fill(&mut self, bands: &mut Bands, dt: f32) {

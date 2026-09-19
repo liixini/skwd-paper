@@ -3,13 +3,15 @@ use super::{
 };
 use serde_json::Value;
 
+#[cfg(test)]
+mod tests;
+
 pub struct Layout {
     pub id: String,
     pub size: [f32; 2],
     pub offset: [f32; 2],
     pub text: bool,
     pub hidden_without_fx: bool,
-    pub passthrough: bool,
 }
 
 pub struct Frame {
@@ -20,6 +22,51 @@ pub struct Frame {
     pub scale: [f32; 2],
     pub depth: f32,
     pub text: Option<String>,
+}
+
+pub struct ParticleFrame {
+    pub visible: bool,
+    origin: (f32, f32, f32),
+    angle: f32,
+    scale: [f32; 3],
+}
+
+impl ParticleFrame {
+    pub fn apply(&self, system: &mut crate::particles::ParticleSystem) {
+        system.origin = self.origin;
+        system.angle = self.angle;
+        system.scale = self.scale[0];
+        system.scale3 = self.scale;
+    }
+}
+
+pub fn particle_frames<'a>(
+    scene: &Value,
+    ids: impl Iterator<Item = &'a str>,
+    canvas: (f32, f32),
+    props: &Properties,
+) -> Vec<Option<ParticleFrame>> {
+    let objects = scene["objects"].as_array().map_or(&[][..], Vec::as_slice);
+    let by_id: std::collections::HashMap<String, &Value> =
+        objects.iter().filter_map(|o| Some((o.get("id").and_then(id_of)?, o))).collect();
+    let parallax = Parallax::of(scene, canvas, props);
+    ids.map(|id| {
+        let object = by_id.get(id)?;
+        let transform = resolve_transform(object, &by_id, props, parallax.as_ref());
+        let ancestors = ancestor_chain(object, &by_id);
+        let visible = ancestors.iter().all(|node| truthy(node.get("visible"), props, true));
+        let scale_z = ancestors
+            .iter()
+            .map(|node| vec3(node.get("scale"), props).map_or(1.0, |scale| scale.2))
+            .product();
+        Some(ParticleFrame {
+            visible,
+            origin: transform.origin,
+            angle: transform.angle,
+            scale: [transform.scale.0, transform.scale.1, scale_z],
+        })
+    })
+    .collect()
 }
 
 impl Layout {
@@ -56,7 +103,6 @@ impl Layout {
             offset,
             text: layer.is_text,
             hidden_without_fx: layer.passthrough || (layer.solid && !layer.effects.is_empty()),
-            passthrough: layer.passthrough,
         }
     }
 }

@@ -5,6 +5,7 @@ use serde_json::Value;
 
 mod font;
 pub mod script;
+pub(crate) mod system_font;
 
 pub const EM_PER_POINT: f32 = 300.0 / 72.0;
 pub const FALLBACK_FONT: &str = "fonts/NotoSans-Regular.ttf";
@@ -151,7 +152,14 @@ pub fn text_value(value: Option<&Value>) -> Option<String> {
 }
 
 fn font_bytes(pkg: &Package, assets: &Assets, name: &str) -> Option<Vec<u8>> {
-    if !name.starts_with("systemfont_") && !name.is_empty() {
+    if let Some(family) = name.strip_prefix("systemfont_") {
+        return assets
+            .system_fonts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve(assets, family);
+    }
+    if !name.is_empty() {
         if let Some(bytes) = pkg.find(name) {
             return Some(bytes.to_vec());
         }

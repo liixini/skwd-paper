@@ -159,6 +159,18 @@ impl Group {
         if !changed && !std::mem::take(&mut scripts.pending) {
             return Ok(());
         }
+        let particle_states = paper_scene::model::script::particle_frames(
+            &scripts.host.scene,
+            self.particles.iter().map(|group| group.id.as_str()),
+            self.canvas,
+            &scripts.host.properties,
+        );
+        for (group, state) in self.particles.iter_mut().zip(particle_states) {
+            if let Some(state) = state {
+                state.apply(&mut group.system);
+                group.visible = state.visible;
+            }
+        }
         let states =
             frames(&scripts.host.scene, &scripts.layouts, self.canvas, &scripts.host.properties);
         for (index, slot, text) in &mut scripts.text {
@@ -195,14 +207,8 @@ impl Group {
                 continue;
             }
             let quad = &mut self.quads[index];
-            if scripts.layouts[index].passthrough {
-                quad.rect =
-                    [state.rect[0], state.rect[1], state.rect[2].abs(), state.rect[3].abs()];
-                quad.angle = 0.0;
-            } else {
-                quad.rect = state.rect;
-                quad.angle = state.angle;
-            }
+            quad.rect = state.rect;
+            quad.angle = state.angle;
             self.mouse.set_script_rect(index, quad.rect);
             if let Some(fx) = self.fx.iter_mut().find(|fx| fx.quad == index) {
                 let origin = (state.rect[0], self.canvas.1 - state.rect[1], state.depth);
@@ -220,25 +226,20 @@ impl Group {
                 ] {
                     fx.uniforms.insert(name.into(), value.to_vec());
                 }
-                fx.base_quad.tint = state.source_tint;
+                fx.base_quad.tint = if fx.passthrough && !fx.copy_background {
+                    [0.0; 4]
+                } else {
+                    state.source_tint
+                };
                 fx.fallback_tint = state.tint;
                 quad.tint = [1.0, 1.0, 1.0, f32::from(state.tint[3] > 0.0)];
                 let node = scripts.host.scene["objects"].as_array().and_then(|nodes| {
                     nodes.iter().find(|n| n["id"].to_string().trim_matches('"') == fx.layer_id)
                 });
-                let mut local = std::collections::HashMap::new();
-                for (pass, owner) in fx.passes.iter_mut().zip(&fx.owner) {
-                    let ordinal = local.entry(*owner).or_insert(0usize);
-                    if let Some(values) = node.and_then(|n| {
-                        n.get("effects")?
-                            .get(*owner)?
-                            .get("passes")?
-                            .get(*ordinal)?
-                            .get("constantshadervalues")
-                    }) {
-                        pass.apply_script_values(values, &scripts.host.properties);
+                if let Some(node) = node {
+                    for pass in &mut fx.passes {
+                        pass.apply_object_values(node, &scripts.host.properties);
                     }
-                    *ordinal += 1;
                 }
             } else if scripts.layouts[index].hidden_without_fx {
                 quad.tint = [1.0, 1.0, 1.0, 0.0];

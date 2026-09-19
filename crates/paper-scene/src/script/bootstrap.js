@@ -94,12 +94,12 @@ function __textureAnimation(index) {
         join() { state.playing = true; state.rate = 1; state.frame = 0; state.since = engine.runtime; push('join'); }
     };
 }
-function __applyUserProperties() {
+function __applyUserProperties(properties = engine.userProperties) {
     for (let i = 0; i < __modules.length; i++) {
         const m = __modules[i];
         if (!m || m.disabled || typeof m.ns.applyUserProperties !== 'function') continue;
         __current = m;
-        try { m.ns.applyUserProperties(engine.userProperties); } catch (e) { m.disabled = true; __log('applyUserProperties ' + i + ': ' + String(e)); }
+        try { m.ns.applyUserProperties(properties); } catch (e) { m.disabled = true; __log('applyUserProperties ' + i + ': ' + String(e)); }
         __current = null;
     }
 }
@@ -108,8 +108,7 @@ function __setup(json, props) {
     globalThis.__scene = __wrap(JSON.parse(json), '', '');
     globalThis.__layers = __scene.objects || [];
     globalThis.__byId = new Map(__layers.map(l => [String(l.id), l]));
-    engine.userProperties = {};
-    for (const [name,entry] of Object.entries(JSON.parse(props))) if (entry.value !== undefined) engine.userProperties[name] = entry.type === 'color' ? __coerce(entry.value, 'color') : entry.value;
+    __setUserProperties(JSON.parse(props));
     engine.canvasSize = new Vec2(__scene.general?.orthogonalprojection?.width ?? 1920, __scene.general?.orthogonalprojection?.height ?? 1080);
     for (const layer of __layers) {
         for (const [key,value] of Object.entries({visible:true, origin:'0 0 0', scale:'1 1 1', angles:'0 0 0', color:'1 1 1', alpha:1}))
@@ -159,10 +158,33 @@ function __frame(time, dt, x, y) {
     input.cursorWorldPosition = new Vec3(x * engine.canvasSize.x, (1 - y) * engine.canvasSize.y, 0);
     input.cursorScreenPosition = new Vec2(x * engine.canvasSize.x, y * engine.canvasSize.y);
 }
-function __createScriptProperties(defaults = {}) {
+const __scriptProperties = new Map();
+function __setUserProperties(properties) {
+    for (const key of Object.keys(engine.userProperties)) delete engine.userProperties[key];
+    for (const [name,entry] of Object.entries(properties)) if (entry.value !== undefined) engine.userProperties[name] = entry.type === 'color' ? __coerce(entry.value, 'color') : entry.value;
+}
+function __updateUserProperties(json) {
+    const update = JSON.parse(json);
+    for (const [path,value] of update.values) {
+        const [object,key] = __owner(path);
+        object[key] = value;
+    }
+    for (const [index,properties] of update.scripts) {
+        const target = __scriptProperties.get(index);
+        if (!target) continue;
+        for (const [key,value] of Object.entries(properties)) if (key in target.values) target.values[key] = target.colors.has(key) ? __coerce(value, 'color') : value;
+    }
+    __setUserProperties(update.properties);
+    const changed = {};
+    for (const name of Object.keys(update.changed)) changed[name] = engine.userProperties[name];
+    if (Object.keys(changed).length) __applyUserProperties(changed);
+}
+function __createScriptProperties(defaults = {}, index = -1) {
     const values = {};
+    const colors = new Set();
+    if (index >= 0) __scriptProperties.set(index, {values,colors});
     const builder = { finish: () => values };
-    for (const kind of ['Slider','Checkbox','Combo','Color','Text','Texture']) builder['add'+kind] = o => { values[o.name] = defaults[o.name] ?? o.value ?? o.options?.[0]?.value; if (kind === 'Color') values[o.name] = __coerce(values[o.name], 'color'); return builder; };
+    for (const kind of ['Slider','Checkbox','Combo','Color','Text','Texture']) builder['add'+kind] = o => { values[o.name] = defaults[o.name] ?? o.value ?? o.options?.[0]?.value; if (kind === 'Color') { colors.add(o.name); values[o.name] = __coerce(values[o.name], 'color'); } return builder; };
     return builder;
 }
 const engine = {

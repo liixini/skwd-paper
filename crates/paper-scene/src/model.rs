@@ -30,6 +30,7 @@ pub struct Layer {
     pub puppet: Option<Puppet>,
     pub center: (f32, f32),
     pub size: (f32, f32),
+    pub composition_size: Option<(f32, f32)>,
     pub scale: (f32, f32),
     pub depth: f32,
     pub scene_order: usize,
@@ -38,6 +39,7 @@ pub struct Layer {
     pub color: [f32; 3],
     pub color_blend: u32,
     pub passthrough: bool,
+    pub copy_background: bool,
     pub solid: bool,
     pub live_text: Option<crate::text::Prepared>,
     pub script_text: Option<crate::text::script::ScriptText>,
@@ -47,9 +49,20 @@ pub struct Layer {
 }
 
 pub struct ParticleLayer {
+    pub id: String,
+    pub visible: bool,
     pub system: crate::particles::ParticleSystem,
     pub depth: f32,
     pub scene_order: usize,
+}
+
+impl Layer {
+    pub fn object_index(&self, scene: &Value) -> Option<usize> {
+        scene.get("objects")?.as_array()?.iter().enumerate().find_map(|(index, object)| {
+            let id = object.get("id").and_then(id_of).unwrap_or_else(|| format!("@object-{index}"));
+            (id == self.id).then_some(index)
+        })
+    }
 }
 
 pub struct Puppet {
@@ -787,6 +800,8 @@ fn load_with_project(
                             add_texture_bytes(&mut texture_bytes, texture.payload_bytes())?;
                         }
                         particles.push(ParticleLayer {
+                            id: id.clone(),
+                            visible,
                             depth: system.origin.2,
                             scene_order: object_index,
                             system,
@@ -839,6 +854,7 @@ fn load_with_project(
                             puppet: None,
                             center,
                             size: (w * sx, h * sy),
+                            composition_size: None,
                             scale: transform.scale,
                             depth: transform.origin.2,
                             scene_order: object_index,
@@ -847,6 +863,7 @@ fn load_with_project(
                             color,
                             color_blend,
                             passthrough: false,
+                            copy_background: false,
                             solid: false,
                             effects,
                         });
@@ -966,6 +983,7 @@ fn load_with_project(
             puppet,
             center,
             size,
+            composition_size: (util.passthrough && !util.fullscreen).then_some(base),
             scale: transform.scale,
             depth: transform.origin.2,
             scene_order: object_index,
@@ -974,6 +992,7 @@ fn load_with_project(
             color,
             color_blend,
             passthrough: util.passthrough,
+            copy_background: util.passthrough && truthy(object.get("copybackground"), props, true),
             solid,
             effects,
         });
@@ -1012,6 +1031,7 @@ fn load_with_project(
                 puppet: None,
                 center: (canvas.0 * 0.5, canvas.1 * 0.5),
                 size: canvas,
+                composition_size: None,
                 scale: (1.0, 1.0),
                 depth: 0.0,
                 scene_order: objects.len(),
@@ -1020,6 +1040,7 @@ fn load_with_project(
                 color: [1.0, 1.0, 1.0],
                 color_blend: 0,
                 passthrough: true,
+                copy_background: true,
                 solid: false,
                 effects,
             });
@@ -1028,6 +1049,19 @@ fn load_with_project(
         }
     }
     layers.sort_by_key(|layer| layer.scene_order);
+    let particle_states = script::particle_frames(
+        &scene,
+        particles.iter().map(|layer| layer.id.as_str()),
+        canvas,
+        props,
+    );
+    for (layer, state) in particles.iter_mut().zip(particle_states) {
+        if let Some(state) = state {
+            state.apply(&mut layer.system);
+            layer.visible = state.visible;
+            layer.depth = layer.system.origin.2;
+        }
+    }
     let mut unified_order: Vec<(usize, bool, usize)> = layers
         .iter()
         .enumerate()
@@ -1048,15 +1082,16 @@ fn load_with_project(
         }
     }
     if let Some(scripts) = &mut scripts {
+        scripts.restrict_property_updates(pkg, assets);
         let sprites: Vec<(usize, usize, f32)> = layers
             .iter()
             .filter(|layer| layer.texture.frames.len() > 1)
-            .map(|layer| {
-                (
-                    layer.scene_order,
+            .filter_map(|layer| {
+                Some((
+                    layer.object_index(&scripts.scene)?,
                     layer.texture.frames.len(),
                     layer.texture.frames.iter().map(|frame| frame.time).sum(),
-                )
+                ))
             })
             .collect();
         scripts.set_sprites(&sprites);

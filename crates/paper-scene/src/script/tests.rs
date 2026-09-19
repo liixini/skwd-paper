@@ -15,6 +15,95 @@ fn no_scripts_creates_no_runtime_and_preserves_scene() {
 }
 
 #[test]
+fn hot_properties_preserve_script_state_and_reset_bound_defaults() {
+    let project = json!({"general":{"properties":{"format":{"type":"bool","value":true},"opacity":{"type":"slider","value":1.0},"tint":{"type":"color","value":"1 1 1"}}}});
+    let mut scene = json!({"objects":[{"id":1,"alpha":{"user":"opacity","value":1.0},"color":{"user":"tint","value":"1 1 1"},"text":{"value":"", "scriptproperties":{"clock":{"user":"format","value":true}},"script":"let frames=0; const props=createScriptProperties().addCheckbox({name:'clock',value:true}).finish(); export function update(){return (props.clock?'12':'24')+':'+(++frames);}"}}]});
+    let defaults = crate::effects::parse_properties(&project);
+    let mut host = SceneScripts::load(&mut scene, &defaults, &project).unwrap().unwrap();
+    assert_eq!(host.scene["objects"][0]["text"], "12:1");
+    let changed = Properties::from([
+        ("format".into(), vec![0.0]),
+        ("opacity".into(), vec![0.25]),
+        ("tint".into(), vec![1.0, 0.0, 0.0]),
+    ]);
+    assert!(host.update_properties(&changed).unwrap());
+    assert!(host.tick(1.0, 0.016, [0.5; 2]).unwrap());
+    assert_eq!(host.scene["objects"][0]["text"], "24:2");
+    assert_eq!(host.scene["objects"][0]["alpha"], 0.25);
+    assert_eq!(host.scene["objects"][0]["color"], "1 0 0");
+    assert_eq!(host.properties["opacity"], vec![0.25]);
+    assert!(host.update_properties(&Properties::new()).unwrap());
+    host.tick(2.0, 0.016, [0.5; 2]).unwrap();
+    assert_eq!(host.scene["objects"][0]["text"], "12:3");
+    assert_eq!(host.scene["objects"][0]["alpha"], 1.0);
+    assert_eq!(host.scene["objects"][0]["color"], "1 1 1");
+}
+
+#[test]
+fn hot_properties_call_the_existing_user_property_listener() {
+    let project = json!({"general":{"properties":{"opacity":{"type":"slider","value":1.0},"stable":{"type":"bool","value":true}}}});
+    let mut scene = json!({"objects":[{"id":1,"alpha":{"user":"opacity","value":1.0},"text":{"value":"", "script":"let calls=0; export function applyUserProperties(props){thisLayer.text=String(++calls)+':'+props.opacity+':'+Object.keys(props).sort().join(',')+':'+engine.userProperties.stable;}"}}]});
+    let mut host =
+        SceneScripts::load(&mut scene, &crate::effects::parse_properties(&project), &project)
+            .unwrap()
+            .unwrap();
+    assert_eq!(host.scene["objects"][0]["text"], "1:1:opacity,stable:true");
+    assert!(host.update_properties(&Properties::from([("opacity".into(), vec![0.5])])).unwrap());
+    assert!(host.tick(1.0, 0.016, [0.5; 2]).unwrap());
+    assert_eq!(host.scene["objects"][0]["text"], "2:0.5:opacity:true");
+}
+
+#[test]
+fn deferred_compositions_reload_before_changing_their_visibility_or_ancestry() {
+    let project = json!({"general":{"properties":{
+        "location":{"type":"slider","value":1},
+        "visible":{"type":"bool","value":false},
+        "opacity":{"type":"slider","value":1}
+    }}});
+    let mut scene = json!({"objects":[
+        {"id":1,"visible":{"user":{"name":"location","condition":"2"},"value":true}},
+        {"id":"composition","parent":1,"visible":{"user":"visible","value":false}},
+        {"id":3,"alpha":{"user":"opacity","value":1},"text":{"value":"", "script":"let ticks=0; export function update(){return String(++ticks);}"}}
+    ]});
+    let mut host =
+        SceneScripts::load(&mut scene, &crate::effects::parse_properties(&project), &project)
+            .unwrap()
+            .unwrap();
+    host.restrict_hidden_layer_updates(&["composition".into()]);
+    let original = host.scene.clone();
+    for (name, value) in [("location", 2.0), ("visible", 1.0)] {
+        assert!(!host.update_properties(&Properties::from([(name.into(), vec![value])])).unwrap());
+        assert_eq!(host.scene, original);
+        assert_eq!(host.properties, crate::effects::parse_properties(&project));
+    }
+    assert!(host.update_properties(&Properties::from([("opacity".into(), vec![0.5])])).unwrap());
+    host.tick(1.0, 0.016, [0.5; 2]).unwrap();
+    assert_eq!(host.scene["objects"][2]["alpha"], 0.5);
+    assert_eq!(host.scene["objects"][2]["text"], "2");
+}
+
+#[test]
+fn deferred_compositions_reject_callbacks_before_they_can_reveal_a_layer() {
+    let project = json!({"general":{"properties":{"opacity":{"type":"slider","value":1}}}});
+    let mut scene = json!({"objects":[
+        {"id":1,"name":"composition","visible":false},
+        {"id":2,"alpha":{"user":"opacity","value":1},"text":{"value":"", "script":"let calls=0; export function applyUserProperties(props){thisLayer.text=String(++calls); thisScene.getLayer('composition').visible=props.opacity<0.5;}"}}
+    ]});
+    let mut host =
+        SceneScripts::load(&mut scene, &crate::effects::parse_properties(&project), &project)
+            .unwrap()
+            .unwrap();
+    host.restrict_hidden_layer_updates(&["1".into()]);
+    let original = host.scene.clone();
+    assert!(!host.update_properties(&Properties::from([("opacity".into(), vec![0.25])])).unwrap());
+    assert_eq!(host.scene, original);
+    host.tick(1.0, 0.016, [0.5; 2]).unwrap();
+    assert_eq!(host.scene["objects"][0]["visible"], false);
+    assert_eq!(host.scene["objects"][1]["text"], "1");
+    assert_eq!(host.properties["opacity"], [1.0]);
+}
+
+#[test]
 fn modules_keep_independent_state_and_init_return_values() {
     let mut scene = json!({"objects":[{"id":1,"alpha":{"value":0.0,"script":"let n=0; export function init(value){return 0.25;} export function update(value){n++; return value+0.1;}"}},{"id":2,"alpha":{"value":0.0,"script":"let n=0; export function update(value){n++; return n;}"}}]});
     let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
@@ -66,6 +155,20 @@ fn saved_script_properties_override_declared_defaults() {
         .unwrap();
     assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
     assert_eq!(scene["objects"][0]["text"], "savedb");
+}
+
+#[test]
+fn bound_script_properties_preserve_boolean_values_and_nested_defaults() {
+    let project = json!({"general":{"properties":{"format":{"type":"bool","value":true},"date":{"type":"bool","value":true}}}});
+    let raw = json!({"objects":[{"id":1,"text":{"value":"", "scriptproperties":{"clock":{"user":"format","value":{"user":"missing","value":true}},"date":{"user":"date","value":false}},"script":"export const scriptProperties=createScriptProperties().addCheckbox({name:'clock',value:true}).addCheckbox({name:'date',value:true}).finish(); export function update(){return (scriptProperties.clock?'12':'24')+(scriptProperties.date?' DD/MM':' MM/DD');}"}}]});
+    for (format, date, expected) in [(0.0, 0.0, "24 MM/DD"), (1.0, 1.0, "12 DD/MM")] {
+        let mut scene = raw.clone();
+        let props =
+            Properties::from([("format".into(), vec![format]), ("date".into(), vec![date])]);
+        let host = SceneScripts::load(&mut scene, &props, &project).unwrap().unwrap();
+        assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+        assert_eq!(scene["objects"][0]["text"], expected);
+    }
 }
 
 #[test]

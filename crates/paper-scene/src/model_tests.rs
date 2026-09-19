@@ -110,7 +110,6 @@ fn hidden_script_layer_preserves_effect_source_alpha() {
         offset: [0.0; 2],
         text: false,
         hidden_without_fx: false,
-        passthrough: false,
     };
     let frame = super::script::frames(
         &scene,

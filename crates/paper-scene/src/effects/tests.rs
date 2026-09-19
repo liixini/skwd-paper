@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 fn pass_meta(names: &[&str]) -> PassMeta {
     PassMeta {
+        property_source: None,
         name: String::new(),
         uniforms: names
             .iter()
@@ -22,6 +23,64 @@ fn pass_meta(names: &[&str]) -> PassMeta {
         resolutions: Vec::new(),
         ndc: false,
     }
+}
+
+#[test]
+fn live_color_vectors_refresh_the_material_uniform_bytes() {
+    let mut meta = pass_meta(&["g_BarColor"]);
+    meta.uniforms[0].kind = UniformKind::Vec3;
+    meta.uniforms[0].material = Some("Bar Color".into());
+    meta.constants.insert("g_BarColor".into(), vec![1.0; 3]);
+    for color in [[1.0, 0.0, 0.0], [0.25, 0.5, 0.75], [1.0; 3]] {
+        meta.apply_script_values(&serde_json::json!({"Bar Color": color}), &BTreeMap::new());
+        let bytes = meta.uniform_bytes(FrameClock::default(), None, 8, 8, (8, 8), &[]);
+        let actual: Vec<_> = bytes[..12]
+            .chunks_exact(4)
+            .map(|part| f32::from_le_bytes(part.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, color);
+    }
+    assert!(super::json_numbers(&serde_json::json!([1, "invalid", 0])).is_none());
+}
+
+#[test]
+fn live_uniforms_keep_source_indices_after_effect_and_pass_filtering() {
+    let definition = br#"{"passes":[{"material":"materials/expanded.json","conditions":[{"DISABLED":1}]},{"material":"materials/expanded.json"}]}"#;
+    let material = br#"{"passes":[{"shader":"color","constantshadervalues":{"Bar Color":"1 1 1"}},{"shader":"color","constantshadervalues":{"Bar Color":"1 1 1"}}]}"#;
+    let vertex = b"attribute vec3 a_Position; void main() { gl_Position = vec4(a_Position, 1.0); }";
+    let fragment = br#"uniform vec3 g_BarColor; // {"material":"Bar Color","default":"1 1 1"}
+void main() { gl_FragColor = vec4(g_BarColor, 1.0); }"#;
+    let package = crate::pkg::Package::parse(crate::tests::build_pkg(&[
+        ("effects/live/effect.json", definition),
+        ("materials/expanded.json", material),
+        ("shaders/color.vert", vertex),
+        ("shaders/color.frag", fragment),
+    ]))
+    .unwrap();
+    let mut object = serde_json::json!({"effects":[
+        {"file":"effects/live/effect.json","visible":false},
+        {"file":"effects/missing/effect.json"},
+        {"file":"effects/live/effect.json","passes":[
+            {"constantshadervalues":{"Bar Color":"0 1 0"}},
+            {"constantshadervalues":{"Bar Color":"0.25 0.5 0.75"}}
+        ]}
+    ]});
+    let (effects, skipped) = super::load_effects(&package, &Assets::discover(Some("")), &object);
+    assert_eq!(effects.len(), 1);
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(effects[0].passes.len(), 2);
+    assert_eq!(effects[0].passes[0].property_source, Some((2, 1)));
+    assert_eq!(effects[0].passes[1].property_source, None);
+    let mut direct = PassMeta::of(&effects[0].passes[0]);
+    let mut expanded = PassMeta::of(&effects[0].passes[1]);
+    assert_eq!(direct.constants["g_BarColor"], [0.25, 0.5, 0.75]);
+    assert_eq!(expanded.constants["g_BarColor"], [1.0; 3]);
+    object["effects"][2]["passes"][1]["constantshadervalues"]["Bar Color"] =
+        serde_json::json!([1, 0, 0]);
+    direct.apply_object_values(&object, &BTreeMap::new());
+    expanded.apply_object_values(&object, &BTreeMap::new());
+    assert_eq!(direct.constants["g_BarColor"], [1.0, 0.0, 0.0]);
+    assert_eq!(expanded.constants["g_BarColor"], [1.0; 3]);
 }
 
 #[test]
@@ -49,6 +108,27 @@ fn asset_reads_confined() {
 
     assert_eq!(assets.read("shaders/inside.vert").as_deref(), Some("inside"));
     assert!(assets.read("../outside.vert").is_none());
+}
+
+#[test]
+fn loaded_shared_assets_record_property_dependencies_and_unknown_json() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("shaders")).unwrap();
+    std::fs::write(
+        directory.path().join("material.json"),
+        r#"{"size":{"user":"Opacity","value":1}}"#,
+    )
+    .unwrap();
+    let assets = Assets::discover(directory.path().to_str());
+    assert_eq!(assets.property_dependencies(), Some(std::collections::BTreeSet::new()));
+    assert!(assets.read("material.json").is_some());
+    assert_eq!(
+        assets.property_dependencies().unwrap().into_iter().collect::<Vec<_>>(),
+        ["opacity"]
+    );
+    std::fs::write(directory.path().join("unknown.json"), "{broken").unwrap();
+    assert!(assets.read("unknown.json").is_some());
+    assert_eq!(assets.property_dependencies(), None);
 }
 
 #[test]
@@ -101,6 +181,7 @@ fn engine_uniforms_follow_the_documented_definitions() {
     let mut fragment = fragment;
     crate::shader::unify_uniforms(&mut vertex, &mut fragment);
     let pass = EffectPass {
+        property_source: None,
         name: "probe".into(),
         vertex,
         fragment,
@@ -150,6 +231,7 @@ fn effect_projection_follows_the_backend_clip_convention() {
     let mut fragment = fragment;
     crate::shader::unify_uniforms(&mut vertex, &mut fragment);
     let pass = EffectPass {
+        property_source: None,
         name: "probe".into(),
         vertex,
         fragment,
@@ -240,6 +322,7 @@ fn annotated_vector_defaults_keep_every_lane() {
     let size = fragment.uniforms.iter().find(|u| u.name == "u_FixedSize").unwrap();
     assert_eq!(size.default, Some(vec![1.0, 0.59]), "{:?}", size.default);
     let pass = EffectPass {
+        property_source: None,
         name: "probe".into(),
         vertex,
         fragment,
