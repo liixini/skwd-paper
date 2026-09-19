@@ -1,4 +1,5 @@
 use super::buffer_set::BufferSet;
+use super::readiness::StartupReadiness;
 use crate::fill_mode::FillMode;
 use paper_control::{OutputTarget, StillCommand};
 use smithay_client_toolkit::{
@@ -53,7 +54,7 @@ pub(super) struct App {
     pub(super) fill_mode: FillMode,
     pub(super) buffers: HashMap<(u32, u32), BufferSet>,
     pub(super) surfaces: Vec<SurfaceState>,
-    pub(super) ready_signaled: bool,
+    pub(super) startup_readiness: StartupReadiness,
     pub(super) persist: bool,
     pub(super) pending_cmd: Arc<Mutex<Option<StillCommand>>>,
     pub(super) namespace: String,

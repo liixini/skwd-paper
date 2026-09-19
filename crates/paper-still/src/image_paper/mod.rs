@@ -4,6 +4,7 @@ mod decode;
 mod lifecycle;
 mod model;
 mod protocol;
+mod readiness;
 mod shm_pixels;
 mod slide;
 mod span;

@@ -1,4 +1,5 @@
 use super::model::App;
+use super::readiness::StartupSync;
 use crate::fill_mode::FillMode;
 use smithay_client_toolkit::{
     compositor::CompositorHandler,
@@ -8,7 +9,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     Connection, Proxy, QueueHandle,
-    protocol::{wl_output::WlOutput, wl_surface::WlSurface},
+    protocol::{wl_callback::WlCallback, wl_output::WlOutput, wl_surface::WlSurface},
 };
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
@@ -79,6 +80,7 @@ impl OutputHandler for App {
         }
     }
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        self.startup_readiness.removed(output.id().protocol_id());
         self.surfaces.retain(|surf| surf.output != output);
         if self.fill_mode == FillMode::Span {
             self.attach_all_span();
@@ -123,12 +125,30 @@ impl wayland_client::Dispatch<ZwlrLayerSurfaceV1, ()> for App {
                 }
             }
             Event::Closed => {
+                for surface in state.surfaces.iter().filter(|surface| &surface.layer == layer) {
+                    state.startup_readiness.removed(surface.output.id().protocol_id());
+                }
                 state.surfaces.retain(|surf| &surf.layer != layer);
                 if state.surfaces.is_empty() {
                     std::process::exit(0);
                 }
             }
             _ => {}
+        }
+    }
+}
+
+impl wayland_client::Dispatch<WlCallback, StartupSync> for App {
+    fn event(
+        state: &mut Self,
+        _: &WlCallback,
+        _: <WlCallback as Proxy>::Event,
+        _: &StartupSync,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if state.startup_readiness.complete_sync() {
+            crate::ipc::signal_ready();
         }
     }
 }
