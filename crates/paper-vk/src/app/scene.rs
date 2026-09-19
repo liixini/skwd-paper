@@ -4312,14 +4312,14 @@ pub(super) fn run_scene(
             }
         }
         // Commit one frame before parking so startup/swap readiness cannot deadlock while idle.
-        let idle_should_pause = target.app.idle && presented;
+        let idle_should_pause = target.app.idle && presented && fade_start.is_none();
         if !idle_should_pause && idle_paused {
             idle_paused = false;
             if let Some(audio) = &mut ctl.audio {
                 audio.set_pause(ctl.paused);
             }
         }
-        if ctl.paused || idle_should_pause {
+        if ctl.render_paused(fade_start.is_some()) || idle_should_pause {
             if idle_should_pause {
                 idle_paused = true;
                 if let Some(audio) = &mut ctl.audio {

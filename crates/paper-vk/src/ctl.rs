@@ -93,6 +93,10 @@ pub fn parse_audio_opts(args: &[String]) -> (bool, u32) {
 }
 
 impl Ctl {
+    pub fn render_paused(&self, transitioning: bool) -> bool {
+        self.paused && !transitioning
+    }
+
     pub fn start(video: &str, mute: bool, volume: u32, with_audio: bool) -> Self {
         Self::start_opts(video, mute, volume, with_audio, true)
     }

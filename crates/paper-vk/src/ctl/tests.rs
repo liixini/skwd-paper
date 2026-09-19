@@ -103,6 +103,19 @@ fn sender_guard_survives_drop() {
 }
 
 #[test]
+fn transition_finishes_with_latest_pause_request_retained() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut ctl = Ctl::with_receiver(rx);
+    for paused in [true, false, true] {
+        tx.send(PaperCommand::pause(paused)).unwrap();
+        assert!(ctl.poll().is_none());
+        assert!(!ctl.render_paused(true));
+        assert_eq!(ctl.paused, paused);
+        assert_eq!(ctl.render_paused(false), paused);
+    }
+}
+
+#[test]
 fn direct_pause_state_updates() {
     let (_tx, rx) = std::sync::mpsc::channel();
     let mut ctl = Ctl::with_receiver(rx);

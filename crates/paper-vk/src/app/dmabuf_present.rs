@@ -1551,7 +1551,7 @@ fn run_shared_dmabuf_with_readiness(
             wall_anchor = None;
             scheduled_q.clear();
         }
-        if ctl.paused && !ctl.freeze_pending() {
+        if ctl.render_paused(fade.is_some() || pending_swap.is_some()) && !ctl.freeze_pending() {
             target.dispatch_wait_events(Instant::now() + std::time::Duration::from_secs(30))?;
             continue;
         }
