@@ -3,6 +3,9 @@ use ash::vk;
 
 use super::Renderer;
 
+#[cfg(all(test, feature = "shared-device"))]
+mod tests;
+
 impl Renderer {
     pub(crate) fn create_render_pass(
         device: &ash::Device,

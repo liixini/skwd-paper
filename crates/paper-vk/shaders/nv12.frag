@@ -41,8 +41,8 @@ void main() {
     vec2 c = filtered(chroma, uv).rg;
     // BT.709 limited range
     float yf = (y - 16.0 / 255.0) * (255.0 / 219.0);
-    float u = c.x - 0.5;
-    float v = c.y - 0.5;
+    float u = (c.x - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (c.y - 128.0 / 255.0) * (255.0 / 224.0);
     vec3 rgb = vec3(
         yf + 1.5748 * v,
         yf - 0.1873 * u - 0.4681 * v,
