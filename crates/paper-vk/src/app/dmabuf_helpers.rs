@@ -47,6 +47,7 @@ pub(super) struct PendingSwap {
     worker: Option<std::thread::JoinHandle<()>>,
     still: std::sync::Arc<std::sync::atomic::AtomicBool>,
     started: Instant,
+    timeout: std::time::Duration,
 }
 
 pub(super) struct RgbaStillSource {
@@ -144,6 +145,7 @@ pub(super) fn begin_swap(
         worker: Some(worker),
         still,
         started: Instant::now(),
+        timeout: load_timeout(),
     }
 }
 
@@ -473,6 +475,15 @@ pub(super) fn pattern_check(
     Ok(())
 }
 
+fn load_timeout() -> std::time::Duration {
+    let ms = std::env::var("SKWD_PAPER_LOAD_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3_000)
+        .clamp(3_000, 60_000);
+    std::time::Duration::from_millis(ms)
+}
+
 pub(super) fn start_swap(
     req: &ctl::SwapReq,
     shared: &crate::shared::SharedDevice,
@@ -487,9 +498,12 @@ pub(super) fn start_swap(
         shared.render_node.clone(),
         force_software,
     );
-    let received = pending.rx.recv_timeout(std::time::Duration::from_secs(3));
+    let received = pending.rx.recv_timeout(pending.timeout);
     let Ok(frame) = received else {
-        tracing::info!("skwd-wall-vk: swap: no frame from {} within 3s, keeping current", req.to);
+        tracing::info!(
+            "skwd-wall-vk: swap: no frame from {} before the load timeout, keeping current",
+            req.to
+        );
         pending.cancel();
         return None;
     };
@@ -504,7 +518,7 @@ pub(super) fn poll_pending_swap(
     let received = match pending.as_ref()?.rx.try_recv() {
         Ok(frame) => Some(Ok(frame)),
         Err(std::sync::mpsc::TryRecvError::Empty)
-            if pending.as_ref()?.started.elapsed() < std::time::Duration::from_secs(3) =>
+            if pending.as_ref()?.started.elapsed() < pending.as_ref()?.timeout =>
         {
             None
         }

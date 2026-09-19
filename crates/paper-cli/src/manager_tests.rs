@@ -444,6 +444,7 @@ fn policy_inheritance() {
     block_on(async {
         let mut fixture = Fixture::new();
         let policy = RendererPolicy {
+            load_timeout_ms: Some(30_000),
             surface: None,
             idle_seconds: Some(30),
             transitions_enabled: Some(true),
@@ -462,6 +463,7 @@ fn policy_inheritance() {
         let environment =
             wait_log(fixture.directory.path(), "env", status[0].pid, "SKWD_PAPER_IDLE_SEC=30");
         assert!(environment.contains("SKWD_PAPER_SAND_QUALITY=low"));
+        assert!(environment.contains("SKWD_PAPER_LOAD_TIMEOUT_MS=30000"));
         assert!(environment.contains("SKWD_PAPER_SAND_FPS=24"));
         assert!(environment.contains("SKWD_PAPER_WE_FPS=60"));
         assert!(environment.contains("SKWD_VK_SCENE_STRICT=1"));

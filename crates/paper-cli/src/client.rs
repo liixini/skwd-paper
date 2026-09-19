@@ -34,7 +34,16 @@ pub(crate) fn request(request: &Request) -> Result<serde_json::Value> {
         wait_for_server(&socket)?
     };
     stream.set_write_timeout(Some(START_TIMEOUT)).context("set Paper request timeout")?;
-    stream.set_read_timeout(Some(RESPONSE_TIMEOUT)).context("set Paper response timeout")?;
+    let timeout = match &request.params {
+        paper_control::RequestParams::Apply(apply) => {
+            apply.policy.as_ref().and_then(|p| p.load_timeout_ms)
+        }
+        _ => None,
+    }
+    .map_or(RESPONSE_TIMEOUT, |ms| {
+        RESPONSE_TIMEOUT.max(Duration::from_millis(ms) + RESPONSE_TIMEOUT)
+    });
+    stream.set_read_timeout(Some(timeout)).context("set Paper response timeout")?;
     let line = encode_ndjson(request).context("encode Paper request")?;
     stream.write_all(line.as_bytes()).context("write Paper request")?;
     let mut response = String::new();
