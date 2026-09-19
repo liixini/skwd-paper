@@ -1,6 +1,7 @@
 use super::buffer_set::BufferSet;
 use super::decode::decode_image;
 use super::model::{App, SurfaceState};
+use super::readiness::{StartupReadiness, StartupSync};
 use super::shm_pixels::pack_pixels;
 use crate::fill_mode::{FillMode, apply_fill_mode};
 use anyhow::{Context, Result, anyhow};
@@ -13,7 +14,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::sync::{Arc, Mutex};
 use wayland_client::protocol::wl_output::Transform;
 use wayland_client::{
-    Connection, EventQueue,
+    Connection, EventQueue, Proxy,
     globals::{GlobalList, registry_queue_init},
     protocol::wl_output::WlOutput,
 };
@@ -68,7 +69,7 @@ pub fn run(
         fill_mode,
         buffers: HashMap::new(),
         surfaces: Vec::new(),
-        ready_signaled: false,
+        startup_readiness: StartupReadiness::default(),
         persist,
         pending_cmd: pending_cmd.clone(),
         namespace: namespace.to_string(),
@@ -109,6 +110,10 @@ fn run_event_loop(
         event_queue.dispatch_pending(app)?;
         app.try_consume_pending_cmd();
         app.try_release_pool();
+
+        if app.startup_readiness.begin_sync()? {
+            conn.display().sync(&app.qh, StartupSync);
+        }
 
         let Some(read_guard) = event_queue.prepare_read() else {
             continue;
@@ -193,6 +198,11 @@ impl App {
         for output in outputs {
             self.maybe_create_surface(output);
         }
+        self.startup_readiness.finish_enumeration(
+            self.surfaces
+                .iter()
+                .map(|surface| (surface.output.id().protocol_id(), surface.attached)),
+        );
     }
 
     pub(super) fn maybe_create_surface(&mut self, output: WlOutput) {
@@ -348,13 +358,10 @@ impl App {
             surf.surface.damage_buffer(0, 0, bw as i32, bh as i32);
             surf.attached = true;
             surf.surface.commit();
+            self.startup_readiness.committed(surf.output.id().protocol_id());
         }
         if let Some(buffer) = self.buffers.get_mut(&(sw, sh)) {
             buffer.drop_local_pages();
-        }
-        if !self.ready_signaled {
-            crate::ipc::signal_ready();
-            self.ready_signaled = true;
         }
         if !self.pending_preload.is_empty() {
             let deferred = std::mem::take(&mut self.pending_preload);

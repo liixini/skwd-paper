@@ -2,6 +2,7 @@ use super::decode::decode_image;
 use super::model::App;
 use super::shm_pixels::{choose_shm_format, pack_pixels};
 use smithay_client_toolkit::shm::slot::SlotPool;
+use wayland_client::Proxy;
 
 impl App {
     pub(super) fn ensure_raw_pixels(&mut self) -> bool {
@@ -88,10 +89,7 @@ impl App {
         surf.span_keepalive = Some(buffer);
         surf.attached = true;
         surf.surface.commit();
-        if !self.ready_signaled {
-            crate::ipc::signal_ready();
-            self.ready_signaled = true;
-        }
+        self.startup_readiness.committed(surf.output.id().protocol_id());
     }
 
     pub(super) fn attach_all_span(&mut self) {
