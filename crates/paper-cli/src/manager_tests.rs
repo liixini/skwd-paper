@@ -444,6 +444,7 @@ fn policy_inheritance() {
     block_on(async {
         let mut fixture = Fixture::new();
         let policy = RendererPolicy {
+            transition_fps: Some(120),
             load_timeout_ms: Some(30_000),
             surface: None,
             idle_seconds: Some(30),
@@ -465,6 +466,7 @@ fn policy_inheritance() {
         assert!(environment.contains("SKWD_PAPER_SAND_QUALITY=low"));
         assert!(environment.contains("SKWD_PAPER_LOAD_TIMEOUT_MS=30000"));
         assert!(environment.contains("SKWD_PAPER_SAND_FPS=24"));
+        assert!(environment.contains("SKWD_PAPER_TRANSITION_FPS=120"));
         assert!(environment.contains("SKWD_PAPER_WE_FPS=60"));
         assert!(environment.contains("SKWD_VK_SCENE_STRICT=1"));
         assert!(environment.contains("SKWD_PAPER_OUTPUT_FPS=DP-1=60"));
@@ -488,6 +490,7 @@ fn sand_primary_scope() {
     block_on(async {
         let mut fixture = Fixture::new();
         let transition = Some(TransitionPolicy {
+            fps: None,
             from: Some("/wall/old.png".into()),
             effect: Some("sand-donut".into()),
             duration_ms: Some(800),
@@ -566,6 +569,7 @@ fn transition_from_incumbent() {
 
         let mut next = assignment("DP-1", Source::video("/wall/two.mp4", None));
         next.transition = Some(TransitionPolicy {
+            fps: None,
             from: None,
             effect: Some("fade".into()),
             duration_ms: Some(800),

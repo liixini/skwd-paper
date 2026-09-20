@@ -4202,6 +4202,9 @@ pub(super) fn run_scene(
         .unwrap_or(30)
         .clamp(1, 240);
     let frame_gap = Duration::from_secs_f64(1.0 / f64::from(fps));
+    let transition_fps = super::shared_support::fade_fps_cap();
+    let playback_fps: Vec<u32> =
+        target.app.surfaces.iter().map(|surface| surface.fps_limit).collect();
     tracing::info!(
         "skwd-wall-vk: scene {} ({} effect chain(s)){}",
         if animated { "animated" } else { "static" },
@@ -4448,6 +4451,20 @@ pub(super) fn run_scene(
             );
         }
         let mouse_driven = group.mouse.pending();
+        target.set_transition_fps(fade_start.map(|_| transition_fps), &playback_fps);
+        let frame_gap = if fade_start.is_some() {
+            target
+                .app
+                .surfaces
+                .iter()
+                .map(|surface| {
+                    super::shared_support::fade_frame_interval(transition_fps, surface.refresh_ns)
+                })
+                .min()
+                .unwrap_or(frame_gap)
+        } else {
+            frame_gap
+        };
         let frame_driven = animated || fade_start.is_some() || mouse_driven;
         if frame_driven && !property_frame {
             let now = Instant::now();

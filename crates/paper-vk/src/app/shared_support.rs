@@ -143,19 +143,20 @@ pub(super) fn run_shared_vsync(
 }
 
 pub(super) fn fade_fps_cap() -> u32 {
-    std::env::var("SKWD_PAPER_SAND_FPS").ok().and_then(|val| val.parse().ok()).unwrap_or(0)
+    std::env::var("SKWD_PAPER_TRANSITION_FPS")
+        .or_else(|_| std::env::var("SKWD_PAPER_SAND_FPS"))
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(0)
 }
 
-pub(super) fn fade_frame_interval(
-    configured_fps: u32,
-    output_fps: u32,
-    refresh_ns: u32,
-) -> Duration {
-    let fps = if configured_fps > 0 { configured_fps } else { output_fps };
-    if fps > 0 {
-        return Duration::from_nanos((1_000_000_000 / u64::from(fps)).max(1));
+pub(super) fn fade_frame_interval(configured_fps: u32, refresh_ns: u32) -> Duration {
+    let refresh =
+        Duration::from_nanos(if refresh_ns > 0 { u64::from(refresh_ns) } else { 16_666_667 });
+    if configured_fps == 0 {
+        return refresh;
     }
-    Duration::from_nanos(if refresh_ns > 0 { u64::from(refresh_ns) } else { 6_944_444 })
+    Duration::from_nanos((1_000_000_000 / u64::from(configured_fps)).max(1)).max(refresh)
 }
 
 pub(super) fn env_speed() -> f64 {
@@ -507,10 +508,13 @@ mod transition_tests {
     }
 
     #[test]
-    fn transition_interval_uses_config_then_output_then_refresh() {
-        assert_eq!(fade_frame_interval(30, 60, 16_666_667), Duration::from_nanos(33_333_333));
-        assert_eq!(fade_frame_interval(0, 60, 16_666_667), Duration::from_nanos(16_666_666));
-        assert_eq!(fade_frame_interval(0, 0, 16_666_667), Duration::from_nanos(16_666_667));
-        assert_eq!(fade_frame_interval(0, 0, 0), Duration::from_nanos(6_944_444));
+    fn transition_interval_uses_refresh_for_auto_and_caps_custom_rates() {
+        assert_eq!(fade_frame_interval(30, 16_666_667), Duration::from_nanos(33_333_333));
+        assert_eq!(fade_frame_interval(0, 16_666_667), Duration::from_nanos(16_666_667));
+        assert_eq!(fade_frame_interval(120, 16_666_667), Duration::from_nanos(16_666_667));
+        assert_eq!(fade_frame_interval(30, 6_944_444), Duration::from_nanos(33_333_333));
+        assert_eq!(fade_frame_interval(120, 6_944_444), Duration::from_nanos(8_333_333));
+        assert_eq!(fade_frame_interval(0, 6_944_444), Duration::from_nanos(6_944_444));
+        assert_eq!(fade_frame_interval(0, 0), Duration::from_nanos(16_666_667));
     }
 }

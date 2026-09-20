@@ -8,7 +8,7 @@ pub(crate) fn stream(
     width: u32,
     height: u32,
     duration_ms: u64,
-    frame_ms: u64,
+    frame_interval: std::time::Duration,
     socket: RawFd,
 ) -> Result<()> {
     let (width, height) = (width.max(16), height.max(16));
@@ -52,7 +52,7 @@ pub(crate) fn stream(
     let sand = paper_shaders::sand_style_index(shader);
     let effect = sand.is_none().then(|| paper_shaders::effect_index(shader)).flatten();
     let duration = std::time::Duration::from_millis(duration_ms.max(100));
-    let interval = std::time::Duration::from_millis(frame_ms.clamp(4, 200));
+    let interval = frame_interval;
     let started = Instant::now();
     let mut frames = 0;
     let mut consumer_wait = std::time::Duration::ZERO;

@@ -672,6 +672,23 @@ impl Target {
         self.app.surfaces[si].surface.commit();
     }
 
+    pub fn set_transition_fps(&mut self, transition: Option<u32>, playback: &[u32]) {
+        for (surface, playback) in self.app.surfaces.iter_mut().zip(playback) {
+            let fps = transition.map_or(*playback, |cap| {
+                let refresh = if surface.refresh_ns > 0 {
+                    (1_000_000_000 + surface.refresh_ns / 2) / surface.refresh_ns
+                } else {
+                    60
+                };
+                if cap == 0 { refresh } else { cap.min(refresh) }.max(1)
+            });
+            if surface.fps_limit != fps {
+                surface.fps_limit = fps;
+                surface.next_commit_ns = 0;
+            }
+        }
+    }
+
     pub fn commit_due_at(&mut self, si: usize, now_ns: u64) -> bool {
         let surface = &mut self.app.surfaces[si];
         commit_due(&mut surface.next_commit_ns, surface.fps_limit, now_ns)

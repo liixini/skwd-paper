@@ -56,6 +56,8 @@ pub enum SandScope {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitionPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<String>,
@@ -89,6 +91,11 @@ impl TransitionPolicy {
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
         {
             return Err(ValidationError::InvalidTransitionEffect(effect.clone()));
+        }
+        if let Some(fps) = self.fps
+            && !(1..=1000).contains(&fps)
+        {
+            return Err(ValidationError::TransitionFpsOutOfRange(fps));
         }
         let duration_ms = self.duration_ms();
         if !(50..=10_000).contains(&duration_ms) {
@@ -160,6 +167,8 @@ pub struct RendererPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transitions_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_fps: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sand: Option<SandPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene: Option<ScenePolicy>,
@@ -169,6 +178,11 @@ pub struct RendererPolicy {
 
 impl RendererPolicy {
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if let Some(fps) = self.transition_fps
+            && fps > 1000
+        {
+            return Err(ValidationError::TransitionFpsOutOfRange(u32::from(fps)));
+        }
         if let Some(timeout) = self.load_timeout_ms
             && !(3_000..=60_000).contains(&timeout)
         {
@@ -954,6 +968,7 @@ pub enum ValidationError {
     TransitionFromStartsWithDash,
     InvalidTransitionEffect(String),
     TransitionDurationOutOfRange(u64),
+    TransitionFpsOutOfRange(u32),
     TransitionsDisabled,
     VolumeOutOfRange(u32),
     LayerNotAllowed(Layer),
@@ -1035,6 +1050,7 @@ impl Display for ValidationError {
             Self::InvalidTransitionEffect(effect) => {
                 write!(formatter, "transition effect {effect} is not a safe token")
             }
+            Self::TransitionFpsOutOfRange(fps) => write!(formatter, "invalid transition FPS {fps}"),
             Self::TransitionDurationOutOfRange(duration_ms) => {
                 write!(formatter, "transition duration {duration_ms} is outside 50..=10000 ms")
             }

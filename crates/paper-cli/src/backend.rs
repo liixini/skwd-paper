@@ -350,6 +350,9 @@ impl BackendPaths {
         if let Some(policy) = policy {
             apply_policy(&mut command, policy);
         }
+        if let Some(fps) = assignment.transition.as_ref().and_then(|transition| transition.fps) {
+            command.env("SKWD_PAPER_TRANSITION_FPS", fps.to_string());
+        }
         command
             .env("SKWD_PAPER_READY_SOCKET", socket)
             .env("SKWD_PAPER_GENERATION", generation.to_string())
@@ -682,8 +685,8 @@ fn plasma_transition_command(
         .arg(transition.duration_ms().to_string())
         .arg("--preview-size")
         .arg(stream_size)
-        .arg("--preview-frame-ms")
-        .arg((1000 / stream_fps.clamp(1, 240)).max(4).to_string())
+        .arg("--preview-fps")
+        .arg(transition.fps.unwrap_or(stream_fps).clamp(1, 1000).to_string())
         .arg("--fill-mode")
         .arg(assignment.fill_mode.as_str())
         .arg("--preview-once")
@@ -733,6 +736,7 @@ fn clear_policy_env(command: &mut Command) {
         "SKWD_PAPER_SAND_PRIMARY",
         "SKWD_PAPER_SAND_SHARP",
         "SKWD_PAPER_SAND_FPS",
+        "SKWD_PAPER_TRANSITION_FPS",
         "SKWD_PAPER_WE_FPS",
         "SKWD_PAPER_WE_DISABLE_PARTICLES",
         "SKWD_WE_ASSETS",
@@ -774,6 +778,9 @@ fn apply_policy(command: &mut Command, policy: &RendererPolicy) {
     }
     if let Some(enabled) = policy.transitions_enabled {
         command.env("SKWD_PAPER_TRANSITIONS", if enabled { "1" } else { "0" });
+    }
+    if let Some(fps) = policy.transition_fps {
+        command.env("SKWD_PAPER_TRANSITION_FPS", fps.to_string());
     }
     if let Some(sand) = &policy.sand {
         if let Some(quality) = sand.quality {

@@ -232,6 +232,7 @@ fn plasma_transition_is_a_one_shot_paper_prelude() {
     let backends = BackendPaths::from_executables(vk.clone(), still.clone());
     let mut assignment = Assignment::new(vec!["DP-1".into()], Source::static_file("/wall/b.png"));
     assignment.transition = Some(paper_control::TransitionPolicy {
+        fps: None,
         from: Some("/wall/a.png".into()),
         effect: Some("inkwell-drop".into()),
         duration_ms: Some(700),
@@ -554,4 +555,31 @@ fn plasma_cpu_only_host_keeps_the_prelude_header() {
     assert!(video.prelude_gpu && video.presenter_gpu);
     assert!(video.presenter_writes_header(true));
     assert!(video.presenter_rebases_stream(false));
+}
+
+#[test]
+fn plasma_transition_rate_does_not_change_the_presenter_rate() {
+    let temp = tempfile::tempdir().unwrap();
+    let vk = temp.path().join("skwd-wall-vk");
+    let still = temp.path().join("skwd-wall-still");
+    executable(&vk, "#!/bin/sh\nexit 0\n");
+    executable(&still, "#!/bin/sh\nexit 0\n");
+    let backends = BackendPaths::from_executables(vk, still);
+    let mut assignment = Assignment::new(vec!["DP-1".into()], Source::video("/wall/b.mp4", None));
+    assignment.transition = Some(paper_control::TransitionPolicy {
+        fps: Some(120),
+        from: Some("/wall/a.png".into()),
+        ..Default::default()
+    });
+    let prelude =
+        super::plasma_transition_command(&backends, &assignment, "1920x1080", 24).unwrap().unwrap();
+    assert!(command_parts(&prelude).1.windows(2).any(|pair| pair == ["--preview-fps", "120"]));
+    let playback =
+        super::plasma_command(&backends, &assignment, &[stream(3, "1920x1080", 24, false)], true)
+            .unwrap();
+    assert!(command_parts(&playback).1.windows(2).any(|pair| pair == ["--stream-fps", "24"]));
+    assignment.transition.as_mut().unwrap().fps = None;
+    let legacy =
+        super::plasma_transition_command(&backends, &assignment, "1920x1080", 24).unwrap().unwrap();
+    assert!(command_parts(&legacy).1.windows(2).any(|pair| pair == ["--preview-fps", "24"]));
 }

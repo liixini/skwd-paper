@@ -142,11 +142,13 @@ fn assignment_options_golden() {
 fn policy_golden_line() {
     let mut configured = assignment(&["DP-1"], Source::video("/wall/b.mp4", None));
     configured.transition = Some(TransitionPolicy {
+        fps: None,
         from: Some("/wall/a.png".into()),
         effect: Some("sand-bloom".into()),
         duration_ms: Some(700),
     });
     let policy = RendererPolicy {
+        transition_fps: None,
         load_timeout_ms: None,
         surface: None,
         idle_seconds: Some(45),
@@ -281,10 +283,15 @@ fn rejects_unsafe_controls() {
     );
 
     for transition in [
-        TransitionPolicy { from: Some(String::new()), effect: None, duration_ms: None },
-        TransitionPolicy { from: Some("--old".into()), effect: None, duration_ms: None },
-        TransitionPolicy { from: None, effect: Some("../fade".into()), duration_ms: None },
-        TransitionPolicy { from: None, effect: None, duration_ms: Some(49) },
+        TransitionPolicy { fps: None, from: Some(String::new()), effect: None, duration_ms: None },
+        TransitionPolicy { fps: None, from: Some("--old".into()), effect: None, duration_ms: None },
+        TransitionPolicy {
+            fps: None,
+            from: None,
+            effect: Some("../fade".into()),
+            duration_ms: None,
+        },
+        TransitionPolicy { fps: None, from: None, effect: None, duration_ms: Some(49) },
     ] {
         assert!(transition.validate().is_err());
     }
@@ -296,6 +303,7 @@ fn rejects_unsafe_controls() {
             assignments: vec![video],
             replace_all: false,
             policy: Some(RendererPolicy {
+                transition_fps: None,
                 transitions_enabled: Some(false),
                 ..RendererPolicy::default()
             }),
@@ -648,4 +656,23 @@ fn load_timeout_policy_is_optional_and_bounded() {
         let policy = RendererPolicy { load_timeout_ms: Some(ms), ..Default::default() };
         assert!(matches!(policy.validate(), Err(ValidationError::LoadTimeoutOutOfRange(_))));
     }
+}
+
+#[test]
+fn transition_fps_decodes_additively_and_validates() {
+    let legacy: TransitionPolicy = serde_json::from_str(r#"{"duration_ms":700}"#).unwrap();
+    assert_eq!(legacy.fps, None);
+    for fps in [1, 30, 120, 1000] {
+        let policy: TransitionPolicy =
+            serde_json::from_value(serde_json::json!({"fps":fps})).unwrap();
+        assert!(policy.validate().is_ok());
+        assert_eq!(serde_json::to_value(&policy).unwrap()["fps"], fps);
+    }
+    for fps in [0, 1001] {
+        assert!(TransitionPolicy { fps: Some(fps), ..Default::default() }.validate().is_err());
+    }
+    assert!(RendererPolicy { transition_fps: Some(0), ..Default::default() }.validate().is_ok());
+    assert!(
+        RendererPolicy { transition_fps: Some(1001), ..Default::default() }.validate().is_err()
+    );
 }

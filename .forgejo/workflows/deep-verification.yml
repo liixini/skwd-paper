@@ -29,6 +29,8 @@ jobs:
       RUST_BACKTRACE: "1"
       SKWD_RUNNER_IMAGE: sha256:66058d5c15a5011188ee634bb909d730c279ab0d65408581b5d70e99a6970edb
       SKWD_VERIFY_ROOT: .ci/checkouts/skwd-verify
+      SKWD_VERIFY_TEST_ENV: /var/tmp/skwd-verify-venv-${{ github.run_id }}-${{ github.run_attempt }}
+      TMPDIR: /var/tmp/skwd-verify-tmp-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out Paper
         uses: https://code.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -38,7 +40,7 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: liixini/skwd-verify
-          ref: 3c7ce77170ee148fda7a2b6661099aa8b699bcb9
+          ref: d72dbeb599fd884c13f0b55e59f3df2b42d28d80
           path: .ci/checkouts/skwd-verify
           token: ${{ secrets.SKWD_SUITE_READ_TOKEN }}
           persist-credentials: false
@@ -53,7 +55,12 @@ jobs:
           restore-keys: cargo-paper-rust-1.94.1-
 
       - name: Create result directory
-        run: mkdir -p ci-artifacts/results
+        run: mkdir -p ci-artifacts/results "$TMPDIR"
+
+      - name: Prepare Python test environment
+        run: |
+          python3 -m venv "$SKWD_VERIFY_TEST_ENV"
+          "$SKWD_VERIFY_TEST_ENV/bin/python" -m pip install --disable-pip-version-check --no-cache-dir --require-hashes --only-binary=:all: -r "$SKWD_VERIFY_ROOT/scripts/requirements-ci.txt"
 
       - name: Verify the standalone system-test repository
         working-directory: .ci/checkouts/skwd-verify
@@ -61,7 +68,7 @@ jobs:
         run: >-
           python3 scripts/ci-report.py wrap
           --suite verify.repository --out ../../../ci-artifacts/results/verify-repository.json
-          -- scripts/test-all.sh
+          -- env "PATH=$SKWD_VERIFY_TEST_ENV/bin:$PATH" scripts/test-all.sh
 
       - name: Verify native linker dependencies
         continue-on-error: true

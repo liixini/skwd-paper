@@ -100,7 +100,7 @@ pub(crate) fn stream(
     width: u32,
     height: u32,
     duration_ms: u64,
-    frame_ms: u64,
+    frame_interval: std::time::Duration,
     write_header: bool,
     once: bool,
 ) -> Result<()> {
@@ -150,7 +150,6 @@ pub(crate) fn stream(
     let duration_ms = duration_ms.max(100);
     let span = duration_ms + 600;
     let started = Instant::now();
-    let frame_interval = std::time::Duration::from_millis(frame_ms.clamp(4, 200));
     let mut frames = 0u64;
     loop {
         let frame_deadline = Instant::now() + frame_interval;

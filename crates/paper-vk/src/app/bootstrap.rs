@@ -187,9 +187,17 @@ pub(crate) fn run() -> Result<()> {
         let duration_ms = parse_flag(&args[3..], "--duration-ms")
             .and_then(|text| text.parse().ok())
             .unwrap_or(600);
-        let frame_ms = parse_flag(&args[3..], "--preview-frame-ms")
+        let frame_ms: u64 = parse_flag(&args[3..], "--preview-frame-ms")
             .and_then(|text| text.parse().ok())
             .unwrap_or(16);
+        let frame_interval = parse_flag(&args[3..], "--preview-fps")
+            .and_then(|text| text.parse::<u32>().ok())
+            .map_or_else(
+                || std::time::Duration::from_millis(frame_ms.clamp(4, 200)),
+                |fps| {
+                    std::time::Duration::from_nanos(1_000_000_000 / u64::from(fps.clamp(1, 1000)))
+                },
+            );
         let write_header = !args[3..].iter().any(|arg| arg == "--stream-no-header");
         let once = args[3..].iter().any(|arg| arg == "--preview-once");
         let fill = parse_flag(&args[3..], "--fill-mode")
@@ -208,7 +216,7 @@ pub(crate) fn run() -> Result<()> {
                 width,
                 height,
                 duration_ms,
-                frame_ms,
+                frame_interval,
                 socket,
             );
         }
@@ -219,7 +227,7 @@ pub(crate) fn run() -> Result<()> {
             width,
             height,
             duration_ms,
-            frame_ms,
+            frame_interval,
             write_header,
             once,
         );

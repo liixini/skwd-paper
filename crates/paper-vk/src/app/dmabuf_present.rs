@@ -1429,6 +1429,8 @@ fn run_shared_dmabuf_with_readiness(
     let mut sw_a: Option<FrameSlot> = None;
     let mut sw_b: Option<FrameSlot> = None;
     let fade_cap = fade_fps_cap();
+    let playback_fps: Vec<u32> =
+        target.app.surfaces.iter().map(|surface| surface.fps_limit).collect();
     let mut last_fade_render: Option<Instant> = None;
     let mut prev_content: Option<u64> = None;
     let mut skip_streak: u64 = 0;
@@ -1555,9 +1557,17 @@ fn run_shared_dmabuf_with_readiness(
             continue;
         }
         let fading = fade.is_some();
+        target.set_transition_fps(fading.then_some(fade_cap), &playback_fps);
         if fading && let Some(last) = last_fade_render {
-            let surface = &target.app.surfaces[anchor];
-            let due = last + fade_frame_interval(fade_cap, surface.fps_limit, surface.refresh_ns);
+            let interval = target
+                .app
+                .surfaces
+                .iter()
+                .filter(|surface| !surface.closed)
+                .map(|surface| fade_frame_interval(fade_cap, surface.refresh_ns))
+                .min()
+                .unwrap_or_else(|| fade_frame_interval(fade_cap, 0));
+            let due = last + interval;
             if Instant::now() < due {
                 target.dispatch_until(due)?;
                 continue;

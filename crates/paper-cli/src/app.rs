@@ -89,6 +89,7 @@ fn apply_request(args: crate::cli::ApplyArgs) -> Result<ApplyRequest> {
         || args.duration_ms.is_some()
     {
         assignment.transition = Some(TransitionPolicy {
+            fps: None,
             from: args.transition_from,
             effect: args.effect,
             duration_ms: args.duration_ms,
