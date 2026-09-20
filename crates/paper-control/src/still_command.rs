@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct StillCommand {
     #[serde(default)]
     pub path: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reveal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slide: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -18,6 +20,7 @@ impl StillCommand {
     pub fn new(path: &str) -> Self {
         Self {
             path: path.to_string(),
+            reveal: false,
             slide: None,
             duration_ms: None,
             preload: Vec::new(),
@@ -25,9 +28,14 @@ impl StillCommand {
         }
     }
 
+    pub fn reveal() -> Self {
+        Self { reveal: true, ..Self::new("") }
+    }
+
     pub fn slide(path: &str, direction: &str, duration_ms: u64) -> Self {
         Self {
             path: path.to_string(),
+            reveal: false,
             slide: Some(direction.to_string()),
             duration_ms: Some(duration_ms),
             preload: Vec::new(),
@@ -36,7 +44,14 @@ impl StillCommand {
     }
 
     pub fn preload(paths: Vec<String>) -> Self {
-        Self { path: String::new(), slide: None, duration_ms: None, preload: paths, fill: None }
+        Self {
+            path: String::new(),
+            reveal: false,
+            slide: None,
+            duration_ms: None,
+            preload: paths,
+            fill: None,
+        }
     }
 
     #[must_use]

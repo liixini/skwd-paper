@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use paper_control::{
     Assignment, Layer, PaperCommand, RendererCapability, RendererDiscovery, RendererPolicy,
-    RuntimeDependencyStatus, SandQuality, SandScope, Source, SourceKind, VideoEngine,
+    RuntimeDependencyStatus, SandQuality, SandScope, Source, SourceKind, StillCommand, VideoEngine,
 };
 use std::ffi::OsString;
 use std::io::Write;
@@ -72,8 +72,20 @@ impl Worker {
     }
 
     pub(crate) async fn send(&mut self, command: &PaperCommand) -> Result<()> {
+        self.send_line(&command.line()).await
+    }
+
+    pub(crate) async fn reveal_still(&mut self) -> Result<bool> {
+        if !static_transition(&self.assignment) {
+            return Ok(false);
+        }
+        self.send_line(&StillCommand::reveal().line()).await?;
+        Ok(true)
+    }
+
+    async fn send_line(&mut self, line: &str) -> Result<()> {
         let stdin = self.stdin.as_mut().ok_or_else(|| anyhow!("Paper worker stdin unavailable"))?;
-        stdin.write_all(command.line().as_bytes()).await.context("write Paper worker command")?;
+        stdin.write_all(line.as_bytes()).await.context("write Paper worker command")?;
         stdin.flush().await.context("flush Paper worker command")
     }
 
@@ -221,7 +233,6 @@ impl BackendPaths {
     ) -> Result<Worker> {
         let mut physical = assignment.clone();
         physical.source = Source::video(transition_source(&assignment.source)?, None);
-        physical.layer = Layer::Bottom;
         physical.mute = true;
         self.spawn_as(&physical, assignment, output, socket, generation, policy, None, true)
     }
@@ -345,6 +356,10 @@ impl BackendPaths {
                     .arg("--duration-ms")
                     .arg(transition.duration_ms().to_string());
             }
+        }
+        command.env_remove("SKWD_PAPER_PREPARE_HIDDEN");
+        if static_transition(assignment) {
+            command.env("SKWD_PAPER_PREPARE_HIDDEN", "1");
         }
         clear_policy_env(&mut command);
         if let Some(policy) = policy {
@@ -1211,3 +1226,12 @@ const fn sand_scope(scope: SandScope) -> &'static str {
 #[cfg(test)]
 #[path = "backend_tests.rs"]
 mod tests;
+
+pub(crate) fn static_transition(assignment: &Assignment) -> bool {
+    assignment.source.kind == SourceKind::Static
+        && assignment
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.from.as_ref())
+            .is_some_and(|from| from != &assignment.source.path)
+}

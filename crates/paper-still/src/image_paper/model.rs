@@ -53,6 +53,7 @@ pub(super) struct App {
     pub(super) raw_h: u32,
     pub(super) fill_mode: FillMode,
     pub(super) buffers: HashMap<(u32, u32), BufferSet>,
+    pub(super) transparent: Option<BufferSet>,
     pub(super) surfaces: Vec<SurfaceState>,
     pub(super) startup_readiness: StartupReadiness,
     pub(super) persist: bool,

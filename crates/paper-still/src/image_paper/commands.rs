@@ -274,6 +274,9 @@ impl App {
         let Some(cmd) = self.pending_cmd.lock().unwrap().take() else {
             return;
         };
+        if cmd.reveal {
+            self.reveal_prepared();
+        }
         let refill = cmd
             .fill
             .as_deref()

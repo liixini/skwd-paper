@@ -1,4 +1,4 @@
-use crate::backend::{BackendPaths, Worker, transition_source};
+use crate::backend::{BackendPaths, Worker, static_transition, transition_source};
 use anyhow::{Context, Result, anyhow};
 use paper_control::{
     ApplyRequest, Assignment, AudioSetRequest, PaperCommand, RendererFailed, RendererPolicy,
@@ -37,6 +37,7 @@ pub(crate) struct ApplyTransaction {
     candidates: Vec<Worker>,
     overlays: Vec<Worker>,
     next: Option<ApplyStage>,
+    reveal_steady: bool,
     ready: BTreeSet<u32>,
     touched: BTreeSet<String>,
     replace_all: bool,
@@ -76,18 +77,31 @@ impl ApplyTransaction {
         self.ready.len() == self.candidates.len()
     }
 
-    pub(crate) fn prepare_next(&mut self) -> Result<bool> {
-        let Some(stage) = self.next.take() else { return Ok(false) };
-        self.overlays = std::mem::take(&mut self.candidates);
+    pub(crate) async fn prepare_next(&mut self) -> Result<bool> {
+        if let Some(stage) = self.next.take() {
+            self.overlays = std::mem::take(&mut self.candidates);
+            self.ready.clear();
+            for (assignment, output) in stage.assignments {
+                self.candidates.push(stage.backends.spawn_overlay(
+                    assignment,
+                    output,
+                    &stage.socket,
+                    self.generation,
+                    self.policy.as_ref(),
+                )?);
+            }
+            self.reveal_steady = true;
+            return Ok(true);
+        }
+        if !std::mem::take(&mut self.reveal_steady) {
+            return Ok(false);
+        }
+        std::mem::swap(&mut self.candidates, &mut self.overlays);
         self.ready.clear();
-        for (assignment, output) in stage.assignments {
-            self.candidates.push(stage.backends.spawn(
-                assignment,
-                output,
-                &stage.socket,
-                self.generation,
-                self.policy.as_ref(),
-            )?);
+        for candidate in &mut self.candidates {
+            if !candidate.reveal_still().await? {
+                self.ready.insert(candidate.pid());
+            }
         }
         Ok(true)
     }
@@ -281,29 +295,17 @@ impl Manager {
         let backends = self.backend_paths();
         let overlays = expanded
             .iter()
-            .filter(|(assignment, _)| {
-                assignment.source.kind == paper_control::SourceKind::Static
-                    && assignment
-                        .transition
-                        .as_ref()
-                        .and_then(|transition| transition.from.as_ref())
-                        .is_some_and(|from| from != &assignment.source.path)
-            })
+            .filter(|(assignment, _)| static_transition(assignment))
             .cloned()
             .collect::<Vec<_>>();
         let next = (!overlays.is_empty()).then(|| ApplyStage {
-            assignments: expanded.clone(),
+            assignments: overlays,
             backends: backends.clone(),
             socket: socket.to_path_buf(),
         });
-        let staged = next.is_some();
         let mut candidates = Vec::with_capacity(expanded.len());
-        for (assignment, output) in if staged { overlays } else { expanded } {
-            let spawned = if staged {
-                backends.spawn_overlay(assignment, output, socket, generation, policy.as_ref())
-            } else {
-                backends.spawn(assignment, output, socket, generation, policy.as_ref())
-            };
+        for (assignment, output) in expanded {
+            let spawned = backends.spawn(assignment, output, socket, generation, policy.as_ref());
             match spawned {
                 Ok(worker) => candidates.push(worker),
                 Err(error) => {
@@ -318,6 +320,7 @@ impl Manager {
             candidates,
             overlays: Vec::new(),
             next,
+            reveal_steady: false,
             ready: BTreeSet::new(),
             touched,
             replace_all: request.replace_all,
@@ -331,7 +334,7 @@ impl Manager {
         &mut self,
         mut transaction: ApplyTransaction,
     ) -> Result<Vec<WorkerStatus>> {
-        if !transaction.all_ready() || transaction.next.is_some() {
+        if !transaction.all_ready() || transaction.next.is_some() || transaction.reveal_steady {
             transaction.rollback().await;
             return Err(anyhow!("Paper composition has not completed presentation readiness"));
         }
@@ -477,6 +480,7 @@ impl Manager {
             candidates,
             overlays: Vec::new(),
             next: None,
+            reveal_steady: false,
             ready: BTreeSet::new(),
             touched,
             replace_all: false,
@@ -549,6 +553,7 @@ impl Manager {
             candidates,
             overlays: Vec::new(),
             next: None,
+            reveal_steady: false,
             ready: BTreeSet::new(),
             touched,
             replace_all: false,

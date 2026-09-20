@@ -79,6 +79,11 @@ impl App {
             }
         };
         pack_pixels(canvas, &pixels, format);
+        if self.transparent.is_some() {
+            surf.span_keepalive = Some(buffer);
+            self.attach_transparent(idx);
+            return;
+        }
         surf.viewport.set_source(0.0, 0.0, bw as f64, bh as f64);
         surf.viewport.set_destination(surf.width as i32, surf.height as i32);
         if let Err(err) = buffer.attach_to(&surf.surface) {

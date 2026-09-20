@@ -51,6 +51,12 @@ pub fn run(
         globals.bind(&qh, 1..=1, ()).context("wp_viewporter not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
 
+    let transparent = if std::env::var("SKWD_PAPER_PREPARE_HIDDEN").as_deref() == Ok("1") {
+        anyhow::ensure!(persist, "hidden preparation requires persistent control");
+        Some(BufferSet::new(&shm, 1, 1, 0, |canvas, _| canvas.fill(0))?)
+    } else {
+        None
+    };
     let pending_cmd: Arc<Mutex<Option<StillCommand>>> = Arc::new(Mutex::new(None));
     let wake = make_wake_pipe()?;
     let mut app = App {
@@ -68,6 +74,7 @@ pub fn run(
         raw_h: img_h,
         fill_mode,
         buffers: HashMap::new(),
+        transparent,
         surfaces: Vec::new(),
         startup_readiness: StartupReadiness::default(),
         persist,
@@ -301,7 +308,9 @@ impl App {
 
     pub(super) fn try_release_pool(&mut self) {
         self.retired.retain(BufferSet::has_active_buffers);
-        self.buffers.retain(|_, buffer| buffer.has_active_buffers());
+        if self.transparent.is_none() {
+            self.buffers.retain(|_, buffer| buffer.has_active_buffers());
+        }
     }
 
     pub(super) fn retire_current(&mut self) {
@@ -309,6 +318,33 @@ impl App {
             if buffer.has_active_buffers() {
                 self.retired.push(buffer);
             }
+        }
+    }
+
+    pub(super) fn attach_transparent(&mut self, idx: usize) {
+        let Some(buffer) = self.transparent.as_mut() else { return };
+        let surf = &mut self.surfaces[idx];
+        surf.viewport.set_source(0.0, 0.0, 1.0, 1.0);
+        surf.viewport.set_destination(surf.width as i32, surf.height as i32);
+        if let Err(err) = buffer.attach_to(idx, &surf.surface) {
+            tracing::error!(error = %err, "attach prepared surface failed");
+            return;
+        }
+        surf.surface.damage_buffer(0, 0, 1, 1);
+        surf.attached = true;
+        surf.surface.commit();
+        self.startup_readiness.committed(surf.output.id().protocol_id());
+    }
+
+    pub(super) fn reveal_prepared(&mut self) {
+        let Some(buffer) = self.transparent.take() else { return };
+        self.retired.push(buffer);
+        self.startup_readiness = StartupReadiness::default();
+        self.startup_readiness.finish_enumeration(
+            self.surfaces.iter().map(|surf| (surf.output.id().protocol_id(), false)),
+        );
+        for idx in 0..self.surfaces.len() {
+            self.attach_to(idx);
         }
     }
 
@@ -342,6 +378,10 @@ impl App {
             vec![idx]
         };
         for attach_idx in indices {
+            if self.transparent.is_some() {
+                self.attach_transparent(attach_idx);
+                continue;
+            }
             let surf = &mut self.surfaces[attach_idx];
             if surf.width == 0 || surf.height == 0 {
                 continue;

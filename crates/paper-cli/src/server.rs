@@ -330,7 +330,7 @@ async fn wait_ready(listener: &UnixListener, transaction: &mut ApplyTransaction)
         .map_or(DEFAULT_READY_TIMEOUT, Duration::from_millis);
     let deadline = Instant::now() + timeout.max(transaction.load_timeout());
     loop {
-        if transaction.all_ready() && !transaction.prepare_next()? {
+        if transaction.all_ready() && !transaction.prepare_next().await? {
             break;
         }
         if let Some(message) = transaction.failed()? {

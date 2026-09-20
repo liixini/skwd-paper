@@ -25,3 +25,14 @@ fn fill_optional() {
     let legacy: StillCommand = serde_json::from_str(r#"{"path":"/w/a.png"}"#).unwrap();
     assert_eq!(legacy.fill, None);
 }
+
+#[test]
+fn reveal_is_explicit_and_legacy_commands_remain_unchanged() {
+    let reveal = StillCommand::reveal();
+    assert_eq!(reveal.line(), "{\"path\":\"\",\"reveal\":true}\n");
+    assert_eq!(serde_json::from_str::<StillCommand>(&reveal.line()).unwrap(), reveal);
+    for input in ["{}", r#"{"path":"/wall/a.png"}"#, r#"{"preload":["/wall/a.png"]}"#] {
+        assert!(!serde_json::from_str::<StillCommand>(input).unwrap().reveal);
+    }
+    assert!(serde_json::from_str::<StillCommand>(r#"{"reveal":"true"}"#).is_err());
+}
