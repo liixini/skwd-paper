@@ -147,6 +147,7 @@ fn policy_golden_line() {
         duration_ms: Some(700),
     });
     let policy = RendererPolicy {
+        load_timeout_ms: None,
         surface: None,
         idle_seconds: Some(45),
         transitions_enabled: Some(true),
@@ -627,4 +628,24 @@ fn surface_policy_validates_effects_and_supported_backends() {
     assert!(request.validate().is_ok());
     request.policy.as_mut().unwrap().surface.as_mut().unwrap().namespace = "bad\nnamespace".into();
     assert_eq!(request.validate(), Err(ValidationError::InvalidSurfacePolicy));
+}
+
+#[test]
+fn load_timeout_policy_is_optional_and_bounded() {
+    let legacy: RendererPolicy = serde_json::from_str("{}").unwrap();
+    assert_eq!(legacy.load_timeout_ms, None);
+    assert!(!serde_json::to_string(&legacy).unwrap().contains("load_timeout_ms"));
+    for ms in [3_000, 10_000, 60_000] {
+        let policy = RendererPolicy { load_timeout_ms: Some(ms), ..Default::default() };
+        assert!(policy.validate().is_ok());
+        assert_eq!(
+            serde_json::from_str::<RendererPolicy>(&serde_json::to_string(&policy).unwrap())
+                .unwrap(),
+            policy
+        );
+    }
+    for ms in [0, 2_999, 60_001, u64::MAX] {
+        let policy = RendererPolicy { load_timeout_ms: Some(ms), ..Default::default() };
+        assert!(matches!(policy.validate(), Err(ValidationError::LoadTimeoutOutOfRange(_))));
+    }
 }

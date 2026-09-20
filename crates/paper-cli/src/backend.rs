@@ -727,6 +727,7 @@ fn clear_policy_env(command: &mut Command) {
         "SKWD_PAPER_DIM",
         "SKWD_PAPER_IDLE_SEC",
         "SKWD_PAPER_TRANSITIONS",
+        "SKWD_PAPER_LOAD_TIMEOUT_MS",
         "SKWD_PAPER_SAND_QUALITY",
         "SKWD_PAPER_SAND_SCOPE",
         "SKWD_PAPER_SAND_PRIMARY",
@@ -755,6 +756,9 @@ pub(crate) fn transition_source(source: &Source) -> Result<String> {
 }
 
 fn apply_policy(command: &mut Command, policy: &RendererPolicy) {
+    if let Some(timeout) = policy.load_timeout_ms {
+        command.env("SKWD_PAPER_LOAD_TIMEOUT_MS", timeout.to_string());
+    }
     if let Some(surface) = &policy.surface {
         command.env("SKWD_VK_INPUT", "passthrough");
         command.env_remove("SKWD_VK_LAYER");

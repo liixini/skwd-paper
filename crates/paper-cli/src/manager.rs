@@ -52,6 +52,10 @@ struct ApplyStage {
 }
 
 impl ApplyTransaction {
+    pub(crate) fn load_timeout(&self) -> Duration {
+        Duration::from_millis(self.policy.as_ref().and_then(|p| p.load_timeout_ms).unwrap_or(0))
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }

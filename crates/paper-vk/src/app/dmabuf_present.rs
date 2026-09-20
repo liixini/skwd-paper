@@ -939,7 +939,7 @@ pub(super) fn run_nv12(
                     slots: Vec::new(),
                 })
             }
-            decode::AnyDecoder::Sw(_) => unreachable!(),
+            decode::AnyDecoder::Sw(_) | decode::AnyDecoder::Still(_) => unreachable!(),
         };
         for si in 0..n_surf {
             target.set_viewport_cover(si, vw, vh)?;
@@ -1189,17 +1189,18 @@ fn run_shared_dmabuf_with_readiness(
     if !sd.foreign_queue {
         tracing::info!("skwd-wall-vk: foreign queue ownership unavailable, using shm present");
     }
+    let n_surf = target.surface_count();
+    let dims: Vec<(u32, u32)> = (0..n_surf).map(|si| target.size_at(si)).collect();
     let first_source = start_fade.as_ref().map(|sf| sf.from.clone());
     let dec = open_shared_decoder(
         &pattern,
         first_source.as_deref().unwrap_or(video),
         sd,
         force_software_decode,
+        &dims,
     )?;
     let speed = env_speed();
-    let n_surf = target.surface_count();
     let dmabuf_formats = target.app.dmabuf_formats.clone();
-    let dims: Vec<(u32, u32)> = (0..n_surf).map(|si| target.size_at(si)).collect();
     let reuse_mode = std::env::var("SKWD_VK_REUSE_EXPORT").ok();
     let source_dims = dec.as_ref().map(decode::AnyDecoder::dims);
     let reuse_source_dims =
@@ -1358,14 +1359,13 @@ fn run_shared_dmabuf_with_readiness(
             video,
             mute,
             volume,
-            pattern.is_none(),
+            pattern.is_none() && !still,
             control_enabled_for_overlay(overlay, transition_held),
         ),
     };
     target.ctl_fd = ctl.wake_fd();
     let mut fade: Option<FadeState> = None;
     let mut active_source = video.to_string();
-    let startup_from = start_fade.as_ref().map(|fade| fade.from.clone());
     let mut pending_swap: Option<PendingSwap> = None;
     let mut readiness = PresentationReadiness::startup();
     if let Some(sf) = start_fade
@@ -1377,31 +1377,24 @@ fn run_shared_dmabuf_with_readiness(
             shader: sf.shader,
             properties: None,
         };
-        fade = start_swap(&req, sd, force_software_decode, &distinct, &mut ctl);
+        fade = start_swap(&req, sd, force_software_decode, &distinct, &dims, &mut ctl);
         if fade.is_none() {
             tracing::info!("skwd-wall-vk: startup transition failed, keeping from-source");
         }
     }
-    let mut fade_rgba_a = startup_from
-        .as_deref()
-        .filter(|path| !paper_control::is_video_path(path))
-        .and_then(|path| match load_rgba_still(&mut renderers[0], path, &distinct) {
-            Ok(source) => Some(source),
-            Err(error) => {
-                tracing::info!("skwd-wall-vk: RGBA transition source unavailable ({error:#})");
-                None
-            }
-        });
-    let mut fade_rgba_b = fade.as_ref().filter(|state| state.still_b).and_then(|state| {
-        match load_rgba_still(&mut renderers[0], &state.path, &distinct) {
-            Ok(source) => Some(source),
-            Err(error) => {
-                tracing::info!("skwd-wall-vk: RGBA transition target unavailable ({error:#})");
-                None
-            }
-        }
-    });
-    let mut steady_rgba: Option<RgbaStillSource> = None;
+    let initial = next_pending(&rx, &pattern, 0)?;
+    let source_rgba = upload_rgba_still(&mut renderers[0], &initial.0, &distinct)?;
+    let mut steady_rgba = None;
+    let mut fade_rgba_a = if fade.is_some() {
+        source_rgba
+    } else {
+        steady_rgba = source_rgba;
+        None
+    };
+    let mut fade_rgba_b = match &fade {
+        Some(state) => upload_rgba_still(&mut renderers[0], &state.cur.0, &distinct)?,
+        None => None,
+    };
     if let Some(fade) = &mut fade {
         prepare_transition_pipelines(
             &mut renderers,
@@ -1421,7 +1414,7 @@ fn run_shared_dmabuf_with_readiness(
     let mut frames: u64 = 0;
     let mut report = Instant::now();
     let hash_mode = std::env::var("SKWD_VK_HASH").is_ok();
-    let mut pending: Option<(decode::RenderFrame, f64)> = None;
+    let mut pending: Option<(decode::RenderFrame, f64)> = Some(initial);
     let mut prev_pts = f64::NEG_INFINITY;
     let mut wall_anchor: Option<(u64, f64)> = None;
     let mut prev_commit_ns: u64 = 0;
@@ -1493,21 +1486,14 @@ fn run_shared_dmabuf_with_readiness(
                 sd.video_decode,
                 sd.render_node.clone(),
                 force_software_decode,
+                &dims,
             ));
         }
         crate::freeze::write_last_requested(&mut ctl, last_presented.as_ref())?;
         if let Some(state) = poll_pending_swap(&mut pending_swap, &distinct, &mut ctl) {
             active_source.clone_from(&state.path);
             fade_rgba_a = steady_rgba.take();
-            fade_rgba_b = state
-                .still_b
-                .then(|| {
-                    load_rgba_still(&mut renderers[0], &state.path, &distinct).map_err(|error| {
-                        tracing::info!("skwd-wall-vk: RGBA swap target unavailable ({error:#})");
-                        error
-                    })
-                })
-                .and_then(Result::ok);
+            fade_rgba_b = upload_rgba_still(&mut renderers[0], &state.cur.0, &distinct)?;
             fade = Some(state);
             prepare_transition_pipelines(
                 &mut renderers,
@@ -1850,10 +1836,11 @@ fn run_shared_dmabuf_with_readiness(
         };
         dec_hash(&pattern, hash_mode, frame, frames, pts);
         if !using_nv12 && pattern.is_none() {
-            if needs_frame_slot(frame) {
+            if steady_rgba.is_none() && fade_rgba_a.is_none() && needs_frame_slot(frame) {
                 ensure_frame_slot(&mut sw_a, &renderers[0], frame, pts)?;
             }
             if let (Some(fd), Some(_)) = (&fade, fade_mix)
+                && fade_rgba_b.is_none()
                 && needs_frame_slot(&fd.cur.0)
             {
                 ensure_frame_slot(&mut sw_b, &renderers[0], &fd.cur.0, fd.cur.1)?;

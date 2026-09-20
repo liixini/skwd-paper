@@ -152,6 +152,8 @@ pub struct SurfacePolicy {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendererPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<Box<SurfacePolicy>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_seconds: Option<u32>,
@@ -167,6 +169,11 @@ pub struct RendererPolicy {
 
 impl RendererPolicy {
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if let Some(timeout) = self.load_timeout_ms
+            && !(3_000..=60_000).contains(&timeout)
+        {
+            return Err(ValidationError::LoadTimeoutOutOfRange(timeout));
+        }
         if self.surface.as_ref().is_some_and(|surface| {
             surface.namespace.trim().is_empty()
                 || surface.namespace.len() > 128
@@ -925,6 +932,7 @@ pub type CapabilitiesResponse = Response<CapabilitiesResult>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    LoadTimeoutOutOfRange(u64),
     InvalidSurfacePolicy,
     EmptyAssignments,
     AssignmentWithoutOutputs,
@@ -970,6 +978,9 @@ pub enum ValidationError {
 impl Display for ValidationError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LoadTimeoutOutOfRange(value) => {
+                write!(formatter, "load_timeout_ms must be between 3000 and 60000, got {value}")
+            }
             Self::InvalidSurfacePolicy => {
                 formatter.write_str("invalid or unsupported surface policy")
             }
