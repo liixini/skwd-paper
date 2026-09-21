@@ -72,6 +72,29 @@ fn audio_only_effect_updates_without_scripts_or_animation() {
 
 #[test]
 #[ignore = "requires Vulkan"]
+fn packed_audio_spectrum_reads_the_requested_band_and_updates_pixels() {
+    let mut model = model(
+        serde_json::json!(true),
+        b"uniform float g_AudioSpectrum16Left[16];\nvoid main(){\nfloat i=5.0;\nfloat a=g_AudioSpectrum16Left[i/4][i%4];\ngl_FragColor=vec4(a,1.0-a,0.0,1.0);\n}",
+    );
+    let shared = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    group.audio = None;
+    group.configure_scene_targets(true).unwrap();
+    for (time, band, expected) in
+        [(1.0, 1, [0, 255, 0, 255]), (2.0, 5, [255, 0, 0, 255]), (3.0, 6, [0, 255, 0, 255])]
+    {
+        let mut values = vec![0.0; 16];
+        values[band] = 1.0;
+        group.fx[0].uniforms.insert("g_AudioSpectrum16Left".into(), values);
+        group.compose(time, 1.0 / 60.0).unwrap();
+        assert_eq!(center(&mut group), expected);
+    }
+    group.destroy();
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
 fn initially_hidden_effect_keeps_its_targets_until_first_visible_frame() {
     let mut model = model(
         serde_json::json!({"value":false,"script":"export function update(v){return engine.runtime>=1.0;}"}),

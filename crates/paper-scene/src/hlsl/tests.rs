@@ -104,6 +104,22 @@ fn uniform_arrays_keep_a_single_dimension_in_the_cbuffer() {
 }
 
 #[test]
+fn packed_audio_spectrum_indices_compile_with_scalar_uniform_layout() {
+    let vert = "attribute vec3 a_Position;\nvoid main(){ gl_Position=vec4(a_Position,1.0); }\n";
+    for count in [16, 32, 64] {
+        for side in ["Left", "Right"] {
+            let name = format!("g_AudioSpectrum{count}{side}");
+            let frag = format!(
+                "uniform float {name}[{count}];\nfloat sample(float i){{ return {name} [i / 4] [i % 4]; }}\nvoid main(){{ gl_FragColor=vec4(sample(5.0),{name}[2],0.0,1.0); }}\n"
+            );
+            let pair = rewrite_pair(vert, &frag);
+            assert!(pair.fragment.contains(&format!("float {name}[{count}];")));
+            super::compile(&pair.fragment, Stage::Fragment, "packed-spectrum").unwrap();
+        }
+    }
+}
+
+#[test]
 fn only_depth_zero_consts_become_static() {
     let body = "  const float a = 1.0; // {\"x\": 1}\nfloat f(float v) {\nconst float b = v * 2.0;\n\treturn b;\n}\n#if 1\nconst vec2 c = vec2(1.0, 2.0);\n#endif\n";
     let out = super::static_const(body);

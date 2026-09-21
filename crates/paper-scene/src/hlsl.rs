@@ -3,6 +3,8 @@ use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
+mod audio;
+
 pub const PRELUDE: &str = "#define HLSL 1
 #define HLSL_SM40 1
 #define vec2 float2
@@ -404,7 +406,7 @@ pub fn rewrite(
     }
     header.push_str("};\nstruct PS_OUTPUT { float4 gl_FragColor : SV_TARGET; };\n");
 
-    let mut vert = static_const(&vert_body);
+    let mut vert = audio::flatten(&static_const(&vert_body), uniforms);
     for decl in &attributes {
         vert = replace_word(&vert, &decl.name, &format!("IN.{}", decl.name));
     }
@@ -417,7 +419,7 @@ pub fn rewrite(
     vert = replace_word(&vert, "gl_Position", "OUT.gl_Position");
     vert = rewrite_main(&vert, Stage::Vertex);
 
-    let mut frag = static_const(&frag_body);
+    let mut frag = audio::flatten(&static_const(&frag_body), uniforms);
     let mut input_copies = String::new();
     for decl in &varyings {
         if decl.array.is_empty() {
