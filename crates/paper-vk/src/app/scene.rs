@@ -98,6 +98,13 @@ struct LayerAnimation {
     image: i32,
     control: SpriteControl,
     rate: f32,
+    refresh: Option<SpriteRefresh>,
+}
+
+#[derive(Default)]
+struct SpriteRefresh {
+    previous: Option<f32>,
+    frame: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,7 +121,26 @@ fn frame_start(frames: &[paper_scene::model::SpriteFrame], index: usize) -> f32 
 }
 
 impl LayerAnimation {
+    fn clock_time(&self, time: f32) -> f32 {
+        self.refresh.as_ref().map_or(time, |clock| clock.frame)
+    }
+
+    fn advance_clock(&mut self, time: f32) {
+        if let Some(clock) = &mut self.refresh {
+            if clock.previous.is_some_and(|previous| time > previous) {
+                clock.frame += 1.0;
+            }
+            clock.previous = Some(time);
+        }
+    }
+
+    fn advance(&mut self, time: f32) -> &paper_scene::model::SpriteFrame {
+        self.advance_clock(time);
+        animation_frame(&self.frames, self.total, self.time(time))
+    }
+
     fn time(&self, time: f32) -> f32 {
+        let time = self.clock_time(time);
         match self.control {
             SpriteControl::Follow => time,
             SpriteControl::Hold(frame) => frame_start(&self.frames, frame),
@@ -138,7 +164,9 @@ impl LayerAnimation {
 
     fn apply(&mut self, op: paper_scene::script::SpriteOp, time: f32) {
         use paper_scene::script::SpriteOp;
+        self.advance_clock(time);
         let current = self.current_frame(time);
+        let time = self.clock_time(time);
         self.control = match op {
             SpriteOp::Play => match self.control {
                 SpriteControl::Hold(frame) => SpriteControl::Play { frame, since: time },
@@ -1357,7 +1385,7 @@ impl Group {
 
     fn advance_layer_animations(&mut self, time: f32) {
         for animation in &mut self.animations {
-            let frame = animation_frame(&animation.frames, animation.total, animation.time(time));
+            let frame = *animation.advance(time);
             let uv = frame.uv;
             if frame.image != animation.image {
                 let page = &self.textures[animation.pages[frame.image as usize]];
@@ -2926,7 +2954,13 @@ fn build_group(
         .iter()
         .enumerate()
         .filter_map(|(index, layer)| {
-            let frames = layer.texture.atlas_frames()?.to_vec();
+            let mut frames = layer.texture.atlas_frames()?.to_vec();
+            let refresh = frames.iter().all(|frame| frame.time == 0.0).then(|| {
+                for frame in &mut frames {
+                    frame.time = 1.0;
+                }
+                SpriteRefresh::default()
+            });
             let total = frames.iter().map(|frame| frame.time).sum();
             Some(LayerAnimation {
                 quad: index,
@@ -2941,6 +2975,7 @@ fn build_group(
                 image: -1,
                 control: SpriteControl::Follow,
                 rate: 1.0,
+                refresh,
             })
         })
         .collect();

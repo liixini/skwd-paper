@@ -12,6 +12,7 @@ pub struct Package {
     entries: Vec<Entry>,
     index: HashMap<String, usize>,
     data_start: usize,
+    scene_file: Option<String>,
 }
 
 pub struct Entry {
@@ -76,7 +77,14 @@ fn map_file(path: &std::path::Path) -> Result<Mapping> {
 impl Package {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let map = map_file(path)?;
-        Self::build(map).with_context(|| format!("parse {}", path.display()))
+        let mut package = Self::build(map).with_context(|| format!("parse {}", path.display()))?;
+        package.scene_file = path
+            .parent()
+            .and_then(|dir| std::fs::read(dir.join("project.json")).ok())
+            .and_then(|bytes| crate::json::parse(&bytes).ok())
+            .and_then(|project| project.get("file")?.as_str().map(str::to_owned))
+            .filter(|file| !file.is_empty());
+        Ok(package)
     }
 
     pub fn parse(data: Vec<u8>) -> Result<Self> {
@@ -120,7 +128,7 @@ impl Package {
         };
         let index =
             entries.iter().enumerate().map(|(idx, entry)| (entry.path.clone(), idx)).collect();
-        Ok(Self { map, version, entries, index, data_start })
+        Ok(Self { map, version, entries, index, data_start, scene_file: None })
     }
 
     pub fn version(&self) -> &str {
@@ -139,6 +147,25 @@ impl Package {
     pub fn find(&self, path: &str) -> Option<&[u8]> {
         let idx = *self.index.get(path)?;
         Some(self.read(&self.entries[idx]))
+    }
+
+    pub fn scene_entry(&self) -> Result<&Entry> {
+        let path = match self.scene_file.as_deref() {
+            Some(path) => path,
+            None => ["scene.json", "gifscene.json"]
+                .into_iter()
+                .find(|path| self.index.contains_key(*path))
+                .ok_or_else(|| anyhow!("no scene.json or gifscene.json in package"))?,
+        };
+        self.index.get(path).map(|index| &self.entries[*index]).ok_or_else(|| {
+            anyhow!("scene entry {path} declared in project.json is missing from package")
+        })
+    }
+
+    pub fn scene_json(&self) -> Result<serde_json::Value> {
+        let entry = self.scene_entry()?;
+        crate::json::parse(self.read(entry))
+            .with_context(|| format!("parse json entry {}", entry.path))
     }
 
     pub fn find_json(&self, path: &str) -> Result<Option<serde_json::Value>> {

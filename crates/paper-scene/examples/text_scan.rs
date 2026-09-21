@@ -11,7 +11,7 @@ fn main() {
         let Ok(pkg) = Package::open(&std::path::Path::new(&dir).join("scene.pkg")) else {
             continue;
         };
-        let Ok(Some(scene)) = pkg.find_json("scene.json") else { continue };
+        let Ok(scene) = pkg.scene_json() else { continue };
         let Some(objects) = scene.get("objects").and_then(Value::as_array) else { continue };
         for object in objects {
             let Some(text @ Value::Object(map)) = object.get("text") else { continue };

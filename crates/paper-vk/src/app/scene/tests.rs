@@ -836,6 +836,7 @@ fn sprite_controls_hold_play_and_rejoin_the_shared_clock() {
         image: -1,
         control: SpriteControl::Follow,
         rate: 1.0,
+        refresh: None,
     };
     assert_eq!(animation.current_frame(0.6), 1);
     animation.apply(SpriteOp::Frame(2), 0.6);
@@ -917,4 +918,54 @@ fn hidden_compositions_defer_authored_targets_until_a_visibility_reload() {
     layer.visible = false;
     layer.effects.clear();
     assert!(deferred_composition_layers(std::slice::from_ref(&layer), dimensions).is_empty());
+}
+
+#[test]
+fn untimed_sprites_advance_once_per_update_and_obey_controls() {
+    use paper_scene::script::SpriteOp;
+    let mut animation = LayerAnimation {
+        quad: 0,
+        object: Some(0),
+        frames: (0..7)
+            .map(|image| paper_scene::model::SpriteFrame {
+                image,
+                time: 1.0,
+                uv: [0.0; 4],
+                rotated: false,
+            })
+            .collect(),
+        total: 7.0,
+        pages: vec![],
+        slot: 0,
+        image: -1,
+        control: SpriteControl::Follow,
+        rate: 1.0,
+        refresh: Some(SpriteRefresh::default()),
+    };
+    assert_eq!(animation.advance(0.0).image, 0);
+    assert_eq!(animation.advance(0.01).image, 1);
+    assert_eq!(animation.advance(0.01).image, 1);
+    assert_eq!(animation.advance(10.0).image, 2);
+    for (tick, image) in (11..18).zip([3, 4, 5, 6, 0, 1, 2]) {
+        assert_eq!(animation.advance(tick as f32).image, image);
+    }
+    animation.apply(SpriteOp::Pause, 17.0);
+    assert_eq!(animation.advance(18.0).image, 2);
+    animation.apply(SpriteOp::Play, 18.0);
+    assert_eq!(animation.advance(18.0).image, 2);
+    assert_eq!(animation.advance(19.0).image, 3);
+    animation.apply(SpriteOp::Frame(6), 19.0);
+    assert_eq!(animation.advance(19.0).image, 6);
+    assert_eq!(animation.advance(20.0).image, 0);
+    animation.apply(SpriteOp::Stop, 20.0);
+    assert_eq!(animation.advance(21.0).image, 0);
+    animation.apply(SpriteOp::Rate(0.5), 21.0);
+    animation.apply(SpriteOp::Play, 21.0);
+    assert_eq!(animation.advance(21.0).image, 0);
+    assert_eq!(animation.advance(22.0).image, 1);
+    assert_eq!(animation.advance(23.0).image, 1);
+    animation.apply(SpriteOp::Rate(1.0), 24.0);
+    animation.apply(SpriteOp::Frame(4), 25.0);
+    assert_eq!(animation.advance(25.0).image, 4);
+    assert_eq!(animation.advance(26.0).image, 5);
 }

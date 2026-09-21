@@ -400,8 +400,7 @@ impl Texture {
             && self.frames.iter().all(|frame| {
                 usize::try_from(frame.image).is_ok_and(|image| image < self.image_count)
                     && !frame.rotated
-            })
-            && self.frames.iter().map(|frame| frame.time).sum::<f32>() > 0.0;
+            });
         playable.then_some(self.frames.as_slice())
     }
 
@@ -724,10 +723,7 @@ fn load_with_project(
     storage: Option<crate::script::Storage>,
 ) -> Result<SceneModel> {
     let props = &assets.properties;
-    let mut scene = pkg
-        .find_json("scene.json")
-        .map_err(|err| anyhow!("{err:#}"))?
-        .ok_or_else(|| anyhow!("no scene.json"))?;
+    let mut scene = pkg.scene_json()?;
     let mut scripts =
         crate::script::SceneScripts::load_with_storage(&mut scene, props, project, storage)?;
     let scripted = scripts.is_some();

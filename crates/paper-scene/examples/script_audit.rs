@@ -23,7 +23,7 @@ fn main() -> Result<()> {
             continue;
         };
         let package = Package::open(Path::new(&path))?;
-        let Some(mut scene) = package.find_json("scene.json")? else {
+        let Ok(mut scene) = package.scene_json() else {
             continue;
         };
         let props = paper_scene::effects::parse_properties(&project);

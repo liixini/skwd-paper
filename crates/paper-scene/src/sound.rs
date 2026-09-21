@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde_json::Value;
 
 use crate::model::Properties;
@@ -55,7 +55,8 @@ pub fn scene_sounds(pkg: &Package, properties: &Properties) -> Result<Vec<SceneS
 }
 
 pub fn scripts_drive_sounds(pkg: &Package) -> bool {
-    pkg.find("scene.json").is_some_and(|raw| {
+    pkg.scene_entry().is_ok_and(|entry| {
+        let raw = pkg.read(entry);
         [&b".play("[..], b".stop(", b".pause(", b".isPlaying("]
             .iter()
             .any(|needle| raw.windows(needle.len()).any(|window| window == *needle))
@@ -67,7 +68,7 @@ pub fn scene_sounds_with_silent(
     properties: &Properties,
     include_silent: bool,
 ) -> Result<Vec<SceneSound>> {
-    let scene = pkg.find_json("scene.json")?.ok_or_else(|| anyhow!("no scene.json"))?;
+    let scene = pkg.scene_json()?;
     let objects = scene.get("objects").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let mut out = Vec::new();
     for object in objects {
@@ -107,7 +108,7 @@ pub fn scene_sounds_with_silent(
 }
 
 pub fn has_event_driven_sounds(pkg: &Package) -> bool {
-    let Ok(Some(scene)) = pkg.find_json("scene.json") else {
+    let Ok(scene) = pkg.scene_json() else {
         return false;
     };
     let objects = scene.get("objects").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
@@ -117,7 +118,7 @@ pub fn has_event_driven_sounds(pkg: &Package) -> bool {
 }
 
 pub fn sound_inventory(pkg: &Package) -> Result<SoundInventory> {
-    let scene = pkg.find_json("scene.json")?.ok_or_else(|| anyhow!("no scene.json"))?;
+    let scene = pkg.scene_json()?;
     let objects = scene.get("objects").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let mut out = SoundInventory::default();
     for object in objects.iter().filter(|object| object.get("sound").is_some()) {

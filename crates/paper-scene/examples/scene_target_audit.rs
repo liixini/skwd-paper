@@ -64,7 +64,7 @@ fn count_strings(value: &Value, own_id: Option<&str>, counts: &mut SceneCounts) 
 
 fn raw_scene_counts(pkg: &Package) -> SceneCounts {
     let mut counts = SceneCounts::default();
-    let Some(scene) = pkg.find_json("scene.json").ok().flatten() else {
+    let Ok(scene) = pkg.scene_json() else {
         return counts;
     };
     for object in scene.get("objects").and_then(Value::as_array).into_iter().flatten() {

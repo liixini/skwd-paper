@@ -967,7 +967,7 @@ fn conditional_symbol_defaults_ignore_trailing_comments() {
 }
 
 #[test]
-fn atlas_frames_require_valid_images_and_unrotated_frames_with_timing() {
+fn atlas_frames_require_valid_images_and_unrotated_frames() {
     use crate::model::{SpriteFrame, Texture};
     let frame = |image, rotated, time| SpriteFrame { uv: [0.0; 4], rotated, time, image };
     let mut texture = model::solid_texture();
@@ -979,7 +979,7 @@ fn atlas_frames_require_valid_images_and_unrotated_frames_with_timing() {
     texture.frames = vec![frame(0, true, 0.1), frame(0, false, 0.1)];
     assert!(texture.atlas_frames().is_none());
     texture.frames = vec![frame(0, false, 0.0), frame(0, false, 0.0)];
-    assert!(texture.atlas_frames().is_none());
+    assert_eq!(texture.atlas_frames().map(<[SpriteFrame]>::len), Some(2));
     let _: &Texture = &texture;
 }
 
@@ -1476,4 +1476,94 @@ fn parallax_model_keeps_zero_depth_and_inherits_root_depth_with_engine_defaults(
     assert_eq!(model.layers[0].mouse.parallax, [0.0; 2]);
     assert_eq!(model.layers[1].mouse.parallax, [1.0, 0.5]);
     assert_eq!(model.layers[2].mouse.parallax, [1.0, 0.5]);
+}
+
+#[test]
+fn scene_entry_consumers_agree_on_declared_and_fallback_scenes() {
+    let scene = br#"{
+        "general":{"orthogonalprojection":{"width":320,"height":240}},
+        "objects":[
+            {"id":1,"name":"Ambience","sound":"sounds/test.ogg","volume":0.5},
+            {"id":2,"name":"Triggered","sound":"sounds/test.ogg","startsilent":true}
+        ],
+        "note":"sound.play("
+    }"#;
+    for name in ["scene.json", "gifscene.json", "scenes/custom.json"] {
+        for declared in [false, true] {
+            if !declared && name == "scenes/custom.json" {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gifscene.pkg");
+            let mut files = vec![(name, &scene[..]), ("sounds/test.ogg", &b"sound"[..])];
+            if declared && name != "scene.json" {
+                files.push(("scene.json", b"{\"objects\":[]}"));
+            }
+            std::fs::write(&path, build_pkg(&files)).unwrap();
+            if declared {
+                std::fs::write(
+                    dir.path().join("project.json"),
+                    serde_json::json!({"type":"scene","file":name}).to_string(),
+                )
+                .unwrap();
+            }
+            let package = pkg::Package::open(&path).unwrap();
+            let model = model::load_from_dir(&package, dir.path()).unwrap();
+            assert_eq!(model.canvas, (320.0, 240.0), "{name}, declared={declared}");
+            let features = scene::extract(&package).unwrap();
+            assert_eq!(features.objects_sound, 2);
+            assert_eq!(features.objects_sound_event, 1);
+            let properties = model::Properties::new();
+            let sounds = crate::sound::scene_sounds(&package, &properties).unwrap();
+            assert_eq!(sounds.len(), 1);
+            assert_eq!(sounds[0].name, "Ambience");
+            assert_eq!(sounds[0].volume, 0.5);
+            let all = crate::sound::scene_sounds_with_silent(&package, &properties, true).unwrap();
+            assert_eq!(all.len(), 2);
+            assert!(!all[1].autostart);
+            assert!(crate::sound::scripts_drive_sounds(&package));
+            assert!(crate::sound::has_event_driven_sounds(&package));
+            let inventory = crate::sound::sound_inventory(&package).unwrap();
+            assert_eq!(inventory.objects, 2);
+            assert_eq!(inventory.autostart, 1);
+            assert_eq!(inventory.event_driven, 1);
+        }
+    }
+}
+
+#[test]
+fn zero_duration_atlas_frames_remain_playable() {
+    for version in ["TEXS0001", "TEXS0002", "TEXS0003"] {
+        let mut texture =
+            build_tex("TEXB0003", 0, tex::FLAG_IS_GIF as i32, &[255; 64], false, None);
+        push_nul_str(&mut texture, version);
+        push_i32(&mut texture, 2);
+        if version == "TEXS0003" {
+            push_i32(&mut texture, 4);
+            push_i32(&mut texture, 2);
+        }
+        for y in [0, 2] {
+            push_i32(&mut texture, 0);
+            texture.extend_from_slice(&0.0f32.to_le_bytes());
+            for value in [0, y, 4, 0, 0, 2] {
+                if version == "TEXS0001" {
+                    push_i32(&mut texture, value);
+                } else {
+                    texture.extend_from_slice(&(value as f32).to_le_bytes());
+                }
+            }
+        }
+        let package = pkg::Package::parse(build_pkg(&[
+            ("gifscene.json", br#"{"objects":[{"image":"models/bg.json"}]}"#),
+            ("models/bg.json", br#"{"material":"materials/bg.json"}"#),
+            ("materials/bg.json", br#"{"passes":[{"textures":["animated"]}]}"#),
+            ("materials/animated.tex", &texture),
+        ]))
+        .unwrap();
+        let scene = model::load(&package).unwrap();
+        let frames = scene.layers[0].texture.atlas_frames().expect(version);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].time, 0.0);
+        assert_eq!(frames[1].uv, [0.0, 0.5, 1.0, 0.5]);
+    }
 }

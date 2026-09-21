@@ -231,15 +231,7 @@ fn count_key(value: &Value, key: &str) -> usize {
 
 pub fn extract(pkg: &Package) -> Result<SceneFeatures, String> {
     let mut out = SceneFeatures::default();
-    let scene = match pkg.find_json("scene.json") {
-        Ok(Some(value)) => value,
-        Ok(None) => match pkg.find_json("gifscene.json") {
-            Ok(Some(value)) => value,
-            Ok(None) => return Err("no scene.json in pkg".into()),
-            Err(err) => return Err(format!("{err:#}")),
-        },
-        Err(err) => return Err(format!("{err:#}")),
-    };
+    let scene = pkg.scene_json().map_err(|err| format!("{err:#}"))?;
 
     let mut walk = Walk { pkg, cache: HashMap::new(), budget: MAX_WALKED_REFS };
     if let Some(objects) = scene.get("objects").and_then(Value::as_array) {
