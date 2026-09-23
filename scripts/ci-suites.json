@@ -4,7 +4,7 @@
     {"id": "verify.repository", "expectedSkips": 0, "coverage": "external verifier self-tests and repository boundary"},
     {"id": "paper.native-deps", "expectedSkips": 0, "coverage": "dav1d and libyuv linker availability"},
     {"id": "paper.format", "expectedSkips": 0, "coverage": "Rust formatting"},
-    {"id": "paper.tests", "expectedSkips": 17, "coverage": "release workspace tests; the Vulkan NV12 color regression, seven Vulkan scene regressions for video, clocks, pointer shaders, particles, depth parallax and Proton layer movement, the real-audio-device test, the manual freeze-frame benchmark, installed-prefix font resolution, and six Vulkan checks for sound callbacks, sorted audio identity, sprite frames, audio-only lifetime, packed spectrum pixels and hidden targets remain opt-in"},
+    {"id": "paper.tests", "expectedSkips": 19, "coverage": "release workspace tests; the Vulkan NV12 color regression, seven Vulkan scene regressions for video, clocks, pointer shaders, particles, depth parallax and Proton layer movement, the real-audio-device test, the manual freeze-frame benchmark, installed-prefix font resolution, and six Vulkan checks for sound callbacks, sorted audio identity, sprite frames, audio-only lifetime, packed spectrum pixels and hidden targets, plus puppet straight-alpha rendering and animated X-ray source visibility, remain opt-in"},
     {"id": "paper.clippy", "expectedSkips": 0, "coverage": "workspace all-target lint gate"},
     {"id": "paper.release", "expectedSkips": 0, "coverage": "release workspace build"},
     {"id": "paper.dependencies", "expectedSkips": 0, "coverage": "unused dependency scan"},

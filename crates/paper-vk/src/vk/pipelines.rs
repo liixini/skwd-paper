@@ -564,7 +564,7 @@ impl Renderer {
                         .viewport_state(&vp)
                         .rasterization_state(&rs)
                         .multisample_state(&ms)
-                        .color_blend_state(&blend)
+                        .color_blend_state(&blend_copy)
                         .dynamic_state(&dynamic)
                         .layout(self.pipeline_layout_layer)
                         .render_pass(self.scene_pass)

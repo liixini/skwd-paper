@@ -767,6 +767,45 @@ fn pointer_unprojection_uses_centered_layer_coordinates() {
     assert!((rotated[4] - 540.0).abs() < 0.001);
 }
 
+#[test]
+#[ignore = "requires Vulkan, Wallpaper Engine assets, and SKWD_WE_XRAY_PROJECT"]
+fn hidden_animated_layer_remains_available_to_xray_on_hover() {
+    let dir = std::path::PathBuf::from(
+        std::env::var("SKWD_WE_XRAY_PROJECT").expect("ROG Workshop project path"),
+    );
+    let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
+    let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
+    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let mut group = build_group(&sd, &mut model, false, &[(1280, 720)], FillMode::Fit).unwrap();
+    assert!(group.scripts.is_some());
+    let source = group.fx.iter().find(|fx| fx.layer_id == "13").unwrap();
+    assert!(!source.sampled_targets.is_empty());
+    let mut counts = Vec::new();
+    for (index, position) in [[0.0, 0.0], [0.5, 0.5], [0.0, 0.0]].into_iter().enumerate() {
+        group.mouse.update(index as u64 + 1, position, [false; 3], (1280, 720), FillMode::Fit);
+        group.compose(index as f32 / 15.0, 1.0 / 15.0).unwrap();
+        let (w, h, pixels) = group.read_canvas().unwrap();
+        let count = pixels
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(index, rgba)| {
+                let (x, y) = (*index as u32 % w, *index as u32 / w);
+                x > w * 35 / 100
+                    && x < w * 65 / 100
+                    && y > h * 40 / 100
+                    && y < h * 62 / 100
+                    && rgba[0] > 120
+                    && u16::from(rgba[0]) > u16::from(rgba[1]) * 2
+                    && f32::from(rgba[0]) > f32::from(rgba[2]) * 1.25
+            })
+            .count();
+        counts.push(count);
+    }
+    group.destroy();
+    assert!(counts[1] > counts[0] + 250, "reveal on hover: {counts:?}");
+    assert!(counts[1] > counts[2] + 250, "clear on departure: {counts:?}");
+}
+
 fn test_layer(visible: bool, effects: usize) -> paper_scene::model::Layer {
     let mut layer = paper_scene::model::Layer {
         id: String::new(),

@@ -49,6 +49,7 @@ pub struct Layer {
 }
 
 pub struct ParticleLayer {
+    pub parallax: [f32; 2],
     pub id: String,
     pub visible: bool,
     pub system: crate::particles::ParticleSystem,
@@ -164,19 +165,26 @@ impl Parallax {
             return None;
         }
         let amount = number(general.and_then(|top| top.get("cameraparallaxamount")), props, 0.5);
-        let eye = vec3(scene.get("camera").and_then(|camera| camera.get("eye")), props)
-            .unwrap_or((0.0, 0.0, 0.0));
-        Some(Self { amount, focus: (canvas.0 * 0.5 + eye.0, canvas.1 * 0.5 + eye.1) })
+        Some(Self { amount, focus: (canvas.0 * 0.5, canvas.1 * 0.5) })
     }
 
     fn offset(&self, root: &Value, props: &Properties) -> (f32, f32) {
-        let depth = vec2_or(root.get("parallaxDepth"), props, (0.0, 0.0));
+        let depth = parallax_depth(root, props);
         let origin = vec3(root.get("origin"), props).unwrap_or((0.0, 0.0, 0.0));
         (
             (origin.0 - self.focus.0) * self.amount * depth.0,
             (origin.1 - self.focus.1) * self.amount * depth.1,
         )
     }
+}
+
+fn parallax_depth(root: &Value, props: &Properties) -> (f32, f32) {
+    let default = if root.get("text").is_some() || root.get("particle").is_some() {
+        (1.0, 1.0)
+    } else {
+        (0.0, 0.0)
+    };
+    vec2_or(root.get("parallaxDepth"), props, default)
 }
 
 fn ancestor_chain<'a>(
@@ -232,7 +240,7 @@ fn layer_mouse(
 ) -> crate::mouse::LayerMouse {
     let chain = ancestor_chain(object, by_id);
     let root = chain.last().copied().unwrap_or(object);
-    let depth = vec2_or(root.get("parallaxDepth"), props, (0.0, 0.0));
+    let depth = parallax_depth(root, props);
     crate::mouse::LayerMouse {
         parallax: if parallax.amount != 0.0 && parallax.influence != 0.0 {
             [depth.0, depth.1]
@@ -791,11 +799,15 @@ fn load_with_project(
         let Some(model_path) = object.get("image").and_then(Value::as_str) else {
             if let Some(path) = object.get("particle").and_then(Value::as_str) {
                 match crate::particles::load(pkg, assets, object, path) {
-                    Some(system) => {
+                    Some(mut system) => {
+                        let state =
+                            script::particle_frame(object, &by_id, props, parallax.as_ref());
+                        state.apply(&mut system);
                         if let Some(texture) = &system.texture {
                             add_texture_bytes(&mut texture_bytes, texture.payload_bytes())?;
                         }
                         particles.push(ParticleLayer {
+                            parallax: state.parallax,
                             id: id.clone(),
                             visible,
                             depth: system.origin.2,

@@ -166,8 +166,12 @@ impl Group {
             &scripts.host.properties,
         );
         for (group, state) in self.particles.iter_mut().zip(particle_states) {
+            if group.parent.is_some() {
+                continue;
+            }
             if let Some(state) = state {
                 state.apply(&mut group.system);
+                group.parallax = state.parallax;
                 group.visible = state.visible;
             }
         }

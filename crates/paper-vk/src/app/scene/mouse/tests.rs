@@ -412,3 +412,17 @@ fn parallax_layer_translation_matches_proton_and_zero_depth_pixels_stay_fixed() 
         }
     }
 }
+
+#[test]
+fn particle_parallax_moves_in_world_axes_and_preserves_pointer_attachment() {
+    let mut mouse = mouse();
+    mouse.position = [0.25, 0.75];
+    mouse.config = Parallax { amount: 0.5, influence: 0.5, delay: 0.0, ..Default::default() };
+    mouse.displacement = mouse.config.displacement(mouse.position, [0.0; 2], 1.0 / 60.0);
+    let offset = mouse.particle_offset([1.0; 2]);
+    assert_eq!(offset, [120.0, 67.5]);
+    let pointer = mouse.particle_pointer(offset);
+    assert_eq!(pointer, [360.0, 202.5]);
+    assert_eq!([pointer[0] + offset[0], pointer[1] + offset[1]], [480.0, 270.0]);
+    assert_eq!(mouse.particle_offset([0.0; 2]), [0.0; 2]);
+}

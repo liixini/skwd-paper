@@ -25,6 +25,7 @@ pub struct Frame {
 }
 
 pub struct ParticleFrame {
+    pub parallax: [f32; 2],
     pub visible: bool,
     origin: (f32, f32, f32),
     angle: f32,
@@ -52,21 +53,35 @@ pub fn particle_frames<'a>(
     let parallax = Parallax::of(scene, canvas, props);
     ids.map(|id| {
         let object = by_id.get(id)?;
-        let transform = resolve_transform(object, &by_id, props, parallax.as_ref());
-        let ancestors = ancestor_chain(object, &by_id);
-        let visible = ancestors.iter().all(|node| truthy(node.get("visible"), props, true));
-        let scale_z = ancestors
-            .iter()
-            .map(|node| vec3(node.get("scale"), props).map_or(1.0, |scale| scale.2))
-            .product();
-        Some(ParticleFrame {
-            visible,
-            origin: transform.origin,
-            angle: transform.angle,
-            scale: [transform.scale.0, transform.scale.1, scale_z],
-        })
+        Some(particle_frame(object, &by_id, props, parallax.as_ref()))
     })
     .collect()
+}
+
+pub(super) fn particle_frame(
+    object: &Value,
+    by_id: &std::collections::HashMap<String, &Value>,
+    props: &Properties,
+    parallax: Option<&Parallax>,
+) -> ParticleFrame {
+    let transform = resolve_transform(object, by_id, props, parallax);
+    let ancestors = ancestor_chain(object, by_id);
+    let visible = ancestors.iter().all(|node| truthy(node.get("visible"), props, true));
+    let scale_z = ancestors
+        .iter()
+        .map(|node| vec3(node.get("scale"), props).map_or(1.0, |scale| scale.2))
+        .product();
+    ParticleFrame {
+        parallax: {
+            let root = ancestors.last().copied().unwrap_or(object);
+            let depth = super::parallax_depth(root, props);
+            [depth.0, depth.1]
+        },
+        visible,
+        origin: transform.origin,
+        angle: transform.angle,
+        scale: [transform.scale.0, transform.scale.1, scale_z],
+    }
 }
 
 impl Layout {

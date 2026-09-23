@@ -6,6 +6,10 @@ use std::collections::BTreeMap;
 mod audio;
 pub use audio::AudioResponse;
 
+#[path = "particles_children.rs"]
+mod children;
+pub use children::Followers;
+
 const MAX_PARTICLES: usize = 32_768;
 pub const TRAIL_POINTS: usize = 12;
 const MAX_PREWARM_STEPS: usize = 600;
@@ -97,13 +101,12 @@ pub struct ControlPoint {
 
 fn control_points(doc: &Value) -> [ControlPoint; 8] {
     let mut points = [ControlPoint::default(); 8];
-    for entry in doc.get("controlpoint").and_then(Value::as_array).into_iter().flatten() {
-        if let Some(point) =
-            entry.get("id").and_then(Value::as_u64).and_then(|id| points.get_mut(id as usize))
-        {
-            point.flags = num_of(entry.get("flags"), 0.0) as u32;
-            point.offset = vec3_of(entry.get("offset"), [0.0; 3]);
-        }
+    for (point, entry) in points
+        .iter_mut()
+        .zip(doc.get("controlpoint").and_then(Value::as_array).into_iter().flatten())
+    {
+        point.flags = num_of(entry.get("flags"), 0.0) as u32;
+        point.offset = vec3_of(entry.get("offset"), [0.0; 3]);
     }
     points
 }
@@ -252,29 +255,65 @@ pub struct Oscillator {
 }
 
 pub enum Operator {
-    Movement { gravity: [f32; 3], drag: f32 },
-    AlphaFade { fade_in: f32, fade_out: f32 },
-    SizeChange { start: f32, end: f32, start_time: f32, end_time: f32 },
-    AlphaChange { start: f32, end: f32, start_time: f32, end_time: f32 },
-    ColorChange { start: [f32; 3], end: [f32; 3], start_time: f32, end_time: f32 },
+    Movement {
+        gravity: [f32; 3],
+        drag: f32,
+    },
+    AlphaFade {
+        fade_in: f32,
+        fade_out: f32,
+    },
+    SizeChange {
+        start: f32,
+        end: f32,
+        start_time: f32,
+        end_time: f32,
+    },
+    AlphaChange {
+        start: f32,
+        end: f32,
+        start_time: f32,
+        end_time: f32,
+    },
+    ColorChange {
+        start: [f32; 3],
+        end: [f32; 3],
+        start_time: f32,
+        end_time: f32,
+    },
     OscillateAlpha(Oscillator),
     OscillatePosition(Oscillator),
     OscillateSize(Oscillator),
-    AngularMovement { force: f32, drag: f32 },
-    Turbulence { scale: f32, speed: (f32, f32), time_scale: f32, mask: [f32; 3] },
-    ControlPointAttract { control_point: usize, origin: [f32; 3], scale: f32, threshold: f32 },
+    AngularMovement {
+        force: f32,
+        drag: f32,
+    },
+    Turbulence {
+        scale: f32,
+        speed: (f32, f32),
+        phase_range: f32,
+        time_scale: f32,
+        mask: [f32; 3],
+    },
+    ControlPointAttract {
+        control_point: usize,
+        scale: f32,
+        threshold: f32,
+        flags: u32,
+        delete_threshold: f32,
+    },
     Vortex(Vortex),
 }
 
-fn oscillator(entry: &Value, scale_fallback: f32) -> Oscillator {
+fn oscillator(entry: &Value, frequency_max: f32, scale: (f32, f32)) -> Oscillator {
     let frequency_min = num_of(entry.get("frequencymin"), 1.0);
-    let scale_min = num_of(entry.get("scalemin"), scale_fallback);
+    let scale_min = num_of(entry.get("scalemin"), scale.0);
     let phase_min = num_of(entry.get("phasemin"), 0.0);
     Oscillator {
-        frequency: (frequency_min, num_of(entry.get("frequencymax"), frequency_min)),
-        scale: (scale_min, num_of(entry.get("scalemax"), scale_min)),
-        phase: (phase_min, num_of(entry.get("phasemax"), phase_min)),
-        mask: vec3_of(entry.get("mask"), [1.0, 1.0, 1.0]),
+        frequency: (frequency_min, num_of(entry.get("frequencymax"), frequency_max)),
+        scale: (scale_min, num_of(entry.get("scalemax"), scale.1)),
+        phase: (phase_min, num_of(entry.get("phasemax"), std::f32::consts::TAU)),
+        mask: vec3_of(entry.get("mask"), [1.0, 1.0, 0.0]),
     }
 }
 
@@ -287,27 +326,71 @@ impl Oscillator {
         )
     }
 
-    fn wave(&self, age: f32, seed: f32) -> f32 {
+    fn modulation(&self, age: f32, seed: f32) -> f32 {
         let (frequency, phase, _) = self.params(seed);
-        (age * frequency + phase).sin()
+        self.scale.0
+            + (self.scale.1 - self.scale.0)
+                * seed
+                * ((age + phase) * frequency).sin().mul_add(0.5, 0.5)
     }
 
-    fn velocity(&self, age: f32, seed: f32) -> f32 {
+    fn displacement(&self, age: f32, dt: f32, seed: f32) -> [f32; 3] {
         let (frequency, phase, amplitude) = self.params(seed);
-        amplitude * frequency * (age * frequency + phase).cos()
-    }
-
-    fn amplitude(&self, seed: f32) -> f32 {
-        self.params(seed).2
+        let delta = |offset: f32| {
+            (((age + phase + offset) * frequency).sin()
+                - ((age + phase + offset - dt) * frequency).sin())
+                * amplitude
+        };
+        [delta(0.0), delta(seed * std::f32::consts::TAU), delta(0.0)]
     }
 }
 
-fn flow(pos: [f32; 3], scale: f32, time: f32) -> (f32, f32) {
-    let (x, y) = (pos[0] * scale, pos[1] * scale);
-    let a = (x + time).sin() + (y * 1.3 - time * 0.7).cos();
-    let b = (y + time * 1.1).sin() + (x * 0.9 + time * 0.6).cos();
-    let len = a.hypot(b);
-    if len < 1.0e-5 { (0.0, 0.0) } else { (a / len, b / len) }
+fn simplex([x, y, z]: [f32; 3]) -> f32 {
+    let skew = (x + y + z) / 3.0;
+    let cells = [(x + skew).floor(), (y + skew).floor(), (z + skew).floor()];
+    let unskew = (cells[0] + cells[1] + cells[2]) / 6.0;
+    let p = [x - cells[0] + unskew, y - cells[1] + unskew, z - cells[2] + unskew];
+    let first = [
+        usize::from(p[0] >= p[1] && p[0] >= p[2]),
+        usize::from(p[1] > p[0] && p[1] > p[2]),
+        usize::from(p[2] > p[0] && p[2] > p[1]),
+    ];
+    let second = [
+        usize::from(p[0] >= p[1] || p[0] >= p[2]),
+        usize::from(p[1] > p[0] || p[1] >= p[2]),
+        usize::from(p[2] > p[0] || p[2] > p[1]),
+    ];
+    let cell = cells.map(|value| (value as i64 & 255) as usize);
+    let gradients = [
+        [1.0, 1.0, 0.0],
+        [-1.0, 1.0, 0.0],
+        [1.0, -1.0, 0.0],
+        [-1.0, -1.0, 0.0],
+        [1.0, 0.0, 1.0],
+        [-1.0, 0.0, 1.0],
+        [1.0, 0.0, -1.0],
+        [-1.0, 0.0, -1.0],
+        [0.0, 1.0, 1.0],
+        [0.0, -1.0, 1.0],
+        [0.0, 1.0, -1.0],
+        [0.0, -1.0, -1.0],
+    ];
+    let mut sum = 0.0;
+    for (corner, offset) in [[0; 3], first, second, [1; 3]].into_iter().enumerate() {
+        let delta = std::array::from_fn::<_, 3, _>(|axis| {
+            p[axis] - offset[axis] as f32 + corner as f32 / 6.0
+        });
+        let weight = (0.6 - dot3(delta, delta)).max(0.0);
+        let hash = perm(
+            cell[0]
+                + offset[0]
+                + perm(
+                    cell[1] + offset[1] + perm(cell[2] + if corner == 3 { 0 } else { offset[2] }),
+                ),
+        ) % 12;
+        sum += dot3(gradients[hash], delta) * weight.powi(4);
+    }
+    sum * 32.0
 }
 
 const PERLIN_PERM: [u8; 256] = [
@@ -330,89 +413,17 @@ fn perm(index: usize) -> usize {
     usize::from(PERLIN_PERM[index & 255])
 }
 
-fn perlin_grad(hash: usize, x: f64, y: f64, z: f64) -> f64 {
-    match hash & 0xF {
-        0x0 | 0xC => x + y,
-        0x1 => -x + y,
-        0x2 => x - y,
-        0x3 => -x - y,
-        0x4 => x + z,
-        0x5 => -x + z,
-        0x6 => x - z,
-        0x7 => -x - z,
-        0x8 => y + z,
-        0x9 | 0xD => -y + z,
-        0xA => y - z,
-        0xB | 0xF => -y - z,
-        _ => y - x,
-    }
-}
-
-fn perlin_ease(t: f64) -> f64 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-}
-
-fn perlin(x: f64, y: f64, z: f64) -> f64 {
-    let cell = |v: f64| (v.floor() as i64 & 255) as usize;
-    let (xi, yi, zi) = (cell(x), cell(y), cell(z));
-    let (x, y, z) = (x - x.floor(), y - y.floor(), z - z.floor());
-    let (u, v, w) = (perlin_ease(x), perlin_ease(y), perlin_ease(z));
-    let a = perm(xi) + yi;
-    let (aa, ab) = (perm(a) + zi, perm(a + 1) + zi);
-    let b = perm(xi + 1) + yi;
-    let (ba, bb) = (perm(b) + zi, perm(b + 1) + zi);
-    let lerp = |t: f64, a: f64, b: f64| a + t * (b - a);
-    lerp(
-        w,
-        lerp(
-            v,
-            lerp(u, perlin_grad(perm(aa), x, y, z), perlin_grad(perm(ba), x - 1.0, y, z)),
-            lerp(
-                u,
-                perlin_grad(perm(ab), x, y - 1.0, z),
-                perlin_grad(perm(bb), x - 1.0, y - 1.0, z),
-            ),
-        ),
-        lerp(
-            v,
-            lerp(
-                u,
-                perlin_grad(perm(aa + 1), x, y, z - 1.0),
-                perlin_grad(perm(ba + 1), x - 1.0, y, z - 1.0),
-            ),
-            lerp(
-                u,
-                perlin_grad(perm(ab + 1), x, y - 1.0, z - 1.0),
-                perlin_grad(perm(bb + 1), x - 1.0, y - 1.0, z - 1.0),
-            ),
-        ),
-    )
-}
-
-fn perlin3(p: [f64; 3]) -> [f64; 3] {
-    [
-        perlin(p[0], p[1], p[2]),
-        perlin(p[0] + 89.2, p[1] + 33.1, p[2] + 57.3),
-        perlin(p[0] + 100.3, p[1] + 120.1, p[2] + 142.2),
-    ]
-}
-
-fn curl_noise(p: [f32; 3]) -> [f32; 3] {
-    const E: f64 = 1e-4;
-    let p = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
-    let sample = |axis: usize, sign: f64| {
-        let mut q = p;
-        q[axis] += sign * E;
-        perlin3(q)
+fn simplex_one(value: f32) -> f32 {
+    let cell = value.floor();
+    let fraction = value - cell;
+    let gradient = |offset: usize, distance: f32| {
+        let hash = perm((cell as i64 & 255) as usize + offset);
+        let magnitude = (hash & 7) as f32 + 1.0;
+        let gradient = if hash & 8 == 0 { magnitude } else { -magnitude };
+        let weight = 1.0 - distance * distance;
+        gradient * distance * weight.powi(4)
     };
-    let (x0, x1) = (sample(0, -1.0), sample(0, 1.0));
-    let (y0, y1) = (sample(1, -1.0), sample(1, 1.0));
-    let (z0, z1) = (sample(2, -1.0), sample(2, 1.0));
-    [
-        (((y1[2] - y0[2]) - (z1[1] - z0[1])) / (2.0 * E)) as f32,
-        (((z1[0] - z0[0]) - (x1[2] - x0[2])) / (2.0 * E)) as f32,
-        (((x1[1] - x0[1]) - (y1[0] - y0[0])) / (2.0 * E)) as f32,
-    ]
+    (gradient(0, fraction) + gradient(1, fraction - 1.0)) * 0.395
 }
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -439,30 +450,10 @@ fn rotate_axis(v: [f32; 3], axis: [f32; 3], angle: f32) -> [f32; 3] {
     ]
 }
 
-fn turbulent_direction(noise: [f32; 3], init: &Turbulent, three_d: bool) -> [f32; 3] {
-    let forward = normalize3(init.forward).unwrap_or([0.0, 1.0, 0.0]);
+fn turbulent_direction(sample: f32, init: &Turbulent) -> [f32; 3] {
     let right = normalize3(init.right).unwrap_or([0.0, 0.0, 1.0]);
-    let mut dir = normalize3(noise).unwrap_or(forward);
-    if init.scale < 2.0 {
-        let max_angle = init.scale * 0.5;
-        let angle = dot3(dir, forward).clamp(-1.0, 1.0).acos() / std::f32::consts::PI;
-        if max_angle <= 1e-4 {
-            dir = forward;
-        } else if angle > max_angle {
-            dir = match normalize3(cross3(dir, forward)) {
-                Some(axis) => rotate_axis(dir, axis, (angle - max_angle) * std::f32::consts::PI),
-                None => forward,
-            };
-        }
-    }
-    if init.offset.abs() > 1e-4 {
-        dir = rotate_axis(dir, right, init.offset);
-    }
-    if !three_d {
-        dir[2] = 0.0;
-        dir = normalize3(dir).unwrap_or(forward);
-    }
-    dir
+    let angle = simplex_one(sample) * std::f32::consts::PI * init.scale + init.offset;
+    rotate_axis(init.forward, right, angle)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -495,6 +486,8 @@ pub enum ParticleBlend {
 }
 
 pub struct ParticleSystem {
+    pub children: Vec<ParticleSystem>,
+    pub follow_limit: Option<usize>,
     pub renderer: Renderer,
     pub trail: Trail,
     pub animation: Animation,
@@ -516,6 +509,7 @@ pub struct ParticleSystem {
     pub scale3: [f32; 3],
     pub tint: [f32; 3],
     pub alpha: f32,
+    pub count_scale: f32,
     pub rate_scale: f32,
     pub size_scale: f32,
     pub grab_slot: Option<usize>,
@@ -620,6 +614,7 @@ pub fn pack_sprites(
 
 #[derive(Clone, Copy)]
 pub struct Particle {
+    pub id: u64,
     pub pos: [f32; 3],
     pub vel: [f32; 3],
     pub size: f32,
@@ -645,7 +640,8 @@ fn parse_emitter(entry: &Value) -> Option<Emitter> {
                 .get("controlpoint")
                 .and_then(Value::as_u64)
                 .filter(|id| *id < 8)
-                .map(|id| id as usize),
+                .map(|id| id as usize)
+                .or(Some(0)),
             origin,
             directions: vec3_of(entry.get("directions"), [1.0, 1.0, 1.0]),
             sign: vec3_of(entry.get("sign"), [0.0, 0.0, 0.0]),
@@ -660,7 +656,8 @@ fn parse_emitter(entry: &Value) -> Option<Emitter> {
                 .get("controlpoint")
                 .and_then(Value::as_u64)
                 .filter(|id| *id < 8)
-                .map(|id| id as usize),
+                .map(|id| id as usize)
+                .or(Some(0)),
             origin,
             extent: vec3_of(entry.get("distancemax"), [0.0, 0.0, 0.0]),
             rate,
@@ -698,7 +695,7 @@ fn parse_initializer(entry: &Value) -> Option<Initializer> {
         }),
         "rotationrandom" => Some(Initializer::Rotation {
             min: vec3_of(min, [0.0, 0.0, 0.0]),
-            max: vec3_of(max, [0.0, 0.0, 0.0]),
+            max: vec3_of(max, [0.0, 0.0, std::f32::consts::TAU]),
         }),
         "angularvelocityrandom" => Some(Initializer::AngularVelocity {
             min: vec3_of(min, [0.0, 0.0, 0.0]),
@@ -736,48 +733,53 @@ fn parse_operator(entry: &Value) -> Option<Operator> {
             drag: num_of(entry.get("drag"), 0.0),
         }),
         "alphafade" => Some(Operator::AlphaFade {
-            fade_in: num_of(entry.get("fadeintime"), 0.1).max(0.0),
-            fade_out: num_of(entry.get("fadeouttime"), 0.9).max(0.0),
+            fade_in: num_of(entry.get("fadeintime"), 0.5).max(0.0),
+            fade_out: num_of(entry.get("fadeouttime"), 0.5).max(0.0),
         }),
         "sizechange" => Some(Operator::SizeChange {
             start: num_of(entry.get("startvalue"), 1.0),
-            end: num_of(entry.get("endvalue"), 1.0),
+            end: num_of(entry.get("endvalue"), 0.0),
             start_time: num_of(entry.get("starttime"), 0.0),
             end_time: num_of(entry.get("endtime"), 1.0),
         }),
         "alphachange" => Some(Operator::AlphaChange {
-            start: num_of(entry.get("startvalue"), 0.0),
-            end: num_of(entry.get("endvalue"), 1.0),
+            start: num_of(entry.get("startvalue"), 1.0),
+            end: num_of(entry.get("endvalue"), 0.0),
             start_time: num_of(entry.get("starttime"), 0.0),
             end_time: num_of(entry.get("endtime"), 1.0),
         }),
         "colorchange" => Some(Operator::ColorChange {
             start: vec3_of(entry.get("startvalue"), [1.0, 1.0, 1.0]),
-            end: vec3_of(entry.get("endvalue"), [1.0, 1.0, 1.0]),
+            end: vec3_of(entry.get("endvalue"), [0.0, 0.0, 0.0]),
             start_time: num_of(entry.get("starttime"), 0.0),
             end_time: num_of(entry.get("endtime"), 1.0),
         }),
-        "oscillatealpha" => Some(Operator::OscillateAlpha(oscillator(entry, 0.5))),
-        "oscillateposition" => Some(Operator::OscillatePosition(oscillator(entry, 0.0))),
-        "oscillatesize" => Some(Operator::OscillateSize(oscillator(entry, 1.0))),
+        "oscillatealpha" => Some(Operator::OscillateAlpha(oscillator(entry, 10.0, (0.0, 1.0)))),
+        "oscillateposition" => {
+            Some(Operator::OscillatePosition(oscillator(entry, 5.0, (0.0, 10.0))))
+        }
+        "oscillatesize" => Some(Operator::OscillateSize(oscillator(entry, 10.0, (0.8, 1.2)))),
         "angularmovement" => Some(Operator::AngularMovement {
             force: vec3_of(entry.get("force"), [0.0, 0.0, 0.0])[2],
             drag: num_of(entry.get("drag"), 0.0),
         }),
         "turbulence" => {
-            let speed_min = num_of(entry.get("speedmin"), 0.0);
+            let speed_min = num_of(entry.get("speedmin"), 500.0);
             Some(Operator::Turbulence {
                 scale: num_of(entry.get("scale"), 0.01),
-                speed: (speed_min, num_of(entry.get("speedmax"), speed_min)),
-                time_scale: num_of(entry.get("timescale"), 1.0),
-                mask: vec3_of(entry.get("mask"), [1.0, 1.0, 1.0]),
+                speed: (speed_min, num_of(entry.get("speedmax"), 1000.0)),
+                phase_range: num_of(entry.get("phasemax"), 0.0)
+                    - num_of(entry.get("phasemin"), 0.0),
+                time_scale: num_of(entry.get("timescale"), 20.0),
+                mask: vec3_of(entry.get("mask"), [1.0, 1.0, 0.0]),
             })
         }
         "controlpointattract" => Some(Operator::ControlPointAttract {
             control_point: num_of(entry.get("controlpoint"), 0.0).clamp(0.0, 7.0) as usize,
-            origin: vec3_of(entry.get("origin"), [0.0, 0.0, 0.0]),
-            scale: num_of(entry.get("scale"), 0.0),
-            threshold: num_of(entry.get("threshold"), 0.0).max(1.0),
+            scale: num_of(entry.get("scale"), 512.0),
+            threshold: num_of(entry.get("threshold"), 512.0),
+            flags: num_of(entry.get("flags"), 2.0) as u32,
+            delete_threshold: num_of(entry.get("deletethreshold"), 15.0),
         }),
         "vortex" => {
             let flags = num_of(entry.get("flags"), 0.0) as u32;
@@ -927,6 +929,21 @@ pub fn load(
     object: &Value,
     path: &str,
 ) -> Option<ParticleSystem> {
+    load_inner(pkg, assets, object, path, 0, &mut 64)
+}
+
+fn load_inner(
+    pkg: &Package,
+    assets: &crate::effects::Assets,
+    object: &Value,
+    path: &str,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<ParticleSystem> {
+    if depth >= 8 || *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
     let mut source = Source::Pkg(pkg, assets);
     let mut doc = source.json(path);
     if doc.is_none()
@@ -1010,11 +1027,20 @@ pub fn load(
         }
     }
     for operator in &mut operators {
-        if let Operator::Vortex(vortex) = operator {
-            vortex.speed.0 *= speed_scale;
-            vortex.speed.1 *= speed_scale;
-            vortex.center_force *= speed_scale;
-            vortex.ring_pull.1 *= speed_scale;
+        match operator {
+            Operator::Movement { gravity, .. } => {
+                for axis in gravity {
+                    *axis *= speed_scale;
+                }
+            }
+            Operator::ControlPointAttract { scale, .. } => *scale *= speed_scale,
+            Operator::Vortex(vortex) => {
+                vortex.speed.0 *= speed_scale;
+                vortex.speed.1 *= speed_scale;
+                vortex.center_force *= speed_scale;
+                vortex.ring_pull.1 *= speed_scale;
+            }
+            _ => {}
         }
     }
     let origin = vec3_of(object.get("origin"), [0.0, 0.0, 0.0]);
@@ -1040,6 +1066,22 @@ pub fn load(
             .map(|(slot, _)| *slot)
     });
     Some(ParticleSystem {
+        children: doc
+            .get("children")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|child| {
+                let path = child.get("name")?.as_str()?;
+                let mut child = child.clone();
+                if let Some(overrides) = object.get("instanceoverride") {
+                    child["instanceoverride"] = overrides.clone();
+                }
+                load_inner(pkg, assets, &child, path, depth + 1, budget)
+            })
+            .collect(),
+        follow_limit: (object.get("type").and_then(Value::as_str) == Some("eventfollow"))
+            .then(|| num_of(object.get("maxcount"), 20.0).clamp(0.0, 256.0) as usize),
         renderer,
         trail,
         animation,
@@ -1067,6 +1109,7 @@ pub fn load(
         ],
         tint,
         alpha: over.map_or(1.0, |value| num_bound(value.get("alpha"), props, 1.0)).clamp(0.0, 1.0),
+        count_scale,
         rate_scale: over
             .map_or(1.0, |value| num_bound(value.get("rate"), props, 1.0))
             .clamp(0.0, 10.0),
@@ -1088,6 +1131,9 @@ pub struct Sim {
     time: f32,
     ribbon: bool,
     sequence: usize,
+    next_id: u64,
+    emitting: bool,
+    emission_offset: [f32; 3],
 }
 
 impl Sim {
@@ -1104,6 +1150,9 @@ impl Sim {
             time: 0.0,
             ribbon: false,
             sequence: 0,
+            next_id: 0,
+            emitting: true,
+            emission_offset: [0.0; 3],
         }
     }
 
@@ -1147,6 +1196,7 @@ impl Sim {
 
     fn emit(&mut self, system: &ParticleSystem, emitter_index: Option<usize>) {
         let mut particle = Particle {
+            id: self.next_id,
             pos: [0.0, 0.0, 0.0],
             vel: [0.0, 0.0, 0.0],
             size: 10.0,
@@ -1160,6 +1210,7 @@ impl Sim {
             lifetime: 1.0,
             phase: self.rng.unit() * std::f32::consts::TAU,
         };
+        self.next_id = self.next_id.wrapping_add(1);
         let index =
             emitter_index.unwrap_or_else(|| (self.rng.next_u32() as usize) % system.emitters.len());
         let emitter = &system.emitters[index];
@@ -1213,16 +1264,10 @@ impl Sim {
                     ];
                 }
                 Initializer::TurbulentVelocity(turbulent) => {
-                    let speed = self.rng.range(turbulent.speed.0, turbulent.speed.1);
                     let phase = self.rng.range(turbulent.phase.0, turbulent.phase.1);
-                    let shift = self.time * turbulent.time_scale;
-                    let sample = [
-                        particle.pos[0] * 0.1 + shift + phase,
-                        particle.pos[1] * 0.1 + shift + phase * 0.7,
-                        particle.pos[2] * 0.1 + shift + phase * 1.3,
-                    ];
                     let dir =
-                        turbulent_direction(curl_noise(sample), turbulent, system.perspective);
+                        turbulent_direction((self.time + phase) * turbulent.time_scale, turbulent);
+                    let speed = self.rng.range(turbulent.speed.0, turbulent.speed.1);
                     let k = if system.world { system.scale3 } else { [1.0; 3] };
                     for axis in 0..3 {
                         particle.vel[axis] += dir[axis] * speed * k[axis];
@@ -1255,6 +1300,9 @@ impl Sim {
                 }
             }
         }
+        for (pos, offset) in particle.pos.iter_mut().zip(self.emission_offset) {
+            *pos += offset;
+        }
         if self.ribbon {
             let point = [particle.pos[0], particle.pos[1]];
             self.history.push([point; TRAIL_POINTS]);
@@ -1273,7 +1321,10 @@ impl Sim {
         left: &[f32],
         right: &[f32],
     ) {
-        let dt = dt.clamp(0.0, 0.25);
+        let frame_dt = dt.clamp(0.0, 0.25);
+        let drag_scale = (0.025 / frame_dt.max(f32::EPSILON)).min(1.0).powf(0.7);
+        let substeps = if frame_dt >= 0.05 { 2 } else { 1 };
+        let dt = frame_dt * system.rate_scale;
         if dt == 0.0 && self.burst_done {
             return;
         }
@@ -1283,7 +1334,10 @@ impl Sim {
         let capacity = Self::capacity(system);
         if !self.burst_done {
             self.burst_done = true;
-            let burst: u32 = system.emitters.iter().map(Emitter::instantaneous).sum();
+            self.pending *= system.count_scale;
+            let burst = (system.emitters.iter().map(Emitter::instantaneous).sum::<u32>() as f32
+                * system.count_scale)
+                .round() as u32;
             if burst > 0 || system.emitters.iter().all(|emitter| emitter.audio().is_some()) {
                 self.pending = 0.0;
             }
@@ -1294,9 +1348,12 @@ impl Sim {
                 self.emit(system, None);
             }
         }
-        let rate: f32 =
-            system.emitters.iter().map(|emitter| emitter.active_rate(left, right)).sum();
-        self.pending += rate * system.rate_scale * dt;
+        let rate: f32 = if self.emitting {
+            system.emitters.iter().map(|emitter| emitter.active_rate(left, right)).sum()
+        } else {
+            0.0
+        };
+        self.pending += rate * system.count_scale * dt;
         while self.pending >= 1.0 {
             self.pending -= 1.0;
             if self.particles.len() < capacity {
@@ -1316,157 +1373,205 @@ impl Sim {
         }
         let time = self.time;
         for particle in &mut self.particles {
+            let previous_position = particle.pos;
             particle.age += dt;
             let life = (particle.age / particle.lifetime).clamp(0.0, 1.0);
             let seed = particle.phase / std::f32::consts::TAU;
-            particle.alpha = particle.base_alpha;
-            particle.size = particle.base_size;
-            for op in &system.operators {
-                match op {
-                    Operator::Movement { gravity, drag } => {
-                        let damp = (1.0 - drag * dt).clamp(0.0, 1.0);
-                        for ((vel, pos), gravity) in
-                            particle.vel.iter_mut().zip(particle.pos.iter_mut()).zip(gravity.iter())
-                        {
-                            *vel = *vel * damp + gravity * dt;
-                            *pos += *vel * dt;
-                        }
-                    }
-                    Operator::AlphaFade { fade_in, fade_out } => {
-                        if *fade_in > 0.0 && life < *fade_in {
-                            particle.alpha *= life / *fade_in;
-                        }
-                        if *fade_out < 1.0 && life > *fade_out {
-                            let span = (1.0 - *fade_out).max(f32::EPSILON);
-                            particle.alpha *= ((1.0 - life) / span).clamp(0.0, 1.0);
-                        }
-                    }
-                    Operator::SizeChange { start, end, start_time, end_time } => {
-                        let span = (*end_time - *start_time).max(f32::EPSILON);
-                        let t = ((life - *start_time) / span).clamp(0.0, 1.0);
-                        particle.size *= start + (end - start) * t;
-                    }
-                    Operator::AlphaChange { start, end, start_time, end_time } => {
-                        let span = (*end_time - *start_time).max(f32::EPSILON);
-                        let t = ((life - *start_time) / span).clamp(0.0, 1.0);
-                        particle.alpha *= start + (end - start) * t;
-                    }
-                    Operator::ColorChange { start, end, start_time, end_time } => {
-                        let span = (*end_time - *start_time).max(f32::EPSILON);
-                        let t = ((life - *start_time) / span).clamp(0.0, 1.0);
-                        for ((channel, start), end) in
-                            particle.color.iter_mut().zip(start.iter()).zip(end.iter())
-                        {
-                            *channel = start + (end - start) * t;
-                        }
-                    }
-                    Operator::OscillateAlpha(osc) => {
-                        let wave = osc.wave(life, seed);
-                        let amount = osc.amplitude(seed);
-                        particle.alpha *= (1.0 - amount * 0.5 * (1.0 - wave)).clamp(0.0, 1.0);
-                    }
-                    Operator::OscillateSize(osc) => {
-                        let wave = osc.wave(particle.age, seed);
-                        let amount = osc.amplitude(seed);
-                        particle.size *= (1.0 + amount * wave).max(0.0);
-                    }
-                    Operator::OscillatePosition(osc) => {
-                        let velocity = osc.velocity(particle.age - dt, seed);
-                        let k = if system.world { system.scale3 } else { [1.0; 3] };
-                        for ((pos, mask), k) in
-                            particle.pos.iter_mut().zip(osc.mask.iter()).zip(k.iter())
-                        {
-                            *pos += velocity * dt * mask * k;
-                        }
-                    }
-                    Operator::AngularMovement { force, drag } => {
-                        particle.angular += force * dt;
-                        particle.angular *= (1.0 - drag * dt).clamp(0.0, 1.0);
-                    }
-                    Operator::Turbulence { scale, speed, time_scale, mask } => {
-                        let (dx, dy) = flow(particle.pos, *scale, time * *time_scale);
-                        let strength = speed.0 + (speed.1 - speed.0) * seed;
-                        particle.pos[0] += dx * strength * mask[0] * dt;
-                        particle.pos[1] += dy * strength * mask[1] * dt;
-                    }
-                    Operator::ControlPointAttract { control_point, origin, scale, threshold } => {
-                        let point =
-                            self.control_points.get(*control_point).copied().unwrap_or([0.0; 3]);
-                        let dx = point[0] + origin[0] - particle.pos[0];
-                        let dy = point[1] + origin[1] - particle.pos[1];
-                        let distance = dx.hypot(dy);
-                        if distance > 1.0e-4 {
-                            let falloff = (1.0 - distance / threshold).clamp(0.0, 1.0);
-                            let pull = scale * falloff * dt / distance;
-                            particle.vel[0] += dx * pull;
-                            particle.vel[1] += dy * pull;
-                        }
-                    }
-                    Operator::Vortex(vortex) => {
-                        if vortex.audio {
-                            continue;
-                        }
-                        let point = self
-                            .control_points
-                            .get(vortex.control_point)
-                            .copied()
-                            .unwrap_or([0.0; 3]);
-                        let axis = normalize3(vortex.axis).unwrap_or([0.0, 0.0, 1.0]);
-                        let to = [
-                            particle.pos[0] - point[0] - vortex.offset[0],
-                            particle.pos[1] - point[1] - vortex.offset[1],
-                            particle.pos[2] - point[2] - vortex.offset[2],
-                        ];
-                        let radial = if vortex.infinite_axis {
-                            let along = dot3(to, axis);
-                            [
-                                to[0] - axis[0] * along,
-                                to[1] - axis[1] * along,
-                                to[2] - axis[2] * along,
-                            ]
-                        } else {
-                            to
-                        };
-                        let distance = dot3(radial, radial).sqrt();
-                        let Some(tangent) = normalize3(cross3(radial, axis)) else {
-                            continue;
-                        };
-                        let inward = normalize3(radial).map_or([0.0; 3], |n| [-n[0], -n[1], -n[2]]);
-                        let mut pull = 0.0;
-                        let mid = vortex.distance.1 - vortex.distance.0 + 0.1;
-                        let band = if mid < 0.0 || distance < vortex.distance.0 {
-                            vortex.speed.0
-                        } else if distance > vortex.distance.1 {
-                            vortex.speed.1
-                        } else {
-                            let t = (distance - vortex.distance.0) / mid;
-                            vortex.speed.0 + (vortex.speed.1 - vortex.speed.0) * t
-                        };
-                        let speed = if vortex.ring {
-                            let inner = vortex.ring_radius - vortex.ring_width * 0.5;
-                            let reach =
-                                vortex.ring_radius + vortex.ring_width * 0.5 + vortex.ring_pull.0;
-                            if distance < inner {
-                                0.0
-                            } else if distance <= reach {
-                                band
-                            } else {
-                                pull = vortex.ring_pull.1;
-                                0.0
+            let dt = dt / substeps as f32;
+            for _ in 0..substeps {
+                particle.alpha = particle.base_alpha;
+                particle.size = particle.base_size;
+                for op in &system.operators {
+                    match op {
+                        Operator::Movement { gravity, drag } => {
+                            let damp = 1.0 - (drag * dt * drag_scale).min(0.999_999_9);
+                            for ((vel, pos), gravity) in particle
+                                .vel
+                                .iter_mut()
+                                .zip(particle.pos.iter_mut())
+                                .zip(gravity.iter())
+                            {
+                                *vel += gravity * dt;
+                                *pos += *vel * dt;
+                                *vel *= damp;
                             }
-                        } else {
-                            band
-                        };
-                        if vortex.maintain_distance && distance > vortex.distance.1 {
-                            pull += vortex.center_force;
                         }
-                        for i in 0..3 {
-                            particle.vel[i] += (tangent[i] * speed + inward[i] * pull) * dt;
+                        Operator::AlphaFade { fade_in, fade_out } => {
+                            let entering = life < *fade_in;
+                            let leaving = life > *fade_out;
+                            let incoming = if entering { life / *fade_in } else { 0.0 };
+                            let outgoing =
+                                if leaving { (1.0 - life) / (1.0 - *fade_out) } else { 0.0 };
+                            particle.alpha *= if entering || leaving {
+                                f32::from_bits(incoming.to_bits() | outgoing.to_bits())
+                            } else {
+                                1.0
+                            };
+                        }
+                        Operator::SizeChange { start, end, start_time, end_time } => {
+                            let span = (*end_time - *start_time).max(f32::EPSILON);
+                            let t = ((life - *start_time) / span).clamp(0.0, 1.0);
+                            particle.size *= start + (end - start) * t;
+                        }
+                        Operator::AlphaChange { start, end, start_time, end_time } => {
+                            let span = (*end_time - *start_time).max(f32::EPSILON);
+                            let t = ((life - *start_time) / span).clamp(0.0, 1.0);
+                            particle.alpha *= start + (end - start) * t;
+                        }
+                        Operator::ColorChange { start, end, start_time, end_time } => {
+                            let span = (*end_time - *start_time).max(f32::EPSILON);
+                            let t = ((life - *start_time) / span).clamp(0.0, 1.0);
+                            for ((channel, start), end) in
+                                particle.color.iter_mut().zip(start.iter()).zip(end.iter())
+                            {
+                                *channel = start + (end - start) * t;
+                            }
+                        }
+                        Operator::OscillateAlpha(osc) => {
+                            particle.alpha *= osc.modulation(particle.age, seed);
+                        }
+                        Operator::OscillateSize(osc) => {
+                            particle.size *= osc.modulation(particle.age, seed).max(0.0);
+                        }
+                        Operator::OscillatePosition(osc) => {
+                            let delta = osc.displacement(particle.age, dt, seed);
+                            let k = if system.world { system.scale3 } else { [1.0; 3] };
+                            for axis in 0..3 {
+                                particle.pos[axis] += delta[axis] * osc.mask[axis] * k[axis];
+                            }
+                        }
+                        Operator::AngularMovement { force, drag } => {
+                            particle.angular += force * dt;
+                            particle.angle += particle.angular * dt;
+                            particle.angular *= 1.0 - (drag * dt * drag_scale).min(0.999_999_9);
+                        }
+                        Operator::Turbulence { scale, speed, phase_range, time_scale, mask } => {
+                            let offset = time * *time_scale + seed * phase_range;
+                            let pos = particle.pos.map(|value| (value + offset) * scale);
+                            let strength = speed.0 + (speed.1 - speed.0) * seed;
+                            for (axis, mask) in mask.iter().enumerate() {
+                                if *mask != 0.0 {
+                                    let first = (3 - axis) % 3;
+                                    let sample =
+                                        [pos[first], pos[(first + 1) % 3], pos[(first + 2) % 3]];
+                                    particle.vel[axis] +=
+                                        simplex(sample) * strength * mask * dt * drag_scale;
+                                }
+                            }
+                        }
+                        Operator::ControlPointAttract {
+                            control_point,
+                            scale,
+                            threshold,
+                            flags,
+                            delete_threshold,
+                        } => {
+                            let point = self
+                                .control_points
+                                .get(*control_point)
+                                .copied()
+                                .unwrap_or([0.0; 3]);
+                            let to = std::array::from_fn(|axis| point[axis] - particle.pos[axis]);
+                            let distance = dot3(to, to).sqrt();
+                            if distance > f32::MIN_POSITIVE && distance < *threshold {
+                                let mut pull =
+                                    scale * (1.0 - distance / threshold) * dt * drag_scale;
+                                if flags & 2 != 0 {
+                                    pull = pull.min(distance);
+                                }
+                                for (velocity, to) in particle.vel.iter_mut().zip(to) {
+                                    *velocity += to * pull / distance;
+                                }
+                            }
+                            if flags & 1 != 0 {
+                                let step = std::array::from_fn(|axis| {
+                                    particle.pos[axis] - previous_position[axis]
+                                });
+                                let target = std::array::from_fn(|axis| {
+                                    point[axis] - previous_position[axis]
+                                });
+                                let length = dot3(step, step);
+                                let along = if length > 0.0 {
+                                    (dot3(target, step) / length).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                let separation =
+                                    std::array::from_fn(|axis| target[axis] - step[axis] * along);
+                                if dot3(separation, separation)
+                                    <= delete_threshold * delete_threshold
+                                {
+                                    particle.age = particle.lifetime;
+                                }
+                            }
+                        }
+                        Operator::Vortex(vortex) => {
+                            if vortex.audio {
+                                continue;
+                            }
+                            let point = self
+                                .control_points
+                                .get(vortex.control_point)
+                                .copied()
+                                .unwrap_or([0.0; 3]);
+                            let axis = normalize3(vortex.axis).unwrap_or([0.0, 0.0, 1.0]);
+                            let to = [
+                                particle.pos[0] - point[0] - vortex.offset[0],
+                                particle.pos[1] - point[1] - vortex.offset[1],
+                                particle.pos[2] - point[2] - vortex.offset[2],
+                            ];
+                            let radial = if vortex.infinite_axis {
+                                let along = dot3(to, axis);
+                                [
+                                    to[0] - axis[0] * along,
+                                    to[1] - axis[1] * along,
+                                    to[2] - axis[2] * along,
+                                ]
+                            } else {
+                                to
+                            };
+                            let distance = dot3(radial, radial).sqrt();
+                            let Some(tangent) = normalize3(cross3(radial, axis)) else {
+                                continue;
+                            };
+                            let inward =
+                                normalize3(radial).map_or([0.0; 3], |n| [-n[0], -n[1], -n[2]]);
+                            let mut pull = 0.0;
+                            let mid = vortex.distance.1 - vortex.distance.0 + 0.1;
+                            let band = if mid < 0.0 || distance < vortex.distance.0 {
+                                vortex.speed.0
+                            } else if distance > vortex.distance.1 {
+                                vortex.speed.1
+                            } else {
+                                let t = (distance - vortex.distance.0) / mid;
+                                vortex.speed.0 + (vortex.speed.1 - vortex.speed.0) * t
+                            };
+                            let speed = if vortex.ring {
+                                let inner = vortex.ring_radius - vortex.ring_width * 0.5;
+                                let reach = vortex.ring_radius
+                                    + vortex.ring_width * 0.5
+                                    + vortex.ring_pull.0;
+                                if distance < inner {
+                                    0.0
+                                } else if distance <= reach {
+                                    band
+                                } else {
+                                    pull = vortex.ring_pull.1;
+                                    0.0
+                                }
+                            } else {
+                                band
+                            };
+                            if vortex.maintain_distance && distance > vortex.distance.1 {
+                                pull += vortex.center_force;
+                            }
+                            for i in 0..3 {
+                                particle.vel[i] += (tangent[i] * speed + inward[i] * pull) * dt;
+                            }
                         }
                     }
                 }
             }
-            particle.angle += particle.angular * dt;
             particle.alpha = (particle.alpha * system.alpha).clamp(0.0, 1.0);
         }
         if self.ribbon {

@@ -1471,8 +1471,7 @@ fn parallax_model_keeps_zero_depth_and_inherits_root_depth_with_engine_defaults(
     assert_eq!(model.mouse.amount, 0.5);
     assert_eq!(model.mouse.influence, 0.5);
     assert_eq!(model.mouse.delay, 0.1);
-    assert!((model.mouse.camera_offset[0] + 44.4 / 1920.0).abs() < 0.000001);
-    assert!((model.mouse.camera_offset[1] - 6.0 / 1080.0).abs() < 0.000001);
+    assert_eq!(model.mouse.camera_offset, [0.0; 2]);
     assert_eq!(model.layers[0].mouse.parallax, [0.0; 2]);
     assert_eq!(model.layers[1].mouse.parallax, [1.0, 0.5]);
     assert_eq!(model.layers[2].mouse.parallax, [1.0, 0.5]);

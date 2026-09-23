@@ -604,6 +604,8 @@ struct ParticleEngine {
 }
 
 struct ParticleGroup {
+    parallax: [f32; 2],
+    camera_offset: [f32; 2],
     id: String,
     visible: bool,
     system: paper_scene::particles::ParticleSystem,
@@ -613,6 +615,75 @@ struct ParticleGroup {
     frames: Vec<paper_scene::model::SpriteFrame>,
     scene_order: usize,
     engine: Option<ParticleEngine>,
+    parent: Option<ParticleParent>,
+    followers: paper_scene::particles::Followers,
+    prewarm_steps: usize,
+}
+
+struct ParticleParent {
+    index: usize,
+    origin: (f32, f32, f32),
+    angle: f32,
+    scale: [f32; 3],
+}
+
+fn advance_particles(
+    groups: &mut [ParticleGroup],
+    dt: f32,
+    mouse: Option<&mouse::SceneMouse>,
+    audio: (&[f32], &[f32]),
+    prewarm_step: Option<usize>,
+) {
+    for index in 0..groups.len() {
+        let (before, after) = groups.split_at_mut(index);
+        let group = &mut after[0];
+        if let Some(binding) = &group.parent {
+            let parent = &before[binding.index];
+            let (sin, cos) = parent.system.angle.sin_cos();
+            let x = binding.origin.0 * parent.system.scale3[0];
+            let y = binding.origin.1 * parent.system.scale3[1];
+            group.system.origin = (
+                parent.system.origin.0 + x * cos - y * sin,
+                parent.system.origin.1 + x * sin + y * cos,
+                parent.system.origin.2 + binding.origin.2 * parent.system.scale3[2],
+            );
+            group.system.angle = parent.system.angle + binding.angle;
+            group.system.scale3 =
+                std::array::from_fn(|axis| parent.system.scale3[axis] * binding.scale[axis]);
+            group.system.scale = group.system.scale3[0];
+            group.system.alpha = parent.system.alpha;
+            group.system.tint = parent.system.tint;
+            group.system.count_scale = parent.system.count_scale;
+            group.system.rate_scale = parent.system.rate_scale;
+            group.system.size_scale = parent.system.size_scale;
+            group.visible = parent.visible;
+        }
+        if !group.visible || prewarm_step.is_some_and(|step| step >= group.prewarm_steps) {
+            continue;
+        }
+        group.camera_offset = if let Some(binding) = &group.parent {
+            before[binding.index].camera_offset
+        } else {
+            mouse.map_or([0.0; 2], |mouse| mouse.particle_offset(group.parallax))
+        };
+        if let Some(mouse) = mouse {
+            group.sim.set_pointer(mouse.particle_pointer(group.camera_offset));
+        }
+        if let Some(binding) = &group.parent
+            && group.system.follow_limit.is_some()
+        {
+            let parent = &before[binding.index];
+            group.followers.step(
+                &mut group.sim,
+                &group.system,
+                (&parent.system, &parent.sim),
+                dt,
+                audio,
+            );
+        } else {
+            group.sim.step_with_audio(&group.system, dt, audio.0, audio.1);
+        }
+    }
 }
 
 struct OrderedParticleQuad {
@@ -1485,20 +1556,22 @@ impl Group {
         let clock = self.frame_clock(time, dt);
         let screen = (self.target.extent.width, self.target.extent.height);
         let canvas = self.canvas;
+        advance_particles(
+            &mut self.particles,
+            dt,
+            Some(&self.mouse),
+            (self.bands.slice(16, false).unwrap_or(&[]), self.bands.slice(16, true).unwrap_or(&[])),
+            None,
+        );
         for (group_index, group) in self.particles.iter_mut().enumerate() {
+            let origin = (
+                group.system.origin.0 + group.camera_offset[0],
+                group.system.origin.1 + group.camera_offset[1],
+                group.system.origin.2,
+            );
             if !group.visible {
                 continue;
             }
-            group.sim.set_pointer([
-                self.mouse.position[0] * canvas.0,
-                (1.0 - self.mouse.position[1]) * canvas.1,
-            ]);
-            group.sim.step_with_audio(
-                &group.system,
-                dt,
-                self.bands.slice(16, false).unwrap_or(&[]),
-                self.bands.slice(16, true).unwrap_or(&[]),
-            );
             if let Some(engine) = group.engine.as_mut() {
                 let system = &group.system;
                 let count = paper_scene::particles::pack_sprites(
@@ -1523,7 +1596,7 @@ impl Group {
                 } else {
                     scene_ortho(canvas, d3d_clip)
                 };
-                let model = model_matrix(system.origin, system.draw_scale3(), system.angle);
+                let model = model_matrix(origin, system.draw_scale3(), system.angle);
                 let mut overrides = std::collections::BTreeMap::new();
                 overrides.insert(
                     "g_ModelViewProjectionMatrix".to_string(),
@@ -1532,7 +1605,7 @@ impl Group {
                 overrides.insert("g_ModelMatrix".to_string(), model.to_vec());
                 overrides.insert(
                     "g_ModelMatrixInverse".to_string(),
-                    model_inverse(system.origin, system.draw_scale3(), system.angle).to_vec(),
+                    model_inverse(origin, system.draw_scale3(), system.angle).to_vec(),
                 );
                 overrides.insert("g_OrientationUp".to_string(), vec![0.0, 1.0, 0.0]);
                 overrides.insert("g_OrientationRight".to_string(), vec![1.0, 0.0, 0.0]);
@@ -1596,12 +1669,12 @@ impl Group {
                         particle.size * paper_scene::particles::SPRITE_EXTENT * system.draw_scale();
                     for (index, pair) in trail.windows(2).enumerate() {
                         let (ax, ay) = (
-                            system.origin.0 + pair[0][0] * system.draw_scale(),
-                            system.origin.1 + pair[0][1] * system.draw_scale(),
+                            origin.0 + pair[0][0] * system.draw_scale(),
+                            origin.1 + pair[0][1] * system.draw_scale(),
                         );
                         let (bx, by) = (
-                            system.origin.0 + pair[1][0] * system.draw_scale(),
-                            system.origin.1 + pair[1][1] * system.draw_scale(),
+                            origin.0 + pair[1][0] * system.draw_scale(),
+                            origin.1 + pair[1][1] * system.draw_scale(),
                         );
                         let (dx, dy) = (bx - ax, by - ay);
                         let span = dx.hypot(dy);
@@ -1647,8 +1720,8 @@ impl Group {
                 let sample = particle_frame(group, particle);
                 let size =
                     particle.size * paper_scene::particles::SPRITE_EXTENT * system.draw_scale();
-                let x = system.origin.0 + particle.pos[0] * system.draw_scale();
-                let y = system.origin.1 + particle.pos[1] * system.draw_scale();
+                let x = origin.0 + particle.pos[0] * system.draw_scale();
+                let y = origin.1 + particle.pos[1] * system.draw_scale();
                 let (width, height, angle) =
                     if system.renderer == paper_scene::particles::Renderer::Trail {
                         let (vx, vy) = (particle.vel[0], particle.vel[1]);
@@ -1796,7 +1869,10 @@ impl Group {
             scene_targets.insert((layer.layer_id.clone(), CompositeBuffer::B), sample);
         }
         for fx_index in 0..self.fx.len() {
-            if self.scripts.is_some() && self.quads[self.fx[fx_index].quad].tint[3] <= 0.0 {
+            if self.scripts.is_some()
+                && self.quads[self.fx[fx_index].quad].tint[3] <= 0.0
+                && self.fx[fx_index].sampled_targets.is_empty()
+            {
                 continue;
             }
             let (needs_snapshot, scene_order) = {
@@ -3316,8 +3392,11 @@ fn build_group(
         });
     }
     let mut mouse = mouse::SceneMouse::new(model);
-    let mut particles = Vec::new();
-    for (index, layer) in std::mem::take(&mut model.particles).into_iter().enumerate() {
+    let mut particles: Vec<ParticleGroup> = Vec::new();
+    let mut pending: std::collections::VecDeque<_> =
+        std::mem::take(&mut model.particles).into_iter().map(|layer| (layer, None)).collect();
+    while let Some((layer, parent)) = pending.pop_front() {
+        let index = particles.len();
         let mut system = layer.system;
         mouse.enabled |= system.follows_mouse();
         let Some(mut texture) = system.texture.take() else {
@@ -3335,8 +3414,7 @@ fn build_group(
                 continue;
             }
         };
-        let mut sim = paper_scene::particles::Sim::new(0x9E37_79B9 ^ (index as u32 + 1));
-        sim.prewarm(&system, 1.0 / 30.0);
+        let sim = paper_scene::particles::Sim::new(0x9E37_79B9 ^ (index as u32 + 1));
         let ratio = texture.img_width.max(1) as f32 / texture.img_height.max(1) as f32;
         let frames = texture.frames.clone();
         let render_var1 = sprite_grid(&texture);
@@ -3351,7 +3429,7 @@ fn build_group(
                     system.blend,
                 ) {
                     Ok(pipeline) => {
-                        let capacity = paper_scene::particles::Sim::capacity(&system);
+                        let capacity = paper_scene::particles::Followers::capacity(&system);
                         let mut extra_textures = Vec::new();
                         for extra in pass.textures.iter_mut().skip(1).flatten() {
                             if let Ok(slot) =
@@ -3421,7 +3499,33 @@ fn build_group(
             }
             None => None,
         };
+        for child in std::mem::take(&mut system.children).into_iter().rev() {
+            let binding = ParticleParent {
+                index,
+                origin: child.origin,
+                angle: child.angle,
+                scale: child.scale3,
+            };
+            pending.push_front((
+                paper_scene::model::ParticleLayer {
+                    parallax: layer.parallax,
+                    id: layer.id.clone(),
+                    visible: layer.visible,
+                    system: child,
+                    depth: layer.depth,
+                    scene_order: layer.scene_order,
+                },
+                Some(binding),
+            ));
+        }
+        let prewarm_steps = ((system.start_time * 30.0).ceil() as usize).min(600).max(
+            parent
+                .as_ref()
+                .map_or(0, |binding: &ParticleParent| particles[binding.index].prewarm_steps),
+        );
         particles.push(ParticleGroup {
+            parallax: layer.parallax,
+            camera_offset: [0.0; 2],
             id: layer.id,
             visible: layer.visible,
             system,
@@ -3431,7 +3535,13 @@ fn build_group(
             frames,
             scene_order: layer.scene_order,
             engine,
+            parent,
+            followers: paper_scene::particles::Followers::default(),
+            prewarm_steps,
         });
+    }
+    for step in 0..particles.iter().map(|group| group.prewarm_steps).max().unwrap_or(0) {
+        advance_particles(&mut particles, 1.0 / 30.0, None, (&[], &[]), Some(step));
     }
     let referenced: BTreeSet<String> = fx
         .iter()

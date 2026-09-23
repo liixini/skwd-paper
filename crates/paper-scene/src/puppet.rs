@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 
+const MAGIC_19: &[u8; 8] = b"MDLV0019";
 const MAGIC_21: &[u8; 8] = b"MDLV0021";
 const MAGIC_23: &[u8; 8] = b"MDLV0023";
 const MESH_SIGNATURE: &[u8; 4] = &[0x0f, 0x00, 0x80, 0x01];
@@ -12,8 +13,8 @@ const MAX_ANIMATION_SAMPLES: usize = 1_000_000;
 pub struct Vertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
-    pub bones: [u16; 2],
-    pub weights: [f32; 2],
+    pub bones: [u16; 4],
+    pub weights: [f32; 4],
 }
 
 #[derive(Debug, PartialEq)]
@@ -57,11 +58,12 @@ pub struct AnimationLayer {
 
 pub fn parse(bytes: &[u8]) -> Result<Mesh> {
     let magic = bytes.get(..8).ok_or_else(|| anyhow!("puppet header is truncated"))?;
-    if magic != MAGIC_21 && magic != MAGIC_23 {
+    if magic != MAGIC_19 && magic != MAGIC_21 && magic != MAGIC_23 {
         return Err(anyhow!("unsupported puppet header"));
     }
-    let skeleton =
-        find(bytes, b"MDLS0004\0").ok_or_else(|| anyhow!("puppet skeleton is missing"))?;
+    let skeleton = find(bytes, b"MDLS0002\0")
+        .or_else(|| find(bytes, b"MDLS0004\0"))
+        .ok_or_else(|| anyhow!("puppet skeleton is missing"))?;
     let (start, vertex_bytes, index_bytes) = locate(bytes, skeleton)?;
     let vertex_count = vertex_bytes / VERTEX_STRIDE;
     let vertices = parse_vertices(bytes, start + 8, vertex_count)?;
@@ -122,8 +124,18 @@ fn parse_vertices(bytes: &[u8], start: usize, count: usize) -> Result<Vec<Vertex
         let vertex = Vertex {
             position: [le_f32(bytes, at)?, le_f32(bytes, at + 4)?, le_f32(bytes, at + 8)?],
             uv: [le_f32(bytes, at + 72)?, le_f32(bytes, at + 76)?],
-            bones: [le_u16_at(bytes, at + 40)?, le_u16_at(bytes, at + 44)?],
-            weights: [le_f32(bytes, at + 56)?, le_f32(bytes, at + 60)?],
+            bones: [
+                le_u16_at(bytes, at + 40)?,
+                le_u16_at(bytes, at + 44)?,
+                le_u16_at(bytes, at + 48)?,
+                le_u16_at(bytes, at + 52)?,
+            ],
+            weights: [
+                le_f32(bytes, at + 56)?,
+                le_f32(bytes, at + 60)?,
+                le_f32(bytes, at + 64)?,
+                le_f32(bytes, at + 68)?,
+            ],
         };
         if !vertex.position.into_iter().chain(vertex.uv).chain(vertex.weights).all(f32::is_finite) {
             return Err(anyhow!("puppet vertex {index} is not finite"));
@@ -136,7 +148,7 @@ fn parse_vertices(bytes: &[u8], start: usize, count: usize) -> Result<Vec<Vertex
 fn parse_bones(bytes: &[u8], start: usize) -> Result<(Vec<Bone>, usize)> {
     let mut at = start;
     let magic = cstring(bytes, &mut at)?;
-    if magic != "MDLS0004" {
+    if magic != "MDLS0002" && magic != "MDLS0004" {
         return Err(anyhow!("unsupported skeleton header {magic}"));
     }
     let animation_at = read_u32(bytes, &mut at)? as usize;
@@ -146,7 +158,7 @@ fn parse_bones(bytes: &[u8], start: usize) -> Result<(Vec<Bone>, usize)> {
     }
     let mut bones = Vec::with_capacity(count);
     for index in 0..count {
-        take(bytes, &mut at, 1)?;
+        cstring(bytes, &mut at)?;
         read_u32(bytes, &mut at)?;
         let parent = read_u32(bytes, &mut at)?;
         let matrix_bytes = read_u32(bytes, &mut at)? as usize;
@@ -178,9 +190,10 @@ fn parse_bones(bytes: &[u8], start: usize) -> Result<(Vec<Bone>, usize)> {
 fn parse_animations(bytes: &[u8], start: usize, bones: usize) -> Result<Vec<Animation>> {
     let mut at = start;
     let magic = cstring(bytes, &mut at)?;
-    if magic != "MDLA0006" {
+    if magic != "MDLA0005" && magic != "MDLA0006" {
         return Err(anyhow!("unsupported animation header {magic}"));
     }
+    let padding_bytes = if magic == "MDLA0005" { 34 } else { 35 };
     let end = read_u32(bytes, &mut at)? as usize;
     let count = read_u32(bytes, &mut at)? as usize;
     if count == 0 || count > 1024 || end > bytes.len() || end <= at {
@@ -190,7 +203,7 @@ fn parse_animations(bytes: &[u8], start: usize, bones: usize) -> Result<Vec<Anim
     let mut total_samples = 0_usize;
     for index in 0..count {
         if index != 0 {
-            let padding = take(bytes, &mut at, 35)?;
+            let padding = take(bytes, &mut at, padding_bytes)?;
             if padding.iter().any(|byte| *byte != 0) {
                 return Err(anyhow!("puppet animation padding is not empty"));
             }

@@ -27,6 +27,9 @@ impl SceneMouse {
     pub fn new(model: &paper_scene::model::SceneModel) -> Self {
         let enabled =
             model.scripts.is_some()
+                || (model.mouse.amount != 0.0
+                    && model.mouse.influence != 0.0
+                    && model.particles.iter().any(|p| p.parallax != [0.0; 2]))
                 || model.layers.iter().any(|layer| {
                     layer.mouse.clock.is_some()
                         || layer.mouse.parallax != [0.0; 2]
@@ -73,6 +76,20 @@ impl SceneMouse {
             fov: model.camera_fov,
             shadows: Vec::new(),
         }
+    }
+
+    pub(super) fn particle_offset(&self, depth: [f32; 2]) -> [f32; 2] {
+        [
+            depth[0] * self.displacement[0] * self.canvas[0] + self.shake_offset[0],
+            -depth[1] * self.displacement[1] * self.canvas[1] - self.shake_offset[1],
+        ]
+    }
+
+    pub(super) fn particle_pointer(&self, offset: [f32; 2]) -> [f32; 2] {
+        [
+            self.position[0] * self.canvas[0] - offset[0],
+            (1.0 - self.position[1]) * self.canvas[1] - offset[1],
+        ]
     }
 
     pub fn update(

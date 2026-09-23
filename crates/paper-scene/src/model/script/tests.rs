@@ -41,3 +41,32 @@ fn particle_parent_rotation_and_script_changes_update_the_same_system() {
     assert!((changed.origin.0 - 300.0).abs() < 0.001);
     assert!((changed.origin.1 - 410.0).abs() < 0.001);
 }
+
+#[test]
+fn particles_use_unit_parallax_depth_and_keep_sprite_scale_unchanged() {
+    let mut scene = serde_json::json!({
+        "general":{"cameraparallax":true,"cameraparallaxamount":0.5},
+        "objects":[
+            {"id":1,"origin":"1500 600 0","particle":"particles/test.json"},
+            {"id":2,"origin":"1500 900 0","particle":"particles/test.json","parallaxDepth":"0 0"},
+            {"id":3,"origin":"1500 1200 0","particle":"particles/test.json","parallaxDepth":"1 1"},
+            {"id":4,"origin":"1500 1500 0","particle":"particles/test.json","parallaxDepth":"2 2"}
+        ]
+    });
+    let props = Properties::new();
+    let states =
+        particle_frames(&scene, ["1", "2", "3", "4"].into_iter(), (3840.0, 2160.0), &props);
+    for (state, expected) in states.iter().zip([
+        (1290.0, 360.0, 0.0),
+        (1500.0, 900.0, 0.0),
+        (1290.0, 1260.0, 0.0),
+        (1080.0, 1920.0, 0.0),
+    ]) {
+        let state = state.as_ref().unwrap();
+        assert_eq!(state.origin, expected);
+        assert_eq!(state.scale, [1.0; 3]);
+    }
+    scene["objects"][0]["origin"] = serde_json::json!("1800 900 0");
+    let states = particle_frames(&scene, ["1"].into_iter(), (3840.0, 2160.0), &props);
+    assert_eq!(states[0].as_ref().unwrap().origin, (1740.0, 810.0, 0.0));
+}

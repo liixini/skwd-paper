@@ -128,3 +128,34 @@ fn hidden_script_layer_preserves_effect_source_alpha() {
     assert_eq!(shown.tint, frame.source_tint);
     assert_eq!(shown.source_tint, frame.source_tint);
 }
+
+#[test]
+fn playback_parallax_ignores_saved_editor_camera_offset() {
+    let mut scene = scene(1.27);
+    scene["camera"] = json!({"eye":"20.05524 289.45834 1", "center":"20.05524 289.45834 0"});
+    let props = Properties::new();
+    let parallax = Parallax::of(&scene, (3840.0, 2160.0), &props).unwrap();
+    let background = json!({"origin":"1920 1080 0", "parallaxDepth":"-1.71 -1.71"});
+    assert_eq!(parallax.offset(&background, &props), (0.0, 0.0));
+}
+
+#[test]
+fn text_defaults_to_unit_depth_for_placement_and_pointer_motion() {
+    let props = Properties::new();
+    let parallax = Parallax::of(&scene(0.5), (1000.0, 800.0), &props).unwrap();
+    let root = json!({"id":1,"text":"Clock", "origin":"700 500 0"});
+    let child =
+        json!({"id":2,"parent":1,"image":"child.json","origin":"10 0 0","parallaxDepth":"0 0"});
+    let objects = [root.clone(), child.clone()];
+    let map = by_id(&objects);
+    let transform = resolve_transform(&child, &map, &props, Some(&parallax));
+    assert_eq!(transform.origin, (810.0, 550.0, 0.0));
+    let mouse = crate::mouse::Parallax { amount: 0.5, influence: 1.0, ..Default::default() };
+    assert_eq!(
+        super::layer_mouse(&child, &map, &props, mouse, transform, false).parallax,
+        [1.0; 2]
+    );
+    let flat = json!({"text":"Clock", "origin":"700 500 0","parallaxDepth":"0 0"});
+    assert_eq!(parallax.offset(&flat, &props), (0.0, 0.0));
+    assert_eq!(super::parallax_depth(&json!({"image":"background.json"}), &props), (0.0, 0.0));
+}
