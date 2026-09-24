@@ -7,6 +7,7 @@ mod scene_thumbnail;
 mod socket;
 mod stdin_reader;
 mod still_command;
+pub mod we_project;
 
 pub use media::{VIDEO_EXTS, is_video_path};
 pub use multi_video::MultiVideoEntry;

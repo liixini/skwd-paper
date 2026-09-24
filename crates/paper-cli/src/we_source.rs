@@ -13,19 +13,19 @@ pub(crate) fn resolve(path: &str) -> Result<WeTarget> {
     if !root.is_dir() {
         return Err(anyhow!("Wallpaper Engine item is not a directory: {}", root.display()));
     }
-    let project_path = root.join("project.json");
-    let project = std::fs::read_to_string(&project_path)
-        .with_context(|| format!("read {}", project_path.display()))?;
-    let project: Value = serde_json::from_str(&project)
-        .with_context(|| format!("decode {}", project_path.display()))?;
+    let resolved = paper_control::we_project::Project::resolve(Path::new(path))?;
+    let project = &resolved.document;
     let kind = project
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Wallpaper Engine project type is missing"))?
         .to_ascii_lowercase();
     match kind.as_str() {
-        "scene" => resolve_scene(root),
-        "video" => resolve_video(&root, &project),
+        "scene" => {
+            resolved.scene_package()?;
+            Ok(WeTarget::Scene(PathBuf::from(path)))
+        }
+        "video" => resolve_video(&resolved.source, project),
         unsupported => Err(anyhow!("unsupported Wallpaper Engine project type {unsupported:?}")),
     }
 }
@@ -34,6 +34,7 @@ pub(crate) fn transition_media(path: &str) -> Result<PathBuf> {
     match resolve(path)? {
         WeTarget::Video(path) => Ok(path),
         WeTarget::Scene(root) => {
+            let root = std::fs::canonicalize(root)?;
             let project: Value =
                 serde_json::from_slice(&std::fs::read(root.join("project.json"))?)?;
             if let Some(relative) = project.get("preview").and_then(Value::as_str)
@@ -78,14 +79,6 @@ fn preview_extension(path: &Path) -> bool {
             .chain(paper_control::VIDEO_EXTS)
             .any(|supported| extension.eq_ignore_ascii_case(supported))
     })
-}
-
-fn resolve_scene(root: PathBuf) -> Result<WeTarget> {
-    if ["scene.pkg", "gifscene.pkg"].iter().any(|name| root.join(name).is_file()) {
-        Ok(WeTarget::Scene(root))
-    } else {
-        Err(anyhow!("Wallpaper Engine scene package is missing in {}", root.display()))
-    }
 }
 
 fn resolve_video(root: &Path, project: &Value) -> Result<WeTarget> {

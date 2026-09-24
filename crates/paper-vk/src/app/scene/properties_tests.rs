@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn preset_hot_updates_rebuild_when_parent_declarations_change() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("1");
+    let preset = root.path().join("2");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::create_dir(&preset).unwrap();
+    std::fs::write(base.join("scene.pkg"), b"fixture").unwrap();
+    std::fs::write(base.join("project.json"), b"{}").unwrap();
+    std::fs::write(preset.join("project.json"), br#"{"dependency":"1","preset":{}}"#).unwrap();
+    let directory = preset.to_str().unwrap();
+    let changed = Properties::from([("opacity".into(), vec![0.5])]);
+    let source = PropertySource::new(directory, &Properties::new());
+    assert!(source.accepts(directory, &changed));
+    std::fs::write(base.join("project.json"), br#"{"general":{}}"#).unwrap();
+    assert!(!source.accepts(directory, &changed));
+}
+
+#[test]
 fn hot_updates_require_changed_properties_and_unchanged_source_files() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().to_string_lossy();

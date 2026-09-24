@@ -2,6 +2,15 @@ use super::Group;
 use paper_scene::model::Properties;
 use std::os::unix::fs::MetadataExt;
 
+pub(super) fn resolved(directory: &str, overrides: &Properties) -> Properties {
+    let mut properties =
+        paper_control::we_project::Project::resolve(std::path::Path::new(directory))
+            .map(|project| paper_scene::effects::parse_properties(&project.document))
+            .unwrap_or_default();
+    properties.extend(overrides.clone());
+    properties
+}
+
 #[derive(PartialEq, Eq)]
 struct FileStamp {
     size: u64,
@@ -34,7 +43,12 @@ impl PropertySource {
 
 fn stamps(directory: &str) -> Option<Vec<FileStamp>> {
     let package = super::locate_pkg(directory).ok()?;
-    [std::path::Path::new(directory).join("project.json"), package]
+    let project =
+        paper_control::we_project::Project::resolve(std::path::Path::new(directory)).ok()?;
+    let mut files: Vec<_> =
+        project.directories.iter().map(|dir| dir.join("project.json")).collect();
+    files.push(package);
+    files
         .iter()
         .map(|path| {
             let meta = path.metadata().ok()?;
@@ -63,7 +77,8 @@ impl Group {
         }
         let Some(scripts) = self.scripts.as_mut() else { return false };
         let started = std::time::Instant::now();
-        match scripts.host.update_properties(properties) {
+        let effective = resolved(directory, properties);
+        match scripts.host.update_properties(&effective) {
             Ok(true) => {}
             Ok(false) => return false,
             Err(error) => {

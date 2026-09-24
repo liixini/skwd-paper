@@ -8,6 +8,7 @@ authors.workspace = true
 description = "Wallpaper Engine scene format parsing and library audit"
 
 [dependencies]
+paper-control = { path = "../paper-control" }
 anyhow = { workspace = true }
 bitflags = { version = "2", features = ["std"] }
 image = { workspace = true }

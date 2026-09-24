@@ -453,6 +453,34 @@ fn sound_package(files: &[(&str, &[u8])]) -> paper_scene::pkg::Package {
 }
 
 #[test]
+fn preset_sound_visibility_and_user_override_share_scene_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("1");
+    let preset = root.path().join("2");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::create_dir(&preset).unwrap();
+    std::fs::write(
+        parent.join("project.json"),
+        br#"{"general":{"properties":{"music":{"type":"bool","value":true}}}}"#,
+    )
+    .unwrap();
+    std::fs::write(preset.join("project.json"), br#"{"dependency":"1","preset":{"music":false}}"#)
+        .unwrap();
+    let package = sound_package(&[
+        ("scene.json", br#"{"objects":[{"id":1,"sound":["clip.ogg"],"visible":{"user":"music","value":true}}]}"#),
+        ("clip.ogg", b"fixture"),
+    ]);
+    let defaults = paper_scene::model::Properties::new();
+    let properties = super::properties::resolved(preset.to_str().unwrap(), &defaults);
+    assert!(paper_scene::sound::scene_sounds(&package, &properties).unwrap().is_empty());
+    let overrides = paper_scene::model::Properties::from([("music".into(), vec![1.0])]);
+    let properties = super::properties::resolved(preset.to_str().unwrap(), &overrides);
+    assert_eq!(paper_scene::sound::scene_sounds(&package, &properties).unwrap().len(), 1);
+    let properties = super::properties::resolved(parent.to_str().unwrap(), &defaults);
+    assert_eq!(paper_scene::sound::scene_sounds(&package, &properties).unwrap().len(), 1);
+}
+
+#[test]
 fn every_scene_sound_is_staged_as_its_own_voice_with_the_authored_playback() {
     let scene = br#"{"objects":[
         {"name":"Ambience","sound":["s/wind.ogg"],"volume":0.4,"playbackmode":"loop"},

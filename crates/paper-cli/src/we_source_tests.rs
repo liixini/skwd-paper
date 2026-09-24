@@ -2,6 +2,39 @@ use super::*;
 use std::fs;
 
 #[test]
+fn preset_resolves_parent_media_and_preserves_scene_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("1");
+    let preset = root.path().join("2");
+    fs::create_dir(&base).unwrap();
+    fs::create_dir(&preset).unwrap();
+    fs::write(base.join("project.json"), r#"{"type":"scene"}"#).unwrap();
+    fs::write(base.join("scene.pkg"), b"fixture").unwrap();
+    fs::write(
+        preset.join("project.json"),
+        r#"{"dependency":"1","preset":{},"preview":"preview.png"}"#,
+    )
+    .unwrap();
+    fs::write(preset.join("preview.png"), b"preview").unwrap();
+    let WeTarget::Scene(path) = resolve(preset.to_str().unwrap()).unwrap() else {
+        panic!("expected scene")
+    };
+    assert_eq!(path, preset);
+    assert_eq!(transition_media(preset.to_str().unwrap()).unwrap(), preset.join("preview.png"));
+    let linked = root.path().join("linked-preset");
+    std::os::unix::fs::symlink(&preset, &linked).unwrap();
+    assert_eq!(transition_media(linked.to_str().unwrap()).unwrap(), preset.join("preview.png"));
+    fs::write(base.join("project.json"), r#"{"type":"video","file":"clip.mp4"}"#).unwrap();
+    fs::write(base.join("clip.mp4"), b"fixture").unwrap();
+    let WeTarget::Video(path) = resolve(preset.to_str().unwrap()).unwrap() else {
+        panic!("expected video")
+    };
+    assert_eq!(path, base.join("clip.mp4"));
+    fs::remove_file(base.join("clip.mp4")).unwrap();
+    assert!(resolve(preset.to_str().unwrap()).is_err());
+}
+
+#[test]
 fn resolves_projects() {
     let temp = tempfile::tempdir().unwrap();
     let scene = temp.path().join("scene");

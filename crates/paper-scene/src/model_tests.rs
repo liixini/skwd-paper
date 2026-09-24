@@ -1,6 +1,41 @@
 use super::{Parallax, Properties, ancestor_chain, resolve_transform};
 use serde_json::{Value, json};
 
+#[test]
+fn preset_scene_load_uses_parent_then_preset_then_explicit_properties() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("1");
+    let preset = root.path().join("2");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::create_dir(&preset).unwrap();
+    std::fs::write(
+        base.join("project.json"),
+        r#"{"type":"scene","general":{"properties":{"tint":{"type":"color","value":"1 0 0"}}}}"#,
+    )
+    .unwrap();
+    std::fs::write(preset.join("project.json"), r#"{"dependency":"1","preset":{"tint":"0 1 0"}}"#)
+        .unwrap();
+    let scene =
+        json!({"general":{"clearcolor":{"user":"tint","value":"1 1 1"}},"objects":[]}).to_string();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    bytes.extend_from_slice(b"PKGV0007");
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&10u32.to_le_bytes());
+    bytes.extend_from_slice(b"scene.json");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&(scene.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(scene.as_bytes());
+    let package = crate::pkg::Package::parse(bytes).unwrap();
+    assert_eq!(super::load_from_dir(&package, &base).unwrap().clear, [1.0, 0.0, 0.0]);
+    assert_eq!(super::load_from_dir(&package, &preset).unwrap().clear, [0.0, 1.0, 0.0]);
+    let properties = Properties::from([("tint".into(), vec![0.0, 0.0, 1.0])]);
+    assert_eq!(
+        super::load_from_dir_with(&package, &preset, &properties).unwrap().clear,
+        [0.0, 0.0, 1.0]
+    );
+}
+
 fn scene(amount: f64) -> Value {
     json!({"general": {"cameraparallax": true, "cameraparallaxamount": amount}})
 }

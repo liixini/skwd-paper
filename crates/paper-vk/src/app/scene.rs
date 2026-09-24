@@ -4009,11 +4009,7 @@ fn transition_style(shader: Option<&str>) -> TransitionStyle {
 }
 
 fn locate_pkg(dir: &str) -> Result<std::path::PathBuf> {
-    ["scene.pkg", "gifscene.pkg"]
-        .iter()
-        .map(|name| std::path::Path::new(dir).join(name))
-        .find(|path| path.is_file())
-        .ok_or_else(|| anyhow!("no scene.pkg in {dir}"))
+    Ok(paper_control::we_project::Project::scene_package_at(std::path::Path::new(dir))?)
 }
 
 struct SceneAudio {
@@ -4109,9 +4105,10 @@ fn stage_clip(clip: &str, bytes: &[u8]) -> Result<tempfile::NamedTempFile> {
 
 fn extract_scene_audio(
     pkg: &paper_scene::pkg::Package,
+    directory: &str,
     properties: &paper_scene::model::Properties,
 ) -> Option<SceneAudio> {
-    match SceneAudio::extract(pkg, properties) {
+    match SceneAudio::extract(pkg, &properties::resolved(directory, properties)) {
         Ok(audio) => audio,
         Err(error) => {
             tracing::warn!("skwd-wall-vk: native scene audio unavailable: {error:#}");
@@ -4167,7 +4164,7 @@ pub(super) fn run_scene(
             &target.app.surfaces.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(","),
         ),
     )?;
-    let mut scene_audio = extract_scene_audio(&pkg, properties);
+    let mut scene_audio = extract_scene_audio(&pkg, dir, properties);
     drop(pkg);
     let particles_disabled = std::env::var("SKWD_PAPER_WE_DISABLE_PARTICLES").as_deref() == Ok("1");
     if particles_disabled {
@@ -4440,7 +4437,7 @@ pub(super) fn run_scene(
                                 .join(","),
                         ),
                     )?;
-                    Ok((model, extract_scene_audio(&pkg, &next_properties)))
+                    Ok((model, extract_scene_audio(&pkg, &req.to, &next_properties)))
                 });
             let (mut next, next_audio) = match loaded {
                 Ok(next) => next,
@@ -4889,7 +4886,7 @@ pub(super) fn stream_scene(
     validate_native_compatibility(&pkg, strict)?;
     let mut model =
         paper_scene::model::load_from_dir_with(&pkg, std::path::Path::new(dir), properties)?;
-    let mut _scene_audio = extract_scene_audio(&pkg, properties);
+    let mut _scene_audio = extract_scene_audio(&pkg, dir, properties);
     drop(pkg);
     let particles_disabled = std::env::var("SKWD_PAPER_WE_DISABLE_PARTICLES").as_deref() == Ok("1");
     if particles_disabled {
@@ -4988,7 +4985,7 @@ pub(super) fn stream_scene(
                         std::path::Path::new(&req.to),
                         &next_properties,
                     )?;
-                    Ok((model, extract_scene_audio(&pkg, &next_properties)))
+                    Ok((model, extract_scene_audio(&pkg, &req.to, &next_properties)))
                 });
             let (mut next, next_audio) = match loaded {
                 Ok(next) => next,

@@ -708,6 +708,11 @@ pub fn load_from_dir_with_storage(
         .ok()
         .and_then(|bytes| crate::json::parse(&bytes).ok())
         .unwrap_or(Value::Null);
+    let project = if project.get("dependency").is_some() || project.get("preset").is_some() {
+        paper_control::we_project::Project::resolve(dir)?.document
+    } else {
+        project
+    };
     let properties = crate::effects::parse_properties(&project);
     let configured = std::env::var("SKWD_WE_ASSETS").ok();
     load_with_project(
