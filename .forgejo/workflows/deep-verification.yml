@@ -40,7 +40,7 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: liixini/skwd-verify
-          ref: 6c8fc9023e41a2d71fed44de4f7b7313d0f7fb17
+          ref: a6478a04192f4720790c17fbede941cf08be9d60
           path: .ci/checkouts/skwd-verify
           token: ${{ secrets.SKWD_SUITE_READ_TOKEN }}
           persist-credentials: false
