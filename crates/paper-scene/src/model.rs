@@ -180,7 +180,10 @@ impl Parallax {
 }
 
 fn parallax_depth(root: &Value, props: &Properties) -> (f32, f32) {
-    let default = if root.get("text").is_some() || root.get("particle").is_some() {
+    let default = if root.get("image").is_some()
+        || root.get("text").is_some()
+        || root.get("particle").is_some()
+    {
         (1.0, 1.0)
     } else {
         (0.0, 0.0)

@@ -192,5 +192,71 @@ fn text_defaults_to_unit_depth_for_placement_and_pointer_motion() {
     );
     let flat = json!({"text":"Clock", "origin":"700 500 0","parallaxDepth":"0 0"});
     assert_eq!(parallax.offset(&flat, &props), (0.0, 0.0));
-    assert_eq!(super::parallax_depth(&json!({"image":"background.json"}), &props), (0.0, 0.0));
+}
+
+#[test]
+fn image_parallax_defaults_to_unit_depth_and_preserves_authored_depth() {
+    let props = Properties::new();
+    let parallax = Parallax::of(&scene(0.5), (1000.0, 800.0), &props).unwrap();
+    let mouse = crate::mouse::Parallax { amount: 0.5, influence: 1.0, ..Default::default() };
+    for (depth, expected) in
+        [(None, [1.0, 1.0]), (Some("0 0"), [0.0, 0.0]), (Some("-2 0.5"), [-2.0, 0.5])]
+    {
+        let mut object = json!({"id":1,"image":"image.json","origin":"700 500 0"});
+        if let Some(depth) = depth {
+            object["parallaxDepth"] = json!(depth);
+        }
+        let objects = [object.clone()];
+        let map = by_id(&objects);
+        let transform = resolve_transform(&object, &map, &props, Some(&parallax));
+        assert_eq!(
+            transform.origin,
+            (700.0 + 100.0 * expected[0], 500.0 + 50.0 * expected[1], 0.0)
+        );
+        assert_eq!(
+            super::layer_mouse(&object, &map, &props, mouse, transform, false).parallax,
+            expected
+        );
+        assert_eq!(
+            super::layer_mouse(
+                &object,
+                &map,
+                &props,
+                crate::mouse::Parallax::default(),
+                transform,
+                false
+            )
+            .parallax,
+            [0.0; 2]
+        );
+    }
+}
+
+#[test]
+fn non_image_parallax_defaults_are_preserved() {
+    let props = Properties::new();
+    for object in [json!({"text":"Clock"}), json!({"particle":"particle.json"})] {
+        assert_eq!(super::parallax_depth(&object, &props), (1.0, 1.0));
+    }
+    for object in [json!({}), json!({"sound":"sound.json"})] {
+        assert_eq!(super::parallax_depth(&object, &props), (0.0, 0.0));
+    }
+}
+
+#[test]
+fn child_inherits_omitted_image_parent_depth() {
+    let props = Properties::new();
+    let parallax = Parallax::of(&scene(0.5), (1000.0, 800.0), &props).unwrap();
+    let root = json!({"id":1,"image":"parent.json","origin":"700 500 0"});
+    let child =
+        json!({"id":2,"parent":1,"image":"child.json","origin":"10 0 0","parallaxDepth":"0 0"});
+    let objects = [root, child.clone()];
+    let map = by_id(&objects);
+    let transform = resolve_transform(&child, &map, &props, Some(&parallax));
+    assert_eq!(transform.origin, (810.0, 550.0, 0.0));
+    let mouse = crate::mouse::Parallax { amount: 0.5, influence: 1.0, ..Default::default() };
+    assert_eq!(
+        super::layer_mouse(&child, &map, &props, mouse, transform, false).parallax,
+        [1.0; 2]
+    );
 }
