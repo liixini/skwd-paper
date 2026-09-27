@@ -1036,3 +1036,36 @@ fn untimed_sprites_advance_once_per_update_and_obey_controls() {
     assert_eq!(animation.advance(25.0).image, 4);
     assert_eq!(animation.advance(26.0).image, 5);
 }
+
+#[test]
+fn background_only_scenes_distinguish_hidden_content_from_failed_content() {
+    use serde_json::json;
+    let hidden = json!({"id":1,"image":"missing.json","visible":false});
+    let cases = [
+        (json!([]), true),
+        (json!([hidden.clone()]), true),
+        (json!([{"id":2}, {"id":1,"parent":2,"image":"missing.json","visible":false}]), true),
+        (json!([hidden.clone(), {"id":2,"sound":["sound.ogg"]}]), true),
+        (json!([{"id":1,"image":"missing.json","visible":true}]), false),
+        (json!([hidden.clone(), {"id":2,"image":"missing.json"}]), false),
+        (json!([hidden.clone(), {"id":2,"particle":"missing.json"}]), false),
+        (json!([hidden.clone(), {"id":2,"light":"missing.json"}]), false),
+        (json!([hidden, {"id":2,"unknown":"unsupported"}]), false),
+        (json!([42]), false),
+    ];
+    for (objects, expected) in cases {
+        let scene = json!({"general":{"clearcolor":"0 1 0"},"objects":objects}).to_string();
+        let package = sound_package(&[("scene.json", scene.as_bytes())]);
+        let model =
+            paper_scene::model::load_with(&package, &paper_scene::effects::Assets::discover(None))
+                .unwrap();
+        assert!(model.layers.is_empty() && model.particles.is_empty());
+        assert_eq!(validate_scene_content(&model).is_ok(), expected, "{scene}");
+        assert_eq!(model.clear, [0.0, 1.0, 0.0]);
+    }
+    let package = sound_package(&[("scene.json", b"{}")]);
+    let model =
+        paper_scene::model::load_with(&package, &paper_scene::effects::Assets::discover(None))
+            .unwrap();
+    assert!(validate_scene_content(&model).is_err());
+}

@@ -2834,6 +2834,19 @@ fn validate_native_compatibility(pkg: &paper_scene::pkg::Package, strict: bool) 
     Ok(())
 }
 
+fn validate_scene_content(model: &SceneModel) -> Result<()> {
+    if !model.layers.is_empty()
+        || !model.particles.is_empty()
+        || (model.background_only && model.skipped.is_empty())
+    {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "scene has no renderable image layers ({})",
+        model.skipped.iter().take(4).cloned().collect::<Vec<_>>().join("; ")
+    ))
+}
+
 fn validate_scene_skips(strict: bool, skipped: &[String]) -> Result<()> {
     if !strict || skipped.is_empty() {
         return Ok(());
@@ -4173,12 +4186,7 @@ pub(super) fn run_scene(
         tracing::info!(disabled, "skwd-wall-vk: scene particles disabled by policy");
     }
     validate_scene_skips(strict, &model.skipped)?;
-    if model.layers.is_empty() && model.particles.is_empty() {
-        return Err(anyhow!(
-            "scene has no renderable image layers ({})",
-            model.skipped.iter().take(4).cloned().collect::<Vec<_>>().join("; ")
-        ));
-    }
+    validate_scene_content(&model)?;
     tracing::info!(
         "skwd-wall-vk: scene {} canvas {}x{} layers {} skipped {}",
         pkg_path.display(),
@@ -4449,8 +4457,8 @@ pub(super) fn run_scene(
             if particles_disabled {
                 next.particles.clear();
             }
-            if next.layers.is_empty() && next.particles.is_empty() {
-                signal_swap_failure(&req.to, "Scene has no layers or particles");
+            if let Err(error) = validate_scene_content(&next) {
+                signal_swap_failure(&req.to, &format!("{error:#}"));
                 continue;
             }
             if let Err(error) = validate_scene_skips(strict, &next.skipped) {
@@ -4807,12 +4815,7 @@ pub(super) fn dump_scene(
         paper_scene::model::load_from_dir_with(&pkg, std::path::Path::new(dir), properties)?;
     drop(pkg);
     validate_scene_skips(strict, &model.skipped)?;
-    if model.layers.is_empty() && model.particles.is_empty() {
-        return Err(anyhow!(
-            "scene has no renderable image layers ({})",
-            model.skipped.iter().take(4).cloned().collect::<Vec<_>>().join("; ")
-        ));
-    }
+    validate_scene_content(&model)?;
     let skipped = model.skipped.clone();
     let sd = shared::create(std::ptr::null_mut()).context("scene dump shared device")?;
     let mut group = build_group(&sd, &mut model, strict, &[(width, height)], fill_mode())?;
@@ -4893,12 +4896,7 @@ pub(super) fn stream_scene(
         model.particles.clear();
     }
     validate_scene_skips(strict, &model.skipped)?;
-    if model.layers.is_empty() && model.particles.is_empty() {
-        return Err(anyhow!(
-            "scene has no renderable image layers ({})",
-            model.skipped.iter().take(4).cloned().collect::<Vec<_>>().join("; ")
-        ));
-    }
+    validate_scene_content(&model)?;
     let sd = shared::create(std::ptr::null_mut()).context("scene stream shared device")?;
     let mut group = build_group(&sd, &mut model, strict, &sizes, fill_mode())?;
     drop(model);
@@ -4997,8 +4995,8 @@ pub(super) fn stream_scene(
             if particles_disabled {
                 next.particles.clear();
             }
-            if next.layers.is_empty() && next.particles.is_empty() {
-                signal_swap_failure(&req.to, "Scene has no layers or particles");
+            if let Err(error) = validate_scene_content(&next) {
+                signal_swap_failure(&req.to, &format!("{error:#}"));
                 continue;
             }
             if let Err(error) = validate_scene_skips(strict, &next.skipped) {

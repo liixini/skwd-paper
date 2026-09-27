@@ -20,6 +20,7 @@ pub struct SceneModel {
     pub layers: Vec<Layer>,
     pub particles: Vec<ParticleLayer>,
     pub skipped: Vec<String>,
+    pub background_only: bool,
 }
 
 pub struct Layer {
@@ -789,6 +790,9 @@ fn load_with_project(
             &mut render_target_layer_ids,
         );
     }
+    let mut background_only = scene.get("objects").is_some_and(Value::is_array);
+    let parents: std::collections::HashSet<_> =
+        objects.iter().filter_map(|object| object.get("parent").and_then(id_of)).collect();
     let mut texture_bytes = 0_usize;
     for (object_index, object) in objects.iter().enumerate() {
         let id =
@@ -801,6 +805,9 @@ fn load_with_project(
         if !visible && !scripted && !render_target_layer_ids.contains(&id) {
             continue;
         }
+        let visual =
+            ["image", "particle", "text", "light"].iter().any(|key| object.get(key).is_some());
+        background_only &= !visual && (object.get("sound").is_some() || parents.contains(&id));
         let Some(model_path) = object.get("image").and_then(Value::as_str) else {
             if let Some(path) = object.get("particle").and_then(Value::as_str) {
                 match crate::particles::load(pkg, assets, object, path) {
@@ -1145,6 +1152,7 @@ fn load_with_project(
         layers,
         particles,
         skipped,
+        background_only,
     })
 }
 
