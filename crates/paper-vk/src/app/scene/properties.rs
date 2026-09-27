@@ -75,10 +75,10 @@ impl Group {
         {
             return false;
         }
-        let Some(scripts) = self.scripts.as_mut() else { return false };
+        let Some(host) = self.scripts.as_mut().and_then(|s| s.host.as_mut()) else { return false };
         let started = std::time::Instant::now();
         let effective = resolved(directory, properties);
-        match scripts.host.update_properties(&effective) {
+        match host.update_properties(&effective) {
             Ok(true) => {}
             Ok(false) => return false,
             Err(error) => {

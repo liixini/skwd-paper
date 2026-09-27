@@ -127,6 +127,23 @@ fn vector_returns_and_cross_layer_writes_reach_scene() {
 }
 
 #[test]
+fn finite_updates_get_enough_time_and_reach_later_bindings() {
+    let mut scene = json!({"objects":[
+        {"id":1,"alpha":{"value":0,"script":"export function update(value){ const start=Date.now(); while(Date.now()-start<8){} return value+1; }"}},
+        {"id":2,"alpha":{"value":0,"script":"export function update(value){ return value+1; }"}}
+    ]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    for frame in 1..=12 {
+        host.tick(frame as f32 / 60.0, 1.0 / 60.0, [0.5; 2]).unwrap();
+        assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+        assert_eq!(host.scene["objects"][0]["alpha"], frame + 1);
+        assert_eq!(host.scene["objects"][1]["alpha"], frame + 1);
+    }
+}
+
+#[test]
 fn infinite_loop_is_stopped_by_frame_budget() {
     let mut scene = json!({"objects":[{"id":1,"alpha":{"value":1.0,"script":"export function update(){while(true){}}"}}]});
     let start = std::time::Instant::now();
@@ -483,4 +500,201 @@ fn destroy_hook_runs_once_and_its_changes_reach_the_scene() {
     host.destroy();
     assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
     assert_eq!(host.scene["objects"][0]["visible"], false);
+}
+
+#[test]
+fn large_unused_layer_metadata_does_not_exhaust_the_script_heap() {
+    let metadata: Vec<_> = (0..18000).map(|i| json!({"frame":i,"value":[i,1,2]})).collect();
+    let mut scene = json!({"objects":[{"id":1,"timeline":metadata,"text":{"value":"", "script":"let ticks=0; export function update(){return String(++ticks);}"}}]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    for frame in 1..=60 {
+        host.tick(frame as f32 / 60.0, 1.0 / 60.0, [0.5; 2]).unwrap();
+    }
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert!(host.animated());
+    assert_eq!(host.scene["objects"][0]["text"], "61");
+}
+
+#[test]
+fn nested_layer_values_keep_identity_and_track_writes_after_replacement() {
+    let mut scene = json!({"objects":[{"id":1,"effects":[{"name":"test","amount":1,"a/b~c":{"value":2}},{"name":"second","amount":7,"a/b~c":{"value":2}}],"text":{"value":"", "script":r"
+export function init() {
+    const effect = thisLayer.getEffect('test');
+    if (effect !== thisLayer.effects[0]) throw Error('unstable effect');
+    thisLayer.effects[1]['a/b~c'].value = 3;
+    effect.amount = 4;
+    thisLayer.effects[0] = {name:'replacement', nested:{amount:5}};
+    thisLayer.effects[0].nested.amount = 6;
+    thisLayer.effects[1].amount = 8;
+    return 'ready';
+}
+export function update() { return 'ready'; }"}}]});
+    let host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert_eq!(
+        scene["objects"][0]["effects"],
+        json!([
+            {"name":"replacement","nested":{"amount":6}},
+            {"name":"second","amount":8,"a/b~c":{"value":3}}
+        ])
+    );
+}
+
+#[test]
+fn lazy_vectors_convert_angles_once_and_keep_initial_configs_independent() {
+    let mut scene = json!({"objects":[{"id":1,"origin":"10 20 0","angles":"0 0 1.5707963267948966","metadata":{"values":["日本",2],"vector":{"origin":"1 2 3"}},"text":{"value":"", "script":r"
+export function init() {
+    if (thisLayer.__proto__ !== Object.getPrototypeOf(thisLayer)) throw Error('prototype changed');
+    const first = thisScene.getInitialLayerConfig(thisLayer);
+    first.metadata.values[0] = 'changed';
+    thisLayer.metadata.values[1] = 3;
+    Object.freeze(thisLayer.metadata.vector);
+    if (thisLayer.metadata.vector.origin.x !== 1) throw Error('frozen vector was not converted');
+    const origin = thisLayer.origin;
+    if (origin !== thisLayer.origin) throw Error('unstable origin');
+    origin.x = 42;
+    const angles = thisLayer.angles;
+    if (angles !== thisLayer.angles || Math.abs(angles.z-90)>0.0001) throw Error('angles converted twice');
+    Object.defineProperty(thisLayer, 'angles', {enumerable:false});
+    Object.seal(thisLayer);
+    if (thisLayer.angles !== angles || Math.abs(thisLayer.angles.z-90)>0.0001) throw Error('descriptor converted angles');
+    angles.z = 180;
+    const second = thisScene.getInitialLayerConfig(thisLayer);
+    if (second.origin !== '10 20 0' || second.metadata.values[0] !== '日本' || second.metadata.values[1] !== 2 || second.scale !== undefined) throw Error('initial config changed');
+    if (thisScene.getInitialLayerConfig('missing') !== undefined) throw Error('unknown layer');
+    return 'ready';
+}
+export function update() { return 'ready'; }"}}]});
+    let host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert_eq!(scene["objects"][0]["origin"], "42 20 0");
+    assert_eq!(scene["objects"][0]["angles"], "0 0 3.141592653589793");
+    assert_eq!(scene["objects"][0]["metadata"]["values"][1], 3);
+}
+
+#[test]
+fn assigned_object_aliases_keep_tracking_nested_changes() {
+    let mut scene = json!({"objects":[{"id":1,"text":{"value":"", "script":r"
+let supplied;
+export function init() {
+    supplied = {nested:{alpha:1}};
+    thisLayer.custom = supplied;
+    const before = Object.keys(thisLayer.custom).join(',');
+    const missing = thisLayer.custom.size;
+    if (missing !== undefined || before !== Object.keys(thisLayer.custom).join(',')) throw Error('missing read changed keys');
+}
+export function update() { supplied.nested.alpha -= 0.25; }
+"}}]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    host.tick(1.0, 0.016, [0.5; 2]).unwrap();
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert_eq!(host.scene["objects"][0]["custom"]["nested"]["alpha"], 0.5);
+}
+
+#[test]
+fn audio_registrations_return_distinct_stable_views_of_shared_samples() {
+    let mut scene = json!({"objects":[{"id":1,"text":{"value":"", "script":r"
+const a=engine.registerAudioBuffers(64), b=engine.registerAudioBuffers(64);
+const other=engine.registerAudioBuffers(16), held=a.left;
+export function init() {
+    if (!(a.left instanceof Float32Array) || !(a.right instanceof Float32Array) || !(a.average instanceof Float32Array)) throw Error('audio type');
+    if (a === b || a.left === b.left || a.left === a.right) throw Error('audio identity');
+    a.left[0] = 42;
+    if (b.left[0] !== 42 || a.right[0] !== 0 || other.left[0] !== 0) throw Error('audio sharing');
+}
+export function update() {
+    if (held !== a.left) throw Error('audio view replaced');
+    return [a.left[0],b.right[0],a.average[0],other.average[0]].join(',');
+}
+"}}]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    assert!(host.needs_audio());
+    host.audio(64, &[0.25; 64], &[0.75; 64]).unwrap();
+    host.tick(1.0, 0.016, [0.5; 2]).unwrap();
+    assert_eq!(host.scene["objects"][0]["text"], "0.25,0.75,0.5,0");
+    host.audio(16, &[1.0; 16], &[2.0; 16]).unwrap();
+    host.tick(2.0, 0.016, [0.5; 2]).unwrap();
+    assert_eq!(host.scene["objects"][0]["text"], "0.25,0.75,0.5,1.5");
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+}
+
+#[test]
+fn hundreds_of_audio_registrations_stay_active_across_frames() {
+    let mut scene = json!({"objects":[{"id":1,"text":{"value":"", "script":"const buffers=Array.from({length:432},()=>engine.registerAudioBuffers(64)); export function update(){return String(buffers[0].average[0]+buffers[431].average[63]);}"}}]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    for frame in 1..=60 {
+        let value = frame as f32;
+        host.audio(64, &[value; 64], &[value; 64]).unwrap();
+        host.tick(value / 60.0, 1.0 / 60.0, [0.5; 2]).unwrap();
+    }
+    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+    assert!(host.animated());
+    assert_eq!(host.scene["objects"][0]["text"], "120");
+}
+
+#[test]
+fn vector_updates_preserve_units_dimensions_and_detached_values() {
+    let mut scene = json!({"objects":[{"id":1,"origin":"1 2 3","angles":"0 0 0","size":"10 20","text":{"value":"", "script":r"
+let old;
+export function init() { old = thisLayer.origin;
+    thisLayer.origin = new Vec4(4,5,6,7);
+    thisLayer.angles = new Vec3(0,0,90);
+    thisLayer.size = new Vec3(30,40,50);
+    thisLayer.custom = new Vec3(7,8,9);
+    thisLayer.scale = new Vec3('4','5','6');
+    if (thisLayer.scale.add(1).x !== 5) throw Error('numeric conversion');
+    if (thisLayer.origin.w !== undefined || thisLayer.size.z !== undefined) throw Error('dimensions');
+    if (old.x !== 1 || old.y !== 2 || old.z !== 3) throw Error('old value changed');
+    if (thisLayer.custom !== '7 8 9' || thisLayer.angles.z !== 90) throw Error('conversion');
+    return 'ready';
+}
+export function update() { return 'ready'; }"}}]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    for frame in 1..4 {
+        assert!(!host.tick(frame as f32, 1.0, [0.5; 2]).unwrap());
+        assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+        assert_eq!(host.scene["objects"][0]["origin"], "4 5 6 7");
+        assert_eq!(host.scene["objects"][0]["angles"], "0 0 1.5707963267948966");
+        assert_eq!(host.scene["objects"][0]["size"], "30 40 50");
+    }
+}
+
+#[test]
+fn replaced_vectors_continue_tracking_component_writes() {
+    let mut scene = json!({"objects":[{"id":1,"origin":"0 0 0","angles":"0 0 0",
+        "alpha":{"value":1,"script":r"
+export function init() {
+    thisLayer.origin = new Vec3(4,5,6);
+    thisLayer.angles = new Vec3(0,0,90);
+}
+export function update() {
+    thisLayer.origin.x += 1;
+    thisLayer.angles.z += 15;
+    return 1;
+}"}}]});
+    let mut host = SceneScripts::load(&mut scene, &Properties::new(), &serde_json::Value::Null)
+        .unwrap()
+        .unwrap();
+    for frame in 1..4 {
+        assert!(host.tick(frame as f32, 1.0, [0.5; 2]).unwrap());
+        assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
+        let origin = crate::effects::json_numbers(&host.scene["objects"][0]["origin"]).unwrap();
+        let angles = crate::effects::json_numbers(&host.scene["objects"][0]["angles"]).unwrap();
+        assert_eq!(origin, vec![5.0 + frame as f32, 5.0, 6.0]);
+        assert!((angles[2] - (105.0 + frame as f32 * 15.0).to_radians()).abs() < 0.00001);
+    }
 }

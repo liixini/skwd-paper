@@ -68,6 +68,7 @@ struct LayerFx {
     source_dynamic: bool,
     audio_dependent: bool,
     source_clock: bool,
+    source_keyframes: bool,
     source_pointer: bool,
     dependency_dynamic: bool,
     retain_targets: bool,
@@ -464,7 +465,8 @@ impl LayerFx {
     }
 
     fn frame_state_dependent(&self) -> bool {
-        self.source_clock
+        self.source_keyframes
+            || self.source_clock
             || self.source_pointer
             || self.intrinsic_dynamic(true)
             || self.dependency_dynamic
@@ -1320,7 +1322,8 @@ impl Group {
                 local_targets: &local_targets[index],
                 binds: &fx.binds,
                 dynamic: fx.intrinsic_dynamic(include_clocks || self.audio.is_some())
-                    || (include_clocks && (fx.source_clock || fx.source_pointer)),
+                    || (include_clocks
+                        && (fx.source_clock || fx.source_pointer || fx.source_keyframes)),
                 passthrough: fx.copy_background,
                 prefix_dynamic: self
                     .particles
@@ -1476,7 +1479,7 @@ impl Group {
     }
 
     fn animated(&self) -> bool {
-        self.scripts.as_ref().is_some_and(|s| s.host.animated())
+        self.scripts.as_ref().is_some_and(script::Scripts::animated)
             || !self.videos.is_empty()
             || !self.animations.is_empty()
             || !self.particles.is_empty()
@@ -2423,8 +2426,8 @@ impl Group {
     }
 
     fn destroy(mut self) {
-        if let Some(scripts) = &mut self.scripts {
-            scripts.host.destroy();
+        if let Some(host) = self.scripts.as_mut().and_then(|s| s.host.as_mut()) {
+            host.destroy();
         }
         self.drop_from();
         self.release_composition_inputs();
@@ -2932,7 +2935,7 @@ fn build_group(
     mode: FillMode,
 ) -> Result<Group> {
     let _compilation = paper_scene::shader::CompilationSession::new()?;
-    let scripted = model.scripts.is_some();
+    let scripted = model.scripts.is_some() || !model.keyframes.is_empty();
     let dimensions = scene_dimensions(model, outputs, mode);
     let (canvas_w, canvas_h) = dimensions.raster;
     let mut renderer =
@@ -3351,7 +3354,7 @@ fn build_group(
         let slot = textures.len();
         textures.push(slot_texture);
         let source_dynamic = layer.texture.system_texture.is_some()
-            || scripted
+            || model.scripts.is_some()
             || layer.texture.video.is_some()
             || inputs.iter().flatten().any(|slot| {
                 texture_interner.video_slots.values().any(|video_slot| video_slot == slot)
@@ -3385,6 +3388,12 @@ fn build_group(
             source_dynamic,
             audio_dependent,
             source_clock: layer.live_text.is_some(),
+            source_keyframes: model
+                .scripts
+                .as_ref()
+                .map(|host| &host.scene)
+                .or_else(|| model.animated_scene.as_ref().map(|(scene, _)| scene))
+                .is_some_and(|scene| model.keyframes.affects_layer(scene, &layer.id)),
             source_pointer: layer
                 .effects
                 .iter()
@@ -3695,7 +3704,7 @@ fn build_group(
     if let Some(scripts) = &mut model.scripts {
         scripts.restrict_hidden_layer_updates(&deferred_compositions);
     }
-    let scripts = script::Scripts::take(model, &layer_slots);
+    let scripts = script::Scripts::take(model, &layer_slots)?;
     let mut group = Group {
         scripts,
         media,
@@ -4628,6 +4637,7 @@ pub(super) fn run_scene(
                 let dt = now.duration_since(last_sim).as_secs_f32().clamp(1.0 / 240.0, 0.1);
                 last_sim = now;
                 group.compose(time, dt)?;
+                animated = group.animated();
                 for (id, op) in group.take_script_sounds() {
                     ctl.scene_sound(&id, op);
                 }
@@ -4659,6 +4669,7 @@ pub(super) fn run_scene(
             let dt = now.duration_since(last_sim).as_secs_f32().clamp(1.0 / 240.0, 0.1);
             last_sim = now;
             group.compose(elapsed, dt)?;
+            animated = group.animated();
             render_pending.fill(true);
         }
 
@@ -4854,9 +4865,9 @@ pub(super) fn dump_scene(
         "particle_systems": group.particles.len(),
         "animated": group.animated(),
         "skipped": skipped,
-        "script_runtime": group.scripts.is_some(),
-        "script_heap_bytes": group.scripts.as_ref().map_or(0, |s| s.host.heap_bytes()),
-        "script_diagnostics": group.scripts.as_ref().map(|s| &s.host.diagnostics),
+        "script_runtime": group.scripts.as_ref().is_some_and(|s| s.host.is_some()),
+        "script_heap_bytes": group.scripts.as_ref().and_then(|s| s.host.as_ref()).map_or(0, |h| h.heap_bytes()),
+        "script_diagnostics": group.scripts.as_ref().and_then(|s| s.host.as_ref()).map(|h| &h.diagnostics),
         "render_ms": started.elapsed().as_secs_f64() * 1000.0,
     });
     std::fs::write(out_dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
@@ -4947,6 +4958,7 @@ pub(super) fn stream_scene(
     let mut trans_style = TransitionStyle::Fade;
     let mut free = vec![[true; 3]; targets.len()];
     let mut emitted = vec![false; targets.len()];
+    let mut render_pending = vec![true; targets.len()];
     loop {
         for (socket, slots) in sockets.iter().zip(free.iter_mut()) {
             crate::preview::drain_acks(*socket, slots)?;
@@ -4971,6 +4983,7 @@ pub(super) fn stream_scene(
                 property_frame = true;
                 presented = false;
                 emitted.fill(false);
+                render_pending.fill(true);
                 animated = group.animated();
                 next_frame = Instant::now();
                 continue;
@@ -5046,6 +5059,7 @@ pub(super) fn stream_scene(
             next_frame = now;
             presented = false;
             emitted.fill(false);
+            render_pending.fill(true);
         }
         let pauses = ctl.take_output_pauses();
         if let Some(all_paused) = crate::preview::apply_output_pauses(&mut targets, pauses) {
@@ -5077,6 +5091,10 @@ pub(super) fn stream_scene(
         }
         if presented
             && !animated
+            && !targets
+                .iter()
+                .zip(&render_pending)
+                .any(|(target, pending)| !target.paused && *pending)
             && !mouse_driven
             && fade_start.is_none()
             && !group.media.as_ref().is_some_and(media::Media::has_pending)
@@ -5104,8 +5122,15 @@ pub(super) fn stream_scene(
             }
             continue;
         }
-        let active: Vec<bool> =
-            targets.iter().zip(&emitted).map(|(target, emitted)| target.active(*emitted)).collect();
+        let active: Vec<bool> = targets
+            .iter()
+            .zip(&emitted)
+            .zip(&render_pending)
+            .map(|((target, emitted), pending)| {
+                target.active(*emitted)
+                    && (*pending || animated || mouse_driven || fade_start.is_some())
+            })
+            .collect();
         if !crate::preview::wait_any_free(&sockets, &mut free, &active, ctl.wake_fd(), None)? {
             continue;
         }
@@ -5119,6 +5144,8 @@ pub(super) fn stream_scene(
             let dt = now.duration_since(last_frame).as_secs_f32().clamp(1.0 / 240.0, 0.1);
             last_frame = now;
             group.compose(epoch.elapsed().as_secs_f32(), dt)?;
+            animated = group.animated();
+            render_pending.fill(true);
             for (id, op) in group.take_script_sounds() {
                 ctl.scene_sound(&id, op);
             }
@@ -5127,6 +5154,9 @@ pub(super) fn stream_scene(
             fade_start.map(|started| started.elapsed().as_secs_f32() * 1000.0 / fade_ms as f32),
             fade_first_frame,
         );
+        if fade_start.is_some() {
+            render_pending.fill(true);
+        }
         for (index, target) in targets.iter().enumerate() {
             crate::preview::drain_acks(target.socket, &mut free[index])?;
             if !active[index] {
@@ -5150,6 +5180,7 @@ pub(super) fn stream_scene(
             )
             .context("send scene stream frame")?;
             free[index][slot] = false;
+            render_pending[index] = false;
             if !emitted[index] {
                 paper_runtime::plasma::frame_ready_on(target.socket)?;
                 emitted[index] = true;

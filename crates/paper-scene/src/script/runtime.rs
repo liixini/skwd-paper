@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const HEAP_LIMIT: usize = 32 * 1024 * 1024;
-const FRAME_BUDGET: Duration = Duration::from_millis(4);
+const FRAME_BUDGET: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SoundOp {
@@ -275,6 +275,32 @@ impl SceneScripts {
         self.property_bindings.restrict_hidden_layers(&self.scene, layers, callbacks);
     }
 
+    pub fn set_keyframes(&mut self, bindings: &crate::keyframe::Bindings) -> Result<()> {
+        self.deadline.set(Instant::now() + FRAME_BUDGET);
+        let paths = serde_json::to_string(&bindings.paths())?;
+        self.context
+            .with(|ctx| ctx.globals().get::<_, Function>("__setKeyframes")?.call::<_, ()>((paths,)))
+            .map_err(|error| anyhow!("keyframe bindings: {error}"))
+    }
+
+    pub fn sync_keyframes(&mut self, bindings: &crate::keyframe::Bindings) -> Result<()> {
+        if bindings.is_empty() {
+            return Ok(());
+        }
+        self.deadline.set(Instant::now() + FRAME_BUDGET);
+        self.context
+            .with(|ctx| {
+                let update: Function = ctx.globals().get("__keyframe")?;
+                for (index, values, count) in bindings.values() {
+                    update.call::<_, ()>((
+                        index, values[0], values[1], values[2], values[3], count,
+                    ))?;
+                }
+                Ok::<_, rquickjs::Error>(())
+            })
+            .map_err(|error| anyhow!("keyframe values: {error}"))
+    }
+
     pub fn set_sprites(&mut self, sprites: &[(usize, usize, f32)]) {
         if self.disabled || sprites.is_empty() {
             return;
@@ -398,7 +424,10 @@ impl SceneScripts {
         if self.disabled {
             return Ok(false);
         }
-        self.deadline.set(Instant::now() + FRAME_BUDGET);
+        let started = Instant::now();
+        self.deadline.set(started + FRAME_BUDGET);
+        let expected = self.updates.len();
+        let mut invoked = 0;
         let mut failed = Vec::new();
         let result = self.context.clone().with(|ctx| {
             let result = (|| -> rquickjs::Result<()> {
@@ -409,6 +438,7 @@ impl SceneScripts {
                     if Instant::now() >= self.deadline.get() {
                         break;
                     }
+                    invoked += 1;
                     if let Err(error) = invoke.call::<_, ()>((index, "update")) {
                         let error = js_error(&ctx, &error);
                         self.diagnostics.push(format!("script {index} stopped: {error:#}"));
@@ -425,6 +455,7 @@ impl SceneScripts {
             })();
             result.map_err(|e| js_error(&ctx, &e))
         });
+        tracing::trace!(target: "paper_scene::script::frame", invoked, expected, elapsed_us = started.elapsed().as_micros(), "SceneScript updates");
         for index in failed {
             self.disable_module(index);
         }
@@ -474,7 +505,7 @@ impl SceneScripts {
             return Err(anyhow!("SceneScript changes exceed 1 MiB per frame"));
         }
         self.audio_registered =
-            self.context.with(|ctx| ctx.eval::<bool, _>("__audio.length > 0").unwrap_or(false));
+            self.context.with(|ctx| ctx.eval::<bool, _>("__audio.size > 0").unwrap_or(false));
         self.timers_pending =
             self.context.with(|ctx| ctx.eval::<bool, _>("__timers.size > 0").unwrap_or(false));
         if let Some(storage) = &mut self.storage {

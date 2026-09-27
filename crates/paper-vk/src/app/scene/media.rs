@@ -295,8 +295,8 @@ impl super::Group {
             }
             self.media_art = snapshot.art;
         }
-        if let Some(scripts) = &mut self.scripts {
-            scripts.host.media(&snapshot.events)?;
+        if let Some(host) = self.scripts.as_mut().and_then(|s| s.host.as_mut()) {
+            host.media(&snapshot.events)?;
         }
         Ok(())
     }

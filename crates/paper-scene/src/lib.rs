@@ -5,6 +5,7 @@ pub mod effect_lifetime;
 pub mod effects;
 pub mod hlsl;
 pub mod json;
+pub mod keyframe;
 pub mod model;
 pub mod mouse;
 pub mod particles;

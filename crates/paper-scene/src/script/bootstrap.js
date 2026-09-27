@@ -10,7 +10,7 @@ class Vec2 {
     lengthSqr() { return this.dot(this); }
     dot(v) { return ['x', 'y', 'z', 'w'].reduce((s, k) => s + (this[k] ?? 0) * (v[k] ?? 0), 0); }
     normalize() { const n = this.length(); return n ? this.divide(n) : this.copy(); }
-    equals(v) { return ['x', 'y', 'z', 'w'].every(k => this[k] === v[k]); }
+    equals(v) { return this.x === v.x && this.y === v.y && this.z === v.z && this.w === v.w; }
     toString() { return ['x', 'y', 'z', 'w'].filter(k => k in this).map(k => this[k]).join(' '); }
 }
 class Vec3 extends Vec2 {
@@ -22,6 +22,7 @@ class Vec4 extends Vec3 {
 }
 Object.assign(globalThis, { Vec2, Vec3, Vec4 });
 const __changes = new Map();
+let __nativeWrite = false;
 const __modules = [];
 const __timers = new Map();
 let __timerId = 0;
@@ -43,20 +44,50 @@ function __plain(value, key) {
     }
     return value;
 }
-function __wrap(value, path, key) {
+function __wrap(value, path, key, eager = false, converted = false) {
     value = __coerce(value, key);
     if (value instanceof Vec2) {
-        if (key === 'angles') value = value.multiply(180 / Math.PI);
-        return new Proxy(value, { set(target, k, v) { if (target[k] !== v) { target[k] = v; __changes.set(path, __plain(target, key)); } return true; } });
+        if (key === 'angles' && !converted) value = value.multiply(180 / Math.PI);
+        return new Proxy(value, { set(target, k, v) { if (target[k] !== v) { target[k] = v; if (!__nativeWrite) __changes.set(path, __plain(target, key)); } return true; } });
     }
     if (!value || typeof value !== 'object') return value;
-    for (const k of Object.keys(value)) value[k] = __wrap(value[k], path + '/' + k.replace(/~/g,'~0').replace(/\//g,'~1'), k);
-    return new Proxy(value, { set(target, k, v) {
-        const p = path + '/' + String(k).replace(/~/g,'~0').replace(/\//g,'~1');
+    const wrapped = new Set();
+    if (eager) for (const k of Object.keys(value)) {
+        value[k] = __wrap(value[k], path + '/' + k.replace(/~/g,'~0').replace(/\//g,'~1'), k, true);
+        wrapped.add(k);
+    }
+    return new Proxy(value, { get(target, k) {
+        const child = target[k];
+        if (typeof k !== 'string' || wrapped.has(k) || (!__vectors.has(k) && (!child || typeof child !== 'object'))) return child;
+        const descriptor = Object.getOwnPropertyDescriptor(target, k);
+        if (!descriptor || (!descriptor.configurable && !descriptor.writable)) return child;
+        const result = __wrap(child, path + '/' + k.replace(/~/g,'~0').replace(/\//g,'~1'), k);
+        if (result !== child) { target[k] = result; wrapped.add(k); }
+        return result;
+    }, defineProperty(target, k, descriptor) {
+        if (!('value' in descriptor) && descriptor.writable === false) this.get(target, k);
+        const changed = ('value' in descriptor && descriptor.value !== target[k]) || 'get' in descriptor;
+        const defined = Reflect.defineProperty(target, k, descriptor);
+        if (defined && changed) wrapped.delete(k);
+        return defined;
+    }, deleteProperty(target, k) {
+        const deleted = Reflect.deleteProperty(target, k);
+        if (deleted) wrapped.delete(k);
+        return deleted;
+    }, set(target, k, v) {
         v = __coerce(v, k);
         if (!(target[k] instanceof Vec2 && v instanceof Vec2 && target[k].equals(v)) && target[k] !== v) {
-            __changes.set(p, __plain(v, k));
-            target[k] = v instanceof Vec2 ? __wrap(__plain(v,k),p,k) : __wrap(v,p,k);
+            const p = path + '/' + String(k).replace(/~/g,'~0').replace(/\//g,'~1');
+            if (!__nativeWrite) __changes.set(p, __plain(v, k));
+            const numericVector = v instanceof Vec2 && __vectors.has(k)
+                && typeof v.x === 'number' && typeof v.y === 'number'
+                && (typeof v.z === 'number' || (!('z' in v) && !('w' in v)));
+            target[k] = v instanceof Vec2
+                ? numericVector
+                    ? __wrap(k === 'size' || k === 'parallaxDepth' ? new Vec2(v.x,v.y) : new Vec3(v.x,v.y,v.z),p,k,true,true)
+                    : __wrap(__plain(v,k),p,k,true)
+                : __wrap(v,p,k,true);
+            wrapped.add(k);
         }
         return true;
     }});
@@ -140,6 +171,23 @@ function __owner(path) {
     for (const p of parts) object = object[p];
     return [object, key];
 }
+let __keyframes = [];
+function __setKeyframes(json) { __keyframes = JSON.parse(json).map(path => path.split('/').slice(1).map(s => s.replace(/~1/g,'/').replace(/~0/g,'~'))); }
+function __keyframe(index, a, b, c, d, count) {
+    const parts = __keyframes[index];
+    const key = parts[parts.length - 1];
+    let object = __scene;
+    for (let i = 0; i < parts.length - 1; i++) { object = object?.[parts[i]]; }
+    if (!object || typeof object !== 'object') return;
+    let value = __coerce(count === 1 ? a : [a,b,c,d].slice(0,count), key);
+    if (key === 'angles' && value instanceof Vec2) {
+        value.x *= 180 / Math.PI;
+        value.y *= 180 / Math.PI;
+        value.z *= 180 / Math.PI;
+    }
+    __nativeWrite = true;
+    try { object[key] = value; } finally { __nativeWrite = false; }
+}
 const __cursorHooks = ['cursorEnter','cursorLeave','cursorMove','cursorDown','cursorUp','cursorClick'];
 function __register(index, ns, path) { const [object,key] = __owner(path); __modules[index] = {ns, object, key, layer:path.startsWith('/objects/') ? __layers[Number(path.split('/')[2])] : null, disabled:false, cursor:__cursorHooks.some(name => typeof ns[name] === 'function')}; }
 function __disable(index) { if (__modules[index]) __modules[index].disabled = true; }
@@ -195,11 +243,11 @@ const engine = {
     registerAsset:file=>({file:String(file)}),
     openUserShortcut:()=>false,
     get timeOfDay(){const d=new Date();return (d.getHours()*3600+d.getMinutes()*60+d.getSeconds())/86400;},
-    registerAudioBuffers: size => { if (!Number.isInteger(size) || size < 1 || size > 128) throw Error('Invalid audio buffer size'); const b = {left:new Array(size).fill(0),right:new Array(size).fill(0),average:new Array(size).fill(0)}; __audio.push(b); return b; },
+    registerAudioBuffers: size => { if (!Number.isInteger(size) || size < 1 || size > 128) throw Error('Invalid audio buffer size'); let b = __audio.get(size); if (!b) { b = {left:new Float32Array(size),right:new Float32Array(size),average:new Float32Array(size)}; __audio.set(size,b); } return {left:b.left.subarray(),right:b.right.subarray(),average:b.average.subarray()}; },
     setTimeout: (fn, delay=0) => __timer(fn, delay, false), setInterval: (fn, delay=0) => __timer(fn, delay, true),
     clearTimeout: id => __timers.delete(id), clearInterval: id => __timers.delete(id)
 };
-const __audio = [];
+const __audio = new Map();
 function __timer(fn, delay, repeat) {
     if (typeof fn !== 'function' || !Number.isFinite(delay) || __timers.size >= 256) throw Error('Invalid or excessive SceneScript timers');
     const id = ++__timerId; __timers.set(id, {fn, delay:Math.max(1,delay)/1000, due:engine.runtime+Math.max(1,delay)/1000, repeat}); return () => __timers.delete(id);
@@ -249,7 +297,7 @@ const console = {log: (...args) => __log(args.map(String).join(' ')), warn: (...
 Object.assign(globalThis, {engine,input,thisScene,shared,console,createScriptProperties:__createScriptProperties});
 
 Object.assign(globalThis, {MediaPlaybackEvent:{PLAYBACK_PLAYING:1,PLAYBACK_PAUSED:2,PLAYBACK_STOPPED:0}});
-function __audioUpdate(count,left,right) { for(const b of __audio) if(b.left.length===count) for(let i=0;i<count;i++){b.left[i]=left[i];b.right[i]=right[i];b.average[i]=(left[i]+right[i])*0.5;} }
+function __audioUpdate(count,left,right) { const b=__audio.get(count); if(!b)return; b.left.set(left); b.right.set(right); for(let i=0;i<count;i++)b.average[i]=(left[i]+right[i])*0.5; }
 
 let __lastPointer = [-1,-1];
 let __lastButtons = [false,false,false];

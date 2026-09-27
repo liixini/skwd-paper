@@ -10,6 +10,8 @@ pub const MAX_SCENE_OBJECTS: usize = 16_384;
 
 pub struct SceneModel {
     pub scripts: Option<crate::script::SceneScripts>,
+    pub keyframes: crate::keyframe::Bindings,
+    pub animated_scene: Option<(Value, Properties)>,
     pub canvas: (f32, f32),
     pub mouse: crate::mouse::Parallax,
     pub shake: Option<crate::mouse::Shake>,
@@ -741,9 +743,13 @@ fn load_with_project(
 ) -> Result<SceneModel> {
     let props = &assets.properties;
     let mut scene = pkg.scene_json()?;
+    let mut keyframes = crate::keyframe::Bindings::parse(&mut scene)?;
     let mut scripts =
         crate::script::SceneScripts::load_with_storage(&mut scene, props, project, storage)?;
-    let scripted = scripts.is_some();
+    if scripts.is_none() {
+        keyframes.apply(&mut scene, 0.0);
+    }
+    let scripted = scripts.is_some() || !keyframes.is_empty();
     let general = scene.get("general");
     let ortho = general.and_then(|top| top.get("orthogonalprojection"));
     let declared = (
@@ -1130,6 +1136,9 @@ fn load_with_project(
         }
     }
     Ok(SceneModel {
+        animated_scene: (scripts.is_none() && !keyframes.is_empty())
+            .then(|| (scene.clone(), props.clone())),
+        keyframes,
         scripts,
         canvas,
         mouse,

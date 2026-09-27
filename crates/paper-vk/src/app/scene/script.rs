@@ -4,28 +4,64 @@ use paper_scene::model::script::{Layout, frames};
 use paper_scene::script::SceneScripts;
 use paper_scene::text::script::ScriptText;
 
+#[cfg(test)]
+mod tests;
+
+fn effect_objects(
+    scene: &serde_json::Value,
+) -> std::collections::HashMap<String, &serde_json::Value> {
+    let objects = scene["objects"].as_array().map_or(&[][..], Vec::as_slice);
+    let mut indexed = std::collections::HashMap::with_capacity(objects.len());
+    for object in objects {
+        indexed.entry(object["id"].to_string().trim_matches('"').to_owned()).or_insert(object);
+    }
+    indexed
+}
+
 pub(super) struct Scripts {
-    pub host: SceneScripts,
+    pub host: Option<SceneScripts>,
+    keyframes: paper_scene::keyframe::Bindings,
+    native: Option<(serde_json::Value, paper_scene::model::Properties)>,
     layouts: Vec<Layout>,
     text: Vec<(usize, usize, ScriptText)>,
     pending: bool,
 }
 
 impl Scripts {
-    pub fn take(model: &mut SceneModel, slots: &[usize]) -> Option<Self> {
-        let host = model.scripts.take()?;
-        let layouts = model
-            .layers
-            .iter()
-            .map(|l| Layout::new(l, &host.scene, model.canvas, &host.properties))
-            .collect();
+    pub fn animated(&self) -> bool {
+        self.keyframes.animated() || self.host.as_ref().is_some_and(SceneScripts::animated)
+    }
+
+    pub fn take(model: &mut SceneModel, slots: &[usize]) -> Result<Option<Self>> {
+        let mut host = model.scripts.take();
+        if let Some(host) = &mut host {
+            host.set_keyframes(&model.keyframes)?;
+        }
+        let native = model.animated_scene.take();
+        if host.is_none() && native.is_none() {
+            return Ok(None);
+        }
+        let (scene, properties) = host
+            .as_ref()
+            .map(|h| (&h.scene, &h.properties))
+            .or_else(|| native.as_ref().map(|(s, p)| (s, p)))
+            .unwrap();
+        let layouts =
+            model.layers.iter().map(|l| Layout::new(l, scene, model.canvas, properties)).collect();
         let text = model
             .layers
             .iter_mut()
             .enumerate()
             .filter_map(|(i, l)| Some((i, slots[i], l.script_text.take()?)))
             .collect();
-        Some(Self { host, layouts, text, pending: true })
+        Ok(Some(Self {
+            host,
+            native,
+            keyframes: std::mem::take(&mut model.keyframes),
+            layouts,
+            text,
+            pending: true,
+        }))
     }
 }
 
@@ -109,61 +145,83 @@ impl Group {
     }
 
     fn script_frame(&mut self, scripts: &mut Scripts, time: f32, dt: f32) -> Result<()> {
-        if scripts.host.needs_audio() {
-            for count in paper_audio::spectrum::BAND_COUNTS {
-                if let (Some(left), Some(right)) =
-                    (self.bands.slice(count, false), self.bands.slice(count, true))
-                {
-                    scripts.host.audio(count, left, right)?;
+        let mut changed = match &mut scripts.host {
+            Some(host) => {
+                let changed = scripts.keyframes.apply(&mut host.scene, time);
+                host.sync_keyframes(&scripts.keyframes)?;
+                changed
+            }
+            None => scripts.keyframes.apply(&mut scripts.native.as_mut().unwrap().0, time),
+        };
+        if let Some(host) = &mut scripts.host {
+            if host.needs_audio() {
+                for count in paper_audio::spectrum::BAND_COUNTS {
+                    if let (Some(left), Some(right)) =
+                        (self.bands.slice(count, false), self.bands.slice(count, true))
+                    {
+                        host.audio(count, left, right)?;
+                    }
                 }
             }
-        }
-        let x = self.mouse.position[0] * self.canvas.0;
-        let y = self.mouse.position[1] * self.canvas.1;
-        let hits = scripts
-            .layouts
-            .iter()
-            .zip(&self.quads)
-            .filter_map(|(layout, q)| {
-                let (sin, cos) = q.angle.sin_cos();
-                let dx = x - q.rect[0];
-                let dy = y - q.rect[1];
-                (q.tint[3] > 0.0
-                    && (dx * cos + dy * sin).abs() <= q.rect[2].abs() * 0.5
-                    && (-dx * sin + dy * cos).abs() <= q.rect[3].abs() * 0.5)
-                    .then(|| layout.id.clone())
-            })
-            .collect();
-        scripts.host.pointer(self.mouse.position, self.mouse.buttons, hits)?;
-        let changed = scripts.host.tick(time, dt, self.mouse.position)?;
-        for command in scripts.host.take_commands() {
-            match command {
-                paper_scene::script::ScriptCommand::Sprite { object, op } => {
-                    self.sprite_command(object, op, time);
-                }
-                paper_scene::script::ScriptCommand::Sound { id, op } => {
-                    use paper_scene::script::SoundOp;
-                    let op = match op {
-                        SoundOp::Play => paper_audio::VoiceOp::Play,
-                        SoundOp::Stop => paper_audio::VoiceOp::Stop,
-                        SoundOp::Pause => paper_audio::VoiceOp::Pause,
-                        SoundOp::Gain(gain) => paper_audio::VoiceOp::Gain(gain),
-                    };
-                    self.script_sounds.push((id, op));
+            let x = self.mouse.position[0] * self.canvas.0;
+            let y = self.mouse.position[1] * self.canvas.1;
+            let hits = scripts
+                .layouts
+                .iter()
+                .zip(&self.quads)
+                .filter_map(|(layout, q)| {
+                    let (sin, cos) = q.angle.sin_cos();
+                    let dx = x - q.rect[0];
+                    let dy = y - q.rect[1];
+                    (q.tint[3] > 0.0
+                        && (dx * cos + dy * sin).abs() <= q.rect[2].abs() * 0.5
+                        && (-dx * sin + dy * cos).abs() <= q.rect[3].abs() * 0.5)
+                        .then(|| layout.id.clone())
+                })
+                .collect();
+            host.pointer(self.mouse.position, self.mouse.buttons, hits)?;
+            changed |= host.tick(time, dt, self.mouse.position)?;
+            for command in host.take_commands() {
+                match command {
+                    paper_scene::script::ScriptCommand::Sprite { object, op } => {
+                        self.sprite_command(object, op, time);
+                    }
+                    paper_scene::script::ScriptCommand::Sound { id, op } => {
+                        use paper_scene::script::SoundOp;
+                        let op = match op {
+                            SoundOp::Play => paper_audio::VoiceOp::Play,
+                            SoundOp::Stop => paper_audio::VoiceOp::Stop,
+                            SoundOp::Pause => paper_audio::VoiceOp::Pause,
+                            SoundOp::Gain(gain) => paper_audio::VoiceOp::Gain(gain),
+                        };
+                        self.script_sounds.push((id, op));
+                    }
                 }
             }
+            for (key, value) in host.take_general_changes() {
+                self.apply_general(&key, &value);
+            }
         }
-        for (key, value) in scripts.host.take_general_changes() {
-            self.apply_general(&key, &value);
-        }
+        let (scene, properties) = match &mut scripts.host {
+            Some(host) => (&mut host.scene, &host.properties),
+            None => {
+                let (scene, properties) = scripts.native.as_mut().unwrap();
+                (scene, &*properties)
+            }
+        };
         if !changed && !std::mem::take(&mut scripts.pending) {
             return Ok(());
         }
+        for key in scripts.keyframes.general_keys() {
+            if let Some(value) = scene["general"].get(key) {
+                self.apply_general(key, value);
+            }
+        }
         let particle_states = paper_scene::model::script::particle_frames(
-            &scripts.host.scene,
+            scene,
             self.particles.iter().map(|group| group.id.as_str()),
             self.canvas,
-            &scripts.host.properties,
+            properties,
         );
         for (group, state) in self.particles.iter_mut().zip(particle_states) {
             if group.parent.is_some() {
@@ -175,8 +233,8 @@ impl Group {
                 group.visible = state.visible;
             }
         }
-        let states =
-            frames(&scripts.host.scene, &scripts.layouts, self.canvas, &scripts.host.properties);
+        let mut states = frames(scene, &scripts.layouts, self.canvas, properties);
+        let mut text_layout_changed = false;
         for (index, slot, text) in &mut scripts.text {
             let Some(wanted) = states[*index].as_ref().and_then(|s| s.text.as_ref()) else {
                 continue;
@@ -198,9 +256,12 @@ impl Group {
                 rendered.offset.1 + texture.height as f32 * 0.5,
             ];
             text.shown.clone_from(wanted);
+            text_layout_changed = true;
         }
-        let states =
-            frames(&scripts.host.scene, &scripts.layouts, self.canvas, &scripts.host.properties);
+        if text_layout_changed {
+            states = frames(scene, &scripts.layouts, self.canvas, properties);
+        }
+        let objects = effect_objects(scene);
         for (index, state) in states.into_iter().enumerate() {
             let Some(state) = state else {
                 continue;
@@ -237,12 +298,9 @@ impl Group {
                 };
                 fx.fallback_tint = state.tint;
                 quad.tint = [1.0, 1.0, 1.0, f32::from(state.tint[3] > 0.0)];
-                let node = scripts.host.scene["objects"].as_array().and_then(|nodes| {
-                    nodes.iter().find(|n| n["id"].to_string().trim_matches('"') == fx.layer_id)
-                });
-                if let Some(node) = node {
+                if let Some(node) = objects.get(&fx.layer_id) {
                     for pass in &mut fx.passes {
-                        pass.apply_object_values(node, &scripts.host.properties);
+                        pass.apply_object_values(node, properties);
                     }
                 }
             } else if scripts.layouts[index].hidden_without_fx {
