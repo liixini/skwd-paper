@@ -258,7 +258,6 @@ fn play_stream(
         if PAUSED.load(Ordering::Relaxed) {
             while PAUSED.load(Ordering::Relaxed) && running() {
                 wait_stream(wake_fd, None)?;
-                drain(wake_fd)?;
             }
             clock = FrameClock::new(video.frame_rate, monotonic_ns()?);
             clock.advance();
@@ -492,6 +491,9 @@ fn wait_stream(wake_fd: RawFd, deadline: Option<u64>) -> Result<(), String> {
         let mut descriptor = libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 };
         let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
         if result >= 0 {
+            if result > 0 {
+                drain(wake_fd)?;
+            }
             return Ok(());
         }
         let error = std::io::Error::last_os_error();

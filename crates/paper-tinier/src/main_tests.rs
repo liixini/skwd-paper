@@ -39,3 +39,16 @@ fn stream_fit_letterboxes() {
     let frame = compose_stream_frame(&source, 1, 1, 3, 1, paper_geom::FillMode::Fit);
     assert_eq!(frame, [0, 0, 0, 255, 0, 0, 255, 255, 0, 0, 0, 255]);
 }
+
+#[test]
+fn stream_control_wake_is_consumed_before_the_next_frame_deadline() {
+    let wake = control_wake().unwrap();
+    notify(wake.as_raw_fd());
+    let first_deadline = monotonic_ns().unwrap() + 1_000_000_000;
+    wait_stream(wake.as_raw_fd(), Some(first_deadline)).unwrap();
+    let mut descriptor = libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    assert_eq!(unsafe { libc::poll(&raw mut descriptor, 1, 0) }, 0);
+    let deadline = monotonic_ns().unwrap() + 30_000_000;
+    wait_stream(wake.as_raw_fd(), Some(deadline)).unwrap();
+    assert!(monotonic_ns().unwrap() >= deadline);
+}
