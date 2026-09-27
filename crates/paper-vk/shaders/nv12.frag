@@ -1,11 +1,11 @@
 #version 450
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 frag;
-layout(push_constant) uniform PC { vec2 uv_scale; vec2 uv_off; int fill; float blur; float dim; } pc;
+layout(push_constant) uniform PC { vec2 uv_scale; vec2 uv_off; int fill; float blur; float dim; float background_blur; vec4 background; } pc;
 layout(binding = 0) uniform sampler2D luma;
 layout(binding = 1) uniform sampler2D chroma;
-vec4 filtered(sampler2D source, vec2 uv) {
-    if (pc.blur <= 0.0) return texture(source, uv);
+vec4 filtered(sampler2D source, vec2 uv, float radius) {
+    if (radius <= 0.0) return texture(source, uv);
     const vec2 offsets[48] = vec2[48](
         vec2(0.143986, 0.000000), vec2(-0.184861, 0.169348), vec2(0.028447, -0.324144),
         vec2(0.235530, 0.307208), vec2(-0.434628, -0.076880), vec2(0.414049, -0.263384),
@@ -24,7 +24,7 @@ vec4 filtered(sampler2D source, vec2 uv) {
         vec2(1.972749, 0.540649), vec2(-1.897702, 0.973870), vec2(0.777101, -2.096096),
         vec2(0.890284, 2.186961), vec2(-2.284555, -1.082693), vec2(2.667690, -0.822477)
     );
-    vec2 stepSize = vec2(pc.blur) / vec2(textureSize(luma, 0));
+    vec2 stepSize = vec2(radius) / vec2(textureSize(luma, 0));
     vec4 color = vec4(0.0);
     for (int i = 0; i < 48; i++)
         color += texture(source, uv + offsets[i] * stepSize);
@@ -32,13 +32,19 @@ vec4 filtered(sampler2D source, vec2 uv) {
 }
 void main() {
     vec2 uv = v_uv;
+    float radius = pc.blur;
     if (pc.fill == 1 && (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))) {
-        frag = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
+        if (pc.background_blur == 0.0) {
+            frag = pc.background;
+            return;
+        }
+        vec2 cover_scale = pc.uv_scale / max(pc.uv_scale.x, pc.uv_scale.y);
+        uv = ((v_uv - pc.uv_off) / pc.uv_scale - 0.5) * cover_scale + 0.5;
+        radius = float(min(textureSize(luma, 0).x, textureSize(luma, 0).y)) * 0.035;
     }
     if (pc.fill == 2) uv = fract(uv);
-    float y = filtered(luma, uv).r;
-    vec2 c = filtered(chroma, uv).rg;
+    float y = filtered(luma, uv, radius).r;
+    vec2 c = filtered(chroma, uv, radius).rg;
     // BT.709 limited range
     float yf = (y - 16.0 / 255.0) * (255.0 / 219.0);
     float u = (c.x - 128.0 / 255.0) * (255.0 / 224.0);

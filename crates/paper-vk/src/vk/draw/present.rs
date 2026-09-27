@@ -311,16 +311,26 @@ impl Renderer {
             fill: i32,
             blur: f32,
             dim: f32,
+            background_blur: f32,
+            background: [f32; 4],
         }
         let (blur, dim) = crate::surface::effects();
-        let push = BlitPush { uv, fill: crate::fill_flag(), blur, dim };
+        let background = paper_control::Background::worker();
+        let push = BlitPush {
+            uv,
+            fill: crate::fill_flag(),
+            blur,
+            dim,
+            background_blur: if background.blur { 1.0 } else { 0.0 },
+            background: background.rgba().map(|channel| f32::from(channel) / 255.0),
+        };
         unsafe {
             self.device.cmd_push_constants(
                 self.cmd,
                 self.pipeline_layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
-                std::slice::from_raw_parts((&raw const push).cast(), 28),
+                std::slice::from_raw_parts((&raw const push).cast(), 48),
             );
         }
     }

@@ -676,3 +676,18 @@ fn transition_fps_decodes_additively_and_validates() {
         RendererPolicy { transition_fps: Some(1001), ..Default::default() }.validate().is_err()
     );
 }
+
+#[test]
+fn background_round_trip_and_legacy_default() {
+    let legacy = r#"{"outputs":["DP-1"],"source":{"kind":"static","path":"/a.png"}}"#;
+    let mut assignment: Assignment = serde_json::from_str(legacy).unwrap();
+    assert_eq!(assignment.background, crate::Background::default());
+    assignment.background = crate::Background { color: [1, 2, 3], blur: true };
+    let value = serde_json::to_value(&assignment).unwrap();
+    assert_eq!(value["background"], serde_json::json!({"color":[1,2,3],"blur":true}));
+    assert_eq!(serde_json::from_value::<Assignment>(value).unwrap(), assignment);
+    assert_eq!(
+        AssignmentStatus::from_assignment(&assignment, 1, None, true).background,
+        assignment.background
+    );
+}

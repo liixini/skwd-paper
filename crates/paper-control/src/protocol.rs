@@ -375,6 +375,8 @@ pub struct Assignment {
     pub source: Source,
     #[serde(default, skip_serializing_if = "is_assignment_default")]
     pub fill_mode: FillMode,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub background: crate::Background,
     #[serde(default = "default_mute", skip_serializing_if = "is_assignment_default")]
     pub mute: bool,
     #[serde(default = "default_volume", skip_serializing_if = "is_assignment_default")]
@@ -391,6 +393,7 @@ impl Assignment {
             outputs,
             source,
             fill_mode: FillMode::default(),
+            background: crate::Background::default(),
             mute: default_mute(),
             volume: default_volume(),
             layer: Layer::default(),
@@ -635,6 +638,8 @@ pub struct AssignmentStatus {
     pub outputs: Vec<String>,
     pub source: Source,
     pub fill_mode: FillMode,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub background: crate::Background,
     pub mute: bool,
     pub volume: u32,
     pub layer: Layer,
@@ -655,6 +660,7 @@ impl AssignmentStatus {
             outputs: assignment.outputs.clone(),
             source: assignment.source.clone(),
             fill_mode: assignment.fill_mode,
+            background: assignment.background,
             mute: assignment.mute,
             volume: assignment.volume,
             layer: assignment.layer,

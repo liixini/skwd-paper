@@ -357,6 +357,7 @@ impl BackendPaths {
                     .arg(transition.duration_ms().to_string());
             }
         }
+        command.env("SKWD_PAPER_BACKGROUND", serde_json::to_string(&assignment.background)?);
         command.env_remove("SKWD_PAPER_PREPARE_HIDDEN");
         if static_transition(assignment) {
             command.env("SKWD_PAPER_PREPARE_HIDDEN", "1");
@@ -589,6 +590,7 @@ fn plasma_command(
         }
     };
     let mut command = StdCommand::new(executable);
+    command.env("SKWD_PAPER_BACKGROUND", serde_json::to_string(&assignment.background)?);
     match source.kind {
         SourceKind::Static => {
             command.arg("*").arg(&source.path);
@@ -689,6 +691,7 @@ fn plasma_transition_command(
     }
     let executable = backends.vk.require_headless("Plasma transition presentation")?;
     let mut command = StdCommand::new(executable);
+    command.env("SKWD_PAPER_BACKGROUND", serde_json::to_string(&assignment.background)?);
     command
         .arg("--preview-stream")
         .arg(to)

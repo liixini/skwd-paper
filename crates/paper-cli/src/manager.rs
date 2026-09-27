@@ -944,6 +944,7 @@ fn expand(
 fn same_renderer(left: &Assignment, right: &Assignment) -> bool {
     left.source == right.source
         && left.fill_mode == right.fill_mode
+        && left.background == right.background
         && left.mute == right.mute
         && left.volume == right.volume
         && left.layer == right.layer

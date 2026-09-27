@@ -13,6 +13,18 @@ pub fn apply_fill_mode(
     surf_h: u32,
     mode: FillMode,
 ) -> (u32, u32, Vec<u8>) {
+    compose(img_w, img_h, pixels, surf_w, surf_h, mode, paper_control::Background::worker())
+}
+
+fn compose(
+    img_w: u32,
+    img_h: u32,
+    pixels: &[u8],
+    surf_w: u32,
+    surf_h: u32,
+    mode: FillMode,
+    background: paper_control::Background,
+) -> (u32, u32, Vec<u8>) {
     if surf_w == 0 || surf_h == 0 {
         return (img_w, img_h, pixels.to_vec());
     }
@@ -36,13 +48,14 @@ pub fn apply_fill_mode(
         FillMode::Fit => {
             let (sw, sh) = fit_scaled_size(img_w, img_h, surf_w, surf_h);
             let scaled = resample_view(&src, 0, 0, img_w, img_h, sw, sh);
-            let mut canvas = opaque_black_image(surf_w, surf_h);
+            let mut canvas =
+                background_image(src.as_raw(), img_w, img_h, surf_w, surf_h, background);
             let off_x = ((surf_w - sw) / 2) as i64;
             let off_y = ((surf_h - sh) / 2) as i64;
             imageops::overlay(&mut canvas, &scaled, off_x, off_y);
             canvas
         }
-        FillMode::Center => center_canvas(&src, img_w, img_h, surf_w, surf_h),
+        FillMode::Center => center_canvas(&src, img_w, img_h, surf_w, surf_h, background),
         FillMode::Tile => tile_canvas(&src, img_w, img_h, surf_w, surf_h),
     };
 
@@ -55,6 +68,7 @@ fn center_canvas(
     img_h: u32,
     surf_w: u32,
     surf_h: u32,
+    background: paper_control::Background,
 ) -> RgbaImage {
     if img_w >= surf_w && img_h >= surf_h {
         let cx = (img_w - surf_w) / 2;
@@ -62,7 +76,7 @@ fn center_canvas(
         return resample_view(src, cx, cy, surf_w, surf_h, surf_w, surf_h);
     }
 
-    let mut canvas = opaque_black_image(surf_w, surf_h);
+    let mut canvas = background_image(src.as_raw(), img_w, img_h, surf_w, surf_h, background);
     if img_w >= surf_w {
         let cx = (img_w - surf_w) / 2;
         let cropped = resample_view(src, cx, 0, surf_w, img_h, surf_w, img_h);
@@ -226,6 +240,25 @@ fn resample_loop(
         }
     }
     out
+}
+
+fn background_image(
+    source: &[u8],
+    sw: u32,
+    sh: u32,
+    width: u32,
+    height: u32,
+    background: paper_control::Background,
+) -> RgbaImage {
+    if background.blur {
+        return RgbaImage::from_raw(
+            width,
+            height,
+            paper_geom::blurred_background(source, sw, sh, width, height, false),
+        )
+        .unwrap();
+    }
+    RgbaImage::from_pixel(width, height, Rgba(background.rgba()))
 }
 
 fn opaque_black(w: u32, h: u32) -> Vec<u8> {

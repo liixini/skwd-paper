@@ -207,3 +207,42 @@ fn span_degenerate_black() {
     assert_eq!((w, h), (64, 64));
     assert!(out.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 255]));
 }
+
+#[test]
+fn center_and_fit_background_preserve_foreground() {
+    let background = paper_control::Background { color: [12, 34, 56], blur: false };
+    for mode in [FillMode::Center, FillMode::Fit] {
+        let (_, _, out) = super::compose(2, 1, &solid(2, 1, RED), 6, 6, mode, background);
+        assert_eq!(px(&out, 6, 0, 0), [12, 34, 56, 255]);
+        assert_eq!(px(&out, 6, 3, 2), RED);
+        let (_, _, blurred) = super::compose(
+            2,
+            1,
+            &solid(2, 1, RED),
+            6,
+            6,
+            mode,
+            paper_control::Background { blur: true, ..background },
+        );
+        assert!(blurred.chunks_exact(4).all(|pixel| pixel == RED));
+    }
+}
+
+#[test]
+fn blurred_backdrop_keeps_center_sharp_and_ignores_saved_color() {
+    let source = [255, 0, 0, 255, 0, 0, 255, 255];
+    let (_, _, out) = super::compose(
+        2,
+        1,
+        &source,
+        8,
+        3,
+        FillMode::Center,
+        paper_control::Background { color: [0, 255, 0], blur: true },
+    );
+    assert_eq!(px(&out, 8, 3, 1), [255, 0, 0, 255]);
+    assert_eq!(px(&out, 8, 4, 1), [0, 0, 255, 255]);
+    let border = px(&out, 8, 3, 0);
+    assert!(border[0] > 0 && border[2] > 0);
+    assert_eq!(border[1], 0);
+}

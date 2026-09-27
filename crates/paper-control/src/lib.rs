@@ -1,4 +1,7 @@
+mod background;
 mod media;
+
+pub use background::Background;
 mod multi_video;
 mod output_target;
 mod paper_command;

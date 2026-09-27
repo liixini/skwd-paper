@@ -320,11 +320,20 @@ fn render_stream_frame(
     fill_mode: FillMode,
 ) {
     output.resize(width as usize * height as usize * 4, 0);
-    for pixel in output.chunks_exact_mut(4) {
-        pixel[0] = 0;
-        pixel[1] = 0;
-        pixel[2] = 0;
-        pixel[3] = 255;
+    let background = paper_control::Background::worker();
+    if background.blur && matches!(fill_mode, FillMode::Center | FillMode::Fit) {
+        *output = paper_geom::blurred_background(
+            source,
+            source_width,
+            source_height,
+            width,
+            height,
+            true,
+        );
+    } else {
+        for pixel in output.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&background.rgba());
+        }
     }
     match fill_mode {
         FillMode::Stretch => copy_scaled(
