@@ -33,13 +33,14 @@ fn parent_and_lock_private() {
     assert!(contention.is_err());
     drop(contention);
     drop(lock);
+    drop(wait_for_released_lock(&socket));
+}
+
+fn wait_for_released_lock(socket: &std::path::Path) -> std::fs::File {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        match acquire_lock(&socket) {
-            Ok(lock) => {
-                drop(lock);
-                break;
-            }
+        match acquire_lock(socket) {
+            Ok(lock) => return lock,
             Err(_) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -60,7 +61,7 @@ fn custom_socket_locks_are_private_independent_and_reusable() {
     assert!(acquire_lock(&first).is_err());
     assert!(acquire_lock(&second).is_err());
     drop(first_lock);
-    assert!(acquire_lock(&first).is_ok());
+    let _reacquired = wait_for_released_lock(&first);
     assert!(acquire_lock(&second).is_err());
 }
 
