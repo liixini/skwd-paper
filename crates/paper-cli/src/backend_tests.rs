@@ -583,3 +583,168 @@ fn plasma_transition_rate_does_not_change_the_presenter_rate() {
         super::plasma_transition_command(&backends, &assignment, "1920x1080", 24).unwrap().unwrap();
     assert!(command_parts(&legacy).1.windows(2).any(|pair| pair == ["--preview-fps", "24"]));
 }
+
+fn check_plasma_prelude_routing(test_name: &str, paused: &[bool], gpu: bool, still: bool) {
+    use std::io::{Read, Seek};
+    use std::os::unix::net::UnixStream;
+
+    if let Ok(specs) = std::env::var("SKWD_PAPER_TEST_STREAMS") {
+        let streams: Vec<PlasmaStream> =
+            specs.split(';').map(|spec| super::parse_plasma_stream(spec, false).unwrap()).collect();
+        let source = if still {
+            Source::static_file("/wall/b.png")
+        } else {
+            Source::video("/wall/b.mp4", None)
+        };
+        let mut assignment = Assignment::new(vec!["DP-2".into()], source);
+        assignment.transition = Some(paper_control::TransitionPolicy {
+            from: Some("/wall/a.png".into()),
+            duration_ms: Some(100),
+            ..Default::default()
+        });
+        super::present_plasma(&assignment, &streams).unwrap();
+        unreachable!();
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let renderer = temp.path().join("renderer");
+    executable(
+        &renderer,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SKWD_PAPER_TEST_TRACE/args-$$\"\nprintf 'epoch=%s\\n' \"$SKWD_PAPER_STREAM_EPOCH\" >> \"$SKWD_PAPER_TEST_TRACE/args-$$\"\n",
+    );
+    let mut peers = Vec::new();
+    let mut inherited = Vec::new();
+    let mut retained = Vec::new();
+    let mut frame_files = Vec::new();
+    let mut specs = Vec::new();
+    for (index, paused) in paused.iter().enumerate() {
+        let (mut plugin, paper) = UnixStream::pair().unwrap();
+        plugin.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let frame_file = tempfile::tempfile().unwrap();
+        inherited.extend([paper.as_raw_fd(), frame_file.as_raw_fd()]);
+        specs.push(format!(
+            "fd={},frame_fd={},size={}x16,fps=30,output=instance-{index},paused={paused}",
+            paper.as_raw_fd(),
+            frame_file.as_raw_fd(),
+            16 + index,
+        ));
+        retained.push(paper);
+        frame_files.push(frame_file);
+        peers.push(std::thread::spawn(move || {
+            let mut epochs = Vec::new();
+            loop {
+                let mut packet = [0u8; 32];
+                match plugin.read_exact(&mut packet) {
+                    Ok(()) => {
+                        assert_eq!(&packet[..6], b"SKDG\x07\0");
+                        let epoch = u16::from_le_bytes([packet[6], packet[7]]);
+                        epochs.push(epoch);
+                        plugin.write_all(&paper_runtime::plasma::packet(8, 0, epoch)).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => panic!("stream handoff failed: {error}"),
+                }
+            }
+            epochs
+        }));
+    }
+    let mut command = StdCommand::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env("SKWD_PAPER_TEST_STREAMS", specs.join(";"))
+        .env("SKWD_PAPER_TEST_TRACE", temp.path())
+        .env("SKWD_PAPER_VK_BIN", &renderer)
+        .env("SKWD_PAPER_STILL_BIN", &renderer)
+        .env("SKWD_PAPER_PLASMA_GPU_STREAM", if gpu { "1" } else { "0" })
+        .env_remove("SKWD_PAPER_STREAM_EPOCH")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            for fd in &inherited {
+                if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    drop(retained);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let traces: Vec<String> = fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("args-"))
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+    let preludes: Vec<&String> =
+        traces.iter().filter(|trace| trace.starts_with("--preview-stream\n")).collect();
+    let expected_preludes = paused.iter().filter(|paused| !gpu || !**paused).count();
+    assert_eq!(preludes.len(), expected_preludes);
+    assert_eq!(traces.len(), expected_preludes + 1);
+    let presenter = traces.iter().find(|trace| !trace.starts_with("--preview-stream\n")).unwrap();
+    assert_eq!(presenter.contains("--stream-no-header"), !gpu);
+    for (index, (peer, mut frames)) in peers.into_iter().zip(frame_files).enumerate() {
+        let mut epochs = Vec::new();
+        if gpu && !paused[index] {
+            epochs.push(1);
+        }
+        if gpu && (!still || expected_preludes > 0) {
+            epochs.push(2);
+        }
+        assert_eq!(peer.join().unwrap(), epochs, "stream {index}");
+        frames.rewind().unwrap();
+        let mut header = Vec::new();
+        frames.read_to_end(&mut header).unwrap();
+        if gpu {
+            assert!(header.is_empty());
+        } else {
+            let mut expected = b"SKWP".to_vec();
+            expected.extend_from_slice(&(16 + index as u32).to_le_bytes());
+            expected.extend_from_slice(&16u32.to_le_bytes());
+            assert_eq!(header, expected);
+        }
+    }
+}
+
+#[test]
+fn mixed_gpu_video_streams_skip_only_the_paused_prelude() {
+    check_plasma_prelude_routing(
+        "backend::tests::mixed_gpu_video_streams_skip_only_the_paused_prelude",
+        &[false, true],
+        true,
+        false,
+    );
+}
+
+#[test]
+fn all_paused_gpu_video_streams_start_without_preludes() {
+    check_plasma_prelude_routing(
+        "backend::tests::all_paused_gpu_video_streams_start_without_preludes",
+        &[true, true],
+        true,
+        false,
+    );
+}
+
+#[test]
+fn mixed_gpu_still_streams_rebase_together_after_one_prelude() {
+    check_plasma_prelude_routing(
+        "backend::tests::mixed_gpu_still_streams_rebase_together_after_one_prelude",
+        &[false, true],
+        true,
+        true,
+    );
+}
+
+#[test]
+fn paused_cpu_still_streams_keep_their_preludes_and_headers() {
+    check_plasma_prelude_routing(
+        "backend::tests::paused_cpu_still_streams_keep_their_preludes_and_headers",
+        &[true, true],
+        false,
+        true,
+    );
+}

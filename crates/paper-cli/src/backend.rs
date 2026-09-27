@@ -520,6 +520,9 @@ pub(crate) fn present_plasma(assignment: &Assignment, streams: &[PlasmaStream]) 
     }
     let mut preludes = Vec::new();
     for stream in streams {
+        if route.prelude_gpu && stream.paused {
+            continue;
+        }
         let transition = plasma_transition_command(&backends, assignment, &stream.size, stream.fps)
             .inspect_err(|error| tracing::warn!(%error, "Plasma transition prelude unavailable"))
             .ok()

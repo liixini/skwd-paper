@@ -5048,8 +5048,7 @@ pub(super) fn stream_scene(
             emitted.fill(false);
         }
         let pauses = ctl.take_output_pauses();
-        if !pauses.is_empty() {
-            let all_paused = crate::preview::apply_output_pauses(&mut targets, pauses);
+        if let Some(all_paused) = crate::preview::apply_output_pauses(&mut targets, pauses) {
             ctl.set_paused(all_paused);
         }
         if let Some((revision, position, buttons)) = ctl.pointer() {
@@ -5058,20 +5057,13 @@ pub(super) fn stream_scene(
         let mouse_driven = group.mouse.pending();
         if ctl.paused && presented {
             suspended_at.get_or_insert_with(Instant::now);
-            if let Some(fd) = ctl.wake_fd() {
-                let mut event = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-                let result = unsafe { libc::poll(&raw mut event, 1, 30_000) };
-                if result < 0
-                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-            } else {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if unsafe { libc::getppid() } <= 1 {
-                return Ok(());
-            }
+            crate::preview::wait_any_free(
+                &sockets,
+                &mut free,
+                &vec![false; targets.len()],
+                ctl.wake_fd(),
+                None,
+            )?;
             continue;
         }
         if !property_frame && let Some(started) = suspended_at.take() {
@@ -5112,12 +5104,11 @@ pub(super) fn stream_scene(
             }
             continue;
         }
-        let active: Vec<bool> = targets
-            .iter()
-            .zip(&emitted)
-            .map(|(target, emitted)| !target.paused || !emitted)
-            .collect();
-        crate::preview::wait_any_free(&sockets, &mut free, &active)?;
+        let active: Vec<bool> =
+            targets.iter().zip(&emitted).map(|(target, emitted)| target.active(*emitted)).collect();
+        if !crate::preview::wait_any_free(&sockets, &mut free, &active, ctl.wake_fd(), None)? {
+            continue;
+        }
         let now = Instant::now();
         if now < next_frame {
             std::thread::sleep(next_frame - now);

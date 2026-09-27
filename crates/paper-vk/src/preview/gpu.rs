@@ -61,13 +61,16 @@ pub(crate) fn stream(
     loop {
         let wait_started = Instant::now();
         let deadline = Instant::now() + interval;
-        while let Some(slot) = receive_ack(socket, false)? {
-            free[slot] = true;
-        }
-        while !free.iter().any(|slot| *slot) {
-            if let Some(slot) = receive_ack(socket, true)? {
-                free[slot] = true;
-            }
+        drain_acks(socket, &mut free)?;
+        if !wait_any_free(
+            &[socket],
+            std::slice::from_mut(&mut free),
+            &[true],
+            None,
+            Some(started + duration),
+        )? {
+            consumer_wait += wait_started.elapsed();
+            break;
         }
         let slot = free.iter().position(|slot| *slot).unwrap();
         consumer_wait += wait_started.elapsed();
@@ -117,20 +120,21 @@ pub(crate) fn stream(
         free[slot] = false;
         frames += 1;
         if progress >= 1.0 {
-            unsafe {
-                shared.device.device_wait_idle()?;
-            }
-            tracing::info!(
-                frames,
-                fps = frames as f64 / started.elapsed().as_secs_f64(),
-                consumer_wait_ms = consumer_wait.as_millis(),
-                render_ms = render_time.as_millis(),
-                "skwd-wall-vk: GPU transition complete"
-            );
-            return Ok(());
+            break;
         }
         if let Some(delay) = deadline.checked_duration_since(Instant::now()) {
             std::thread::sleep(delay);
         }
     }
+    unsafe {
+        shared.device.device_wait_idle()?;
+    }
+    tracing::info!(
+        frames,
+        fps = frames as f64 / started.elapsed().as_secs_f64(),
+        consumer_wait_ms = consumer_wait.as_millis(),
+        render_ms = render_time.as_millis(),
+        "skwd-wall-vk: GPU transition complete"
+    );
+    Ok(())
 }

@@ -8,34 +8,6 @@ use anyhow::{Context, Result};
 
 use crate::vk::Src;
 
-fn wait_stream_control(ctl: &mut crate::ctl::Ctl) -> Result<std::time::Duration> {
-    let _ = ctl.poll();
-    if !ctl.paused || !ctl.output_pauses.is_empty() {
-        return Ok(std::time::Duration::ZERO);
-    }
-    let started = Instant::now();
-    while ctl.paused && ctl.output_pauses.is_empty() {
-        let Some(fd) = ctl.wake_fd() else {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let _ = ctl.poll();
-            continue;
-        };
-        let mut event = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        let result = unsafe { libc::poll(&raw mut event, 1, 30_000) };
-        if result < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error.into());
-            }
-        }
-        let _ = ctl.poll();
-        if unsafe { libc::getppid() } <= 1 {
-            return Err(anyhow::anyhow!("stream parent exited"));
-        }
-    }
-    Ok(started.elapsed())
-}
-
 pub(crate) fn parse_size(value: Option<&str>) -> (u32, u32) {
     value
         .and_then(|text| text.split_once('x'))
@@ -421,6 +393,10 @@ pub(crate) struct StreamTarget {
 }
 
 impl StreamTarget {
+    pub(crate) fn active(&self, emitted: bool) -> bool {
+        !self.paused || !emitted
+    }
+
     pub(crate) fn single(socket: RawFd, width: u32, height: u32, fps: u32, paused: bool) -> Self {
         Self { socket, width, height, fps, output: String::new(), paused }
     }
@@ -433,15 +409,17 @@ pub(crate) fn pacing_fps(targets: &[StreamTarget]) -> u32 {
 pub(crate) fn apply_output_pauses(
     targets: &mut [StreamTarget],
     pauses: Vec<(String, bool)>,
-) -> bool {
+) -> Option<bool> {
+    let mut matched = false;
     for (output, paused) in pauses {
         for target in targets.iter_mut() {
             if target.output == output || target.output.is_empty() {
                 target.paused = paused;
+                matched = true;
             }
         }
     }
-    targets.iter().all(|target| target.paused)
+    matched.then(|| targets.iter().all(|target| target.paused))
 }
 
 pub(crate) fn drain_acks(socket: RawFd, free: &mut [bool; 3]) -> std::io::Result<()> {
@@ -457,18 +435,33 @@ pub(crate) fn wait_any_free(
     sockets: &[RawFd],
     free: &mut [[bool; 3]],
     active: &[bool],
-) -> Result<()> {
+    wake: Option<RawFd>,
+    deadline: Option<Instant>,
+) -> Result<bool> {
     loop {
         if free.iter().zip(active).any(|(slots, active)| *active && slots.iter().any(|slot| *slot))
         {
-            return Ok(());
+            return Ok(true);
         }
         let mut events: Vec<libc::pollfd> = sockets
             .iter()
             .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
             .collect();
+        if let Some(fd) = wake {
+            events.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+        }
+        let timeout = if let Some(deadline) = deadline {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(false);
+            };
+            remaining.as_millis().saturating_add(1).min(30_000) as i32
+        } else if wake.is_some() {
+            30_000
+        } else {
+            50
+        };
         let ready =
-            unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, 30_000) };
+            unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, timeout) };
         if ready < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -480,13 +473,19 @@ pub(crate) fn wait_any_free(
             if unsafe { libc::getppid() } <= 1 {
                 return Err(anyhow::anyhow!("stream parent exited"));
             }
+            if wake.is_none() && deadline.is_none() {
+                return Ok(false);
+            }
             continue;
         }
-        for (index, event) in events.iter().enumerate() {
+        for (index, event) in events.iter().take(sockets.len()).enumerate() {
             if event.revents == 0 {
                 continue;
             }
             drain_acks(sockets[index], &mut free[index])?;
+        }
+        if wake.is_some() && events[sockets.len()].revents != 0 {
+            return Ok(false);
         }
     }
 }
@@ -630,7 +629,7 @@ impl VideoStreamer {
         }
         let mut targets: Vec<StreamTarget> =
             self.sinks.iter().map(|sink| sink.target.clone()).collect();
-        let all_paused = apply_output_pauses(&mut targets, pauses);
+        let Some(all_paused) = apply_output_pauses(&mut targets, pauses) else { return };
         for (sink, target) in self.sinks.iter_mut().zip(targets) {
             sink.target.paused = target.paused;
         }
@@ -645,17 +644,27 @@ impl VideoStreamer {
     }
 
     fn wait_for_slot(&mut self) -> Result<()> {
-        for sink in &mut self.sinks {
-            sink.drain_acks()?;
+        loop {
+            let _ = self.ctl.poll();
+            self.route_pauses();
+            for sink in &mut self.sinks {
+                sink.drain_acks()?;
+            }
+            let sockets: Vec<RawFd> = self.sinks.iter().map(|sink| sink.target.socket).collect();
+            let active: Vec<bool> = self
+                .sinks
+                .iter()
+                .map(|sink| sink.target.active(sink.emitted) && (!self.ctl.paused || !sink.emitted))
+                .collect();
+            let mut free: Vec<[bool; 3]> = self.sinks.iter().map(|sink| sink.free).collect();
+            let ready = wait_any_free(&sockets, &mut free, &active, self.ctl.wake_fd(), None)?;
+            for (sink, slots) in self.sinks.iter_mut().zip(free) {
+                sink.free = slots;
+            }
+            if ready {
+                return Ok(());
+            }
         }
-        let sockets: Vec<RawFd> = self.sinks.iter().map(|sink| sink.target.socket).collect();
-        let active: Vec<bool> = self.sinks.iter().map(|sink| !sink.target.paused).collect();
-        let mut free: Vec<[bool; 3]> = self.sinks.iter().map(|sink| sink.free).collect();
-        wait_any_free(&sockets, &mut free, &active)?;
-        for (sink, slots) in self.sinks.iter_mut().zip(free) {
-            sink.free = slots;
-        }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -667,17 +676,6 @@ impl VideoStreamer {
         deadline: Instant,
         relative: f64,
     ) -> Result<bool> {
-        let suspended = if self.emitted {
-            wait_stream_control(&mut self.ctl)?
-        } else {
-            let _ = self.ctl.poll();
-            std::time::Duration::ZERO
-        };
-        self.shift_timeline(suspended);
-        self.route_pauses();
-        if self.ctl.paused {
-            return Ok(self.transition.is_some());
-        }
         let mut deadline = deadline + self.timeline_shift;
         let wait_started = Instant::now();
         self.wait_for_slot()?;
@@ -737,7 +735,10 @@ impl VideoStreamer {
         });
         for sink in &mut self.sinks {
             sink.drain_acks()?;
-            if sink.target.paused || !sink.due(relative) {
+            if !sink.target.active(sink.emitted)
+                || (self.ctl.paused && sink.emitted)
+                || !sink.due(relative)
+            {
                 continue;
             }
             let Some(slot) = sink.free.iter().position(|value| *value) else {
@@ -922,7 +923,6 @@ pub(crate) fn dmabuf_video_stream(
             started = Instant::now();
             streamer.emitted = false;
             for sink in &mut streamer.sinks {
-                sink.emitted = false;
                 sink.next_emit = 0.0;
             }
             previous_frame = None;
