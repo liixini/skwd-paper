@@ -67,6 +67,7 @@ pub struct Ctl {
     wake: Option<paper_runtime::wake::Pipe>,
     pointer: Option<paper_control::PointerState>,
     pointer_revision: u64,
+    surface_changed: bool,
 }
 
 pub fn parse_audio_opts(args: &[String]) -> (bool, u32) {
@@ -142,6 +143,7 @@ impl Ctl {
             route_output_pauses: false,
             pointer: None,
             pointer_revision: 0,
+            surface_changed: false,
         }
     }
 
@@ -161,6 +163,7 @@ impl Ctl {
             route_output_pauses: false,
             pointer: None,
             pointer_revision: 0,
+            surface_changed: false,
         }
     }
 
@@ -189,7 +192,12 @@ impl Ctl {
             route_output_pauses: false,
             pointer: None,
             pointer_revision: 0,
+            surface_changed: false,
         }
+    }
+
+    pub fn take_surface_change(&mut self) -> bool {
+        std::mem::take(&mut self.surface_changed)
     }
 
     pub fn pointer(&self) -> Option<(u64, [f32; 2], [bool; 3])> {
@@ -291,6 +299,13 @@ impl Ctl {
             return None;
         }
         match paper_control::classify_command(cmd) {
+            paper_control::CommandClass::Surface(surface) => {
+                if surface.validate().is_ok() {
+                    crate::surface::set(&surface);
+                    self.surface_changed = true;
+                }
+                None
+            }
             paper_control::CommandClass::Pointer(state) => {
                 if self.pointer != Some(state) {
                     self.pointer = Some(state);

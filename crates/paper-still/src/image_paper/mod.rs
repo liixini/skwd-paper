@@ -9,6 +9,7 @@ mod shm_pixels;
 mod slide;
 mod span;
 mod stream;
+mod surface_effects;
 
 pub use lifecycle::run;
 pub use paper_control::OutputTarget;

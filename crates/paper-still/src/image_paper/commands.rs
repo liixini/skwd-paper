@@ -271,9 +271,21 @@ impl App {
         if !self.persist {
             return;
         }
-        let Some(cmd) = self.pending_cmd.lock().unwrap().take() else {
-            return;
-        };
+        let commands = std::mem::take(&mut *self.pending_cmd.lock().unwrap());
+        for cmd in commands {
+            self.consume_command(&cmd);
+        }
+    }
+
+    fn consume_command(&mut self, cmd: &paper_control::StillCommand) {
+        if let Some(surface) = &cmd.surface
+            && let Err(error) = self.set_surface_effects(surface)
+        {
+            tracing::warn!(%error, "surface effects failed");
+        }
+        if !cmd.path.is_empty() {
+            self.effect_cache = None;
+        }
         if cmd.reveal {
             self.reveal_prepared();
         }
@@ -283,6 +295,7 @@ impl App {
             .and_then(|name| name.parse::<FillMode>().ok())
             .is_some_and(|mode| std::mem::replace(&mut self.fill_mode, mode) != mode);
         if refill {
+            self.effect_cache = None;
             self.preloaded.clear();
             tracing::info!(fill_mode = ?self.fill_mode, "image persist: fill mode changed");
         }

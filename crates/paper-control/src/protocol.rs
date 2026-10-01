@@ -176,6 +176,20 @@ pub struct RendererPolicy {
     pub output_fps: BTreeMap<String, u32>,
 }
 
+impl SurfacePolicy {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.namespace.trim().is_empty()
+            || self.namespace.len() > 128
+            || self.namespace.chars().any(char::is_control)
+            || self.blur > 100
+            || self.dim > 100
+        {
+            return Err(ValidationError::InvalidSurfacePolicy);
+        }
+        Ok(())
+    }
+}
+
 impl RendererPolicy {
     pub fn validate(&self) -> Result<(), ValidationError> {
         if let Some(fps) = self.transition_fps
@@ -188,14 +202,8 @@ impl RendererPolicy {
         {
             return Err(ValidationError::LoadTimeoutOutOfRange(timeout));
         }
-        if self.surface.as_ref().is_some_and(|surface| {
-            surface.namespace.trim().is_empty()
-                || surface.namespace.len() > 128
-                || surface.namespace.chars().any(char::is_control)
-                || surface.blur > 100
-                || surface.dim > 100
-        }) {
-            return Err(ValidationError::InvalidSurfacePolicy);
+        if let Some(surface) = &self.surface {
+            surface.validate()?;
         }
         if let Some(fps) = self.sand.as_ref().and_then(|sand| sand.fps)
             && !(1..=1000).contains(&fps)
@@ -487,7 +495,6 @@ impl ApplyRequest {
             if policy.surface.is_some()
                 && self.assignments.iter().any(|assignment| {
                     assignment.source.effective_video_engine() == Some(VideoEngine::Tinier)
-                        || assignment.transition.is_some()
                 })
             {
                 return Err(ValidationError::InvalidSurfacePolicy);
@@ -603,6 +610,7 @@ impl Request {
             RequestParams::Apply(request) => request.validate(),
             RequestParams::Stop(request) => request.validate(),
             RequestParams::AudioSet(request) => request.validate(),
+            RequestParams::SurfaceSet(request) => request.validate(),
             RequestParams::Pause(_)
             | RequestParams::Status(_)
             | RequestParams::Capabilities(_)
@@ -623,6 +631,8 @@ pub enum RequestParams {
     Pause(PauseRequest),
     #[serde(rename = "paper.audio.set")]
     AudioSet(AudioSetRequest),
+    #[serde(rename = "paper.surface.set")]
+    SurfaceSet(SurfacePolicy),
     #[serde(rename = "paper.status")]
     Status(StatusRequest),
     #[serde(rename = "paper.capabilities")]
@@ -712,6 +722,8 @@ pub struct AudioSetResult {
 pub struct ControlCapabilities {
     pub pause: bool,
     pub audio: bool,
+    #[serde(default)]
+    pub surface_effects: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -841,7 +853,7 @@ impl CapabilitiesResult {
             video_engines: vec![VideoEngine::Default, VideoEngine::Tinier],
             fill_modes: FillMode::ALL.to_vec(),
             layers: vec![Layer::Background, Layer::Bottom, Layer::Top, Layer::Overlay],
-            controls: ControlCapabilities { pause: true, audio: true },
+            controls: ControlCapabilities { pause: true, audio: true, surface_effects: true },
             transitions: TransitionCapabilities {
                 startup_source_kinds: vec![SourceKind::Video, SourceKind::WallpaperEngine],
                 static_overlay: true,

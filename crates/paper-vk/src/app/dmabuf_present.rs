@@ -1521,7 +1521,13 @@ fn run_shared_dmabuf_with_readiness(
             )?;
             xr_ready = true;
         }
-        if target.app.idle && fade.is_none() && pending_swap.is_none() && frames > 0 {
+        let surface_changed = ctl.take_surface_change();
+        if !surface_changed
+            && target.app.idle
+            && fade.is_none()
+            && pending_swap.is_none()
+            && frames > 0
+        {
             idle_paused = true;
             if let Some(audio) = &mut ctl.audio {
                 // Idle remains authoritative if an unpause command arrives while idle.
@@ -1539,7 +1545,10 @@ fn run_shared_dmabuf_with_readiness(
             wall_anchor = None;
             scheduled_q.clear();
         }
-        if ctl.render_paused(fade.is_some() || pending_swap.is_some()) && !ctl.freeze_pending() {
+        if !surface_changed
+            && ctl.render_paused(fade.is_some() || pending_swap.is_some())
+            && !ctl.freeze_pending()
+        {
             target.dispatch_wait_events(Instant::now() + std::time::Duration::from_secs(30))?;
             continue;
         }
@@ -1548,7 +1557,9 @@ fn run_shared_dmabuf_with_readiness(
             wall_anchor = None;
             scheduled_q.clear();
         }
-        if should_park_still(still, fade.is_some(), pending_swap.is_some(), frames) {
+        if !surface_changed
+            && should_park_still(still, fade.is_some(), pending_swap.is_some(), frames)
+        {
             if overlay {
                 tracing::info!("skwd-wall-vk: overlay transition complete, exiting");
                 return Ok(());

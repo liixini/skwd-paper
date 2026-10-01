@@ -57,7 +57,8 @@ pub fn run(
     } else {
         None
     };
-    let pending_cmd: Arc<Mutex<Option<StillCommand>>> = Arc::new(Mutex::new(None));
+    let pending_cmd: Arc<Mutex<std::collections::VecDeque<StillCommand>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let wake = make_wake_pipe()?;
     let mut app = App {
         registry_state,
@@ -79,6 +80,8 @@ pub fn run(
         startup_readiness: StartupReadiness::default(),
         persist,
         pending_cmd: pending_cmd.clone(),
+        cache_effects: std::env::var("SKWD_PAPER_DYNAMIC_EFFECTS").as_deref() == Ok("1"),
+        effect_cache: None,
         namespace: namespace.to_string(),
         layer,
         blur,
@@ -158,14 +161,14 @@ fn run_event_loop(
 }
 
 fn spawn_image_stdin_reader(
-    pending: Arc<Mutex<Option<StillCommand>>>,
+    pending: Arc<Mutex<std::collections::VecDeque<StillCommand>>>,
     wake: paper_runtime::wake::Pipe,
 ) {
     paper_control::spawn_stdin_line_reader("skwd-wall-still persist", move |line| {
         match serde_json::from_str::<StillCommand>(line) {
             Ok(cmd) => {
                 tracing::info!(path = %cmd.path, "image persist: command received");
-                *pending.lock().unwrap() = Some(cmd);
+                pending.lock().unwrap().push_back(cmd);
                 wake.poke();
             }
             Err(err) => {
@@ -308,7 +311,7 @@ impl App {
 
     pub(super) fn try_release_pool(&mut self) {
         self.retired.retain(BufferSet::has_active_buffers);
-        if self.transparent.is_none() {
+        if self.transparent.is_none() && !self.cache_effects {
             self.buffers.retain(|_, buffer| buffer.has_active_buffers());
         }
     }

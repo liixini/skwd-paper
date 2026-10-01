@@ -88,7 +88,7 @@ fn rendered_clock_and_shadow_follow_pointer_and_stop_when_it_stops() {
     assert_eq!(group.quads.len(), 2);
     assert_eq!(group.quads[0].texture, group.quads[1].texture);
     let ordered =
-        super::super::ordered_scene_quads(&group.quads, &group.quad_scene_order, &[], None);
+        super::super::ordered_scene_quads(&group.quads, &group.quad_scene_order, &[], 0, None);
     assert_eq!(ordered[0].tint[..3], [0.0; 3]);
     assert_eq!(ordered[1].tint[..3], [1.0; 3]);
     if let Ok(evidence) = std::env::var("SKWD_WE_CLOCK_EVIDENCE") {

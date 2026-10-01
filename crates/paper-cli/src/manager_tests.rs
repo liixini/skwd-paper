@@ -898,3 +898,54 @@ fn commit_rejects_each_unfinished_static_transition_stage() {
         }
     });
 }
+
+#[test]
+fn live_surface_effects_preserve_workers_and_follow_replacement() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let sharp =
+            paper_control::SurfacePolicy { namespace: "stationary".into(), blur: 0, dim: 0 };
+        let blurred = paper_control::SurfacePolicy { blur: 20, dim: 15, ..sharp.clone() };
+        for source in
+            [Source::static_file("/wall/still.png"), Source::video("/wall/clip.mp4", None)]
+        {
+            let mut request = apply(vec![assignment("DP-1", source)], true);
+            request.policy = Some(RendererPolicy {
+                surface: Some(Box::new(sharp.clone())),
+                ..Default::default()
+            });
+            let initial = fixture.commit(&request).await;
+            fixture.manager.set_surface(blurred.clone()).await.unwrap();
+            assert_eq!(fixture.manager.status()[0].pid, initial[0].pid);
+            let lines = wait_log(fixture.directory.path(), "stdin", initial[0].pid, "surface");
+            assert!(lines.contains("\"blur\":20"));
+            assert_eq!(fixture.manager.policy().unwrap().surface.as_deref(), Some(&blurred));
+            let replaced = fixture.commit(&request).await;
+            assert_ne!(replaced[0].pid, initial[0].pid);
+            assert_eq!(fixture.manager.policy().unwrap().surface.as_deref(), Some(&blurred));
+            fixture.manager.set_surface(sharp.clone()).await.unwrap();
+            assert_eq!(fixture.manager.status()[0].pid, replaced[0].pid);
+            let lines = wait_log(fixture.directory.path(), "stdin", replaced[0].pid, "surface");
+            assert!(lines.contains("\"blur\":0"));
+            let mismatch =
+                paper_control::SurfacePolicy { namespace: "another".into(), blur: 80, dim: 0 };
+            assert!(
+                fixture
+                    .manager
+                    .set_surface(mismatch)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("namespace")
+            );
+            assert_eq!(fixture.manager.status()[0].pid, replaced[0].pid);
+            assert_eq!(fixture.manager.policy().unwrap().surface.as_deref(), Some(&sharp));
+            assert_eq!(fixture.manager.surface_override.as_ref(), Some(&sharp));
+            let lines = std::fs::read_to_string(
+                fixture.directory.path().join(format!("stdin-{}", replaced[0].pid)),
+            )
+            .unwrap();
+            assert!(!lines.contains("\"blur\":80"));
+        }
+    });
+}

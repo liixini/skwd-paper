@@ -31,7 +31,6 @@
 3	crates/paper-vk/src/decode/tests.rs
 16	crates/paper-vk/src/ffmpeg_vulkan.rs
 2	crates/paper-vk/src/freeze.rs
-2	crates/paper-vk/src/main.rs
 2	crates/paper-vk/src/memory.rs
 13	crates/paper-vk/src/preview.rs
 1	crates/paper-vk/src/preview/gpu.rs
@@ -50,6 +49,7 @@
 10	crates/paper-vk/src/vk/pipelines.rs
 4	crates/paper-vk/src/vk/renderer.rs
 20	crates/paper-vk/src/vk/scene.rs
+2	crates/paper-vk/src/vk/scene/tests.rs
 3	crates/paper-vk/src/vk/swapchain.rs
 6	crates/paper-vk/src/vk/upload.rs
 3	crates/paper-vk/src/wayland/protocol.rs

@@ -272,32 +272,29 @@ pub(super) fn create_scene_render_pass(
     device: &ash::Device,
     format: vk::Format,
 ) -> Result<vk::RenderPass> {
-    create_scene_pass(device, format, false)
+    create_scene_pass(device, format, vk::ImageLayout::UNDEFINED)
 }
 
 pub(super) fn create_scene_render_pass_load(
     device: &ash::Device,
     format: vk::Format,
 ) -> Result<vk::RenderPass> {
-    create_scene_pass(device, format, true)
+    create_scene_pass(device, format, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
 }
 
 fn create_scene_pass(
     device: &ash::Device,
     format: vk::Format,
-    load: bool,
+    initial_layout: vk::ImageLayout,
 ) -> Result<vk::RenderPass> {
+    let load = initial_layout != vk::ImageLayout::UNDEFINED;
     unsafe {
         let attachment = [vk::AttachmentDescription::default()
             .format(format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(if load { vk::AttachmentLoadOp::LOAD } else { vk::AttachmentLoadOp::CLEAR })
             .store_op(vk::AttachmentStoreOp::STORE)
-            .initial_layout(if load {
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-            } else {
-                vk::ImageLayout::UNDEFINED
-            })
+            .initial_layout(initial_layout)
             .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let color_ref = [vk::AttachmentReference::default()
             .attachment(0)
@@ -320,7 +317,10 @@ fn create_scene_pass(
                         | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                         | vk::AccessFlags::TRANSFER_READ,
                 )
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                ),
             vk::SubpassDependency::default()
                 .src_subpass(0)
                 .dst_subpass(vk::SUBPASS_EXTERNAL)
@@ -363,6 +363,19 @@ impl Renderer {
         }
         let pass = create_scene_render_pass_load(&self.device, format)?;
         self.format_passes_load.push((format, pass));
+        Ok(pass)
+    }
+
+    pub fn scene_pass_append_for(&mut self, format: vk::Format) -> Result<vk::RenderPass> {
+        self.ensure_scene_pipelines()?;
+        if let Some((_, pass)) =
+            self.format_passes_append.iter().find(|(known, _)| *known == format)
+        {
+            return Ok(*pass);
+        }
+        let pass =
+            create_scene_pass(&self.device, format, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
+        self.format_passes_append.push((format, pass));
         Ok(pass)
     }
 

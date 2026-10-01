@@ -1050,6 +1050,46 @@ impl Renderer {
         textures: &[SceneTexture],
         particles: &[ParticleDraw<'_>],
     ) {
+        self.record_scene_pass_with_canvas(
+            target,
+            canvas,
+            (target.render_pass, clear),
+            quads,
+            textures,
+            particles,
+        );
+    }
+
+    pub fn record_scene_append_with_canvas(
+        &mut self,
+        target: &SceneTarget,
+        canvas: [f32; 2],
+        clear: [f32; 4],
+        quads: &[SceneQuad],
+        textures: &[SceneTexture],
+        particles: &[ParticleDraw<'_>],
+    ) -> Result<()> {
+        let pass = self.scene_pass_append_for(target.format)?;
+        self.record_scene_pass_with_canvas(
+            target,
+            canvas,
+            (pass, clear),
+            quads,
+            textures,
+            particles,
+        );
+        Ok(())
+    }
+
+    fn record_scene_pass_with_canvas(
+        &mut self,
+        target: &SceneTarget,
+        canvas: [f32; 2],
+        (render_pass, clear): (vk::RenderPass, [f32; 4]),
+        quads: &[SceneQuad],
+        textures: &[SceneTexture],
+        particles: &[ParticleDraw<'_>],
+    ) {
         let canvas = [canvas[0].max(1.0), canvas[1].max(1.0)];
         let mut next_particle = 0usize;
         let load_pass = if particles.iter().any(|batch| batch.grab.is_some()) {
@@ -1068,7 +1108,7 @@ impl Renderer {
             self.device.cmd_begin_render_pass(
                 self.cmd,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(target.render_pass)
+                    .render_pass(render_pass)
                     .framebuffer(target.framebuffer)
                     .render_area(vk::Rect2D {
                         offset: vk::Offset2D { x: 0, y: 0 },

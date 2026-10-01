@@ -68,3 +68,24 @@ fn reads_bom_and_rejects_non_objects() {
     std::fs::write(root.path().join("project.json"), b"[]").unwrap();
     assert!(read(root.path()).is_err());
 }
+
+#[test]
+fn video_file_resolves_through_presets_and_stays_inside_the_item() {
+    let root = tempfile::tempdir().unwrap();
+    let base = item(root.path(), "1", &json!({"type":"Video","file":"media/clip.mp4"}));
+    std::fs::create_dir(base.join("media")).unwrap();
+    std::fs::write(base.join("media/clip.mp4"), b"fixture").unwrap();
+    let preset = item(root.path(), "2", &json!({"dependency":"1","preset":{}}));
+    let resolved = Project::resolve(&preset).unwrap();
+    assert_eq!(resolved.kind().as_deref(), Some("video"));
+    assert_eq!(resolved.video_file().unwrap(), base.join("media/clip.mp4").canonicalize().unwrap());
+
+    std::fs::write(root.path().join("outside.mp4"), b"fixture").unwrap();
+    std::os::unix::fs::symlink(root.path().join("outside.mp4"), base.join("link.mp4")).unwrap();
+    for file in ["link.mp4", "../outside.mp4", "/outside.mp4", "missing.mp4", ""] {
+        let project = item(root.path(), "3", &json!({"type":"video","file":file}));
+        assert!(Project::resolve(&project).unwrap().video_file().is_err(), "{file}");
+    }
+    let untyped = item(root.path(), "4", &json!({}));
+    assert_eq!(Project::resolve(&untyped).unwrap().kind(), None);
+}

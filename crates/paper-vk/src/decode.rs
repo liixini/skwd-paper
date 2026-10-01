@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use ffmpeg_the_third as ff;
 
 pub(crate) mod still;
+pub(crate) mod thumbnail;
 
 const HW_THREAD_COUNT: i32 = 1;
 const CONSECUTIVE_PACKET_ERROR_LIMIT: usize = 16;

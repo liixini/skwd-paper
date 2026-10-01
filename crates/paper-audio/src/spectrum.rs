@@ -1,6 +1,5 @@
-use anyhow::{Context, Result, anyhow};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::traits::{Consumer, Producer, Split};
+use anyhow::{Result, anyhow};
+use ringbuf::traits::{Consumer, Split};
 
 pub const BAND_COUNTS: [usize; 3] = [16, 32, 64];
 const WINDOW: usize = 2048;
@@ -9,7 +8,7 @@ const HOLD: f32 = 0.25;
 const ATTACK_TAU: f32 = 0.045;
 const RELEASE_TAU: f32 = 0.28;
 const GAIN: f32 = 30.0;
-const BRIDGES: [&str; 2] = ["pulse", "pipewire"];
+const DEFAULT_MONITOR: &str = "@DEFAULT_MONITOR@";
 
 #[derive(Clone)]
 pub struct Bands {
@@ -59,8 +58,14 @@ impl Bands {
     }
 }
 
-pub fn source_name() -> String {
-    std::env::var("SKWD_VK_AUDIO_SOURCE").unwrap_or_else(|_| "@DEFAULT_MONITOR@".to_string())
+fn monitor_source(source: Option<&std::ffi::OsStr>) -> Result<&'static str> {
+    match source {
+        None => Ok(DEFAULT_MONITOR),
+        Some(source) if source == DEFAULT_MONITOR => Ok(DEFAULT_MONITOR),
+        Some(source) => {
+            Err(anyhow!("SKWD_VK_AUDIO_SOURCE must be {DEFAULT_MONITOR}, got {source:?}"))
+        }
+    }
 }
 
 fn tuned(name: &str, fallback: f32) -> f32 {
@@ -147,13 +152,8 @@ fn spectrum_levels(re: &[f32], im: &[f32], edges: &[(usize, usize)], gain: f32) 
     levels
 }
 
-enum Capture {
-    Monitor(crate::pulse::MonitorCapture),
-    Bridge(cpal::Stream),
-}
-
 pub struct Analyser {
-    _capture: Capture,
+    _capture: crate::pulse::MonitorCapture,
     consumer: ringbuf::HeapCons<f32>,
     channels: usize,
     edges: Vec<(usize, usize)>,
@@ -171,32 +171,33 @@ pub struct Analyser {
 
 impl Analyser {
     pub fn start() -> Result<Self> {
-        let source = source_name();
+        let source = std::env::var_os("SKWD_VK_AUDIO_SOURCE");
+        Self::start_with_capture(source.as_deref(), crate::pulse::MonitorCapture::start)
+    }
+
+    fn start_with_capture(
+        source: Option<&std::ffi::OsStr>,
+        capture: impl FnOnce(&str, ringbuf::HeapProd<f32>) -> Result<crate::pulse::MonitorCapture>,
+    ) -> Result<Self> {
+        let source = monitor_source(source)?;
         let (producer, consumer) =
             ringbuf::HeapRb::<f32>::new(WINDOW * usize::from(crate::pulse::CHANNELS) * 8).split();
-        match crate::pulse::MonitorCapture::start(&source, producer) {
-            Ok(capture) => {
-                tracing::info!(
-                    "skwd-wall-vk: audio capture on pulse monitor source={source} rate={} channels={}",
-                    crate::pulse::RATE,
-                    crate::pulse::CHANNELS
-                );
-                return Ok(Self::with_capture(
-                    Capture::Monitor(capture),
-                    consumer,
-                    crate::pulse::RATE as f32,
-                    usize::from(crate::pulse::CHANNELS),
-                ));
-            }
-            Err(error) => tracing::info!(
-                "skwd-wall-vk: pulse monitor capture unavailable ({error}); using the ALSA bridge"
-            ),
-        }
-        Self::start_bridge()
+        let capture = capture(source, producer)?;
+        tracing::info!(
+            "skwd-wall-vk: audio capture on pulse monitor source={source} rate={} channels={}",
+            crate::pulse::RATE,
+            crate::pulse::CHANNELS
+        );
+        Ok(Self::with_capture(
+            capture,
+            consumer,
+            crate::pulse::RATE as f32,
+            usize::from(crate::pulse::CHANNELS),
+        ))
     }
 
     fn with_capture(
-        capture: Capture,
+        capture: crate::pulse::MonitorCapture,
         consumer: ringbuf::HeapCons<f32>,
         rate: f32,
         channels: usize,
@@ -221,46 +222,6 @@ impl Analyser {
             starved: 0.0,
             cursor: 0,
         }
-    }
-
-    fn start_bridge() -> Result<Self> {
-        let host = cpal::default_host();
-        let mut device = None;
-        for wanted in BRIDGES {
-            if let Ok(mut found) = host.input_devices()
-                && let Some(hit) =
-                    found.find(|candidate| candidate.name().is_ok_and(|name| name == wanted))
-            {
-                device = Some(hit);
-                break;
-            }
-        }
-        let device = device
-            .or_else(|| host.default_input_device())
-            .ok_or_else(|| anyhow!("no audio capture device"))?;
-        let name = device.name().unwrap_or_else(|_| "?".to_string());
-        let config = device.default_input_config().context("capture config")?;
-        let rate = config.sample_rate().0 as f32;
-        let channels = config.channels().max(1) as usize;
-        let (mut producer, consumer) = ringbuf::HeapRb::<f32>::new(WINDOW * channels * 8).split();
-        let stream = device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    for sample in data {
-                        let _ = producer.try_push(*sample);
-                    }
-                },
-                |error| tracing::warn!("skwd-wall-vk: audio capture error {error}"),
-                None,
-            )
-            .context("capture stream")?;
-        stream.play().context("capture start")?;
-        tracing::info!(
-            "skwd-wall-vk: audio capture on {name} source={} rate={rate} channels={channels}",
-            source_name()
-        );
-        Ok(Self::with_capture(Capture::Bridge(stream), consumer, rate, channels))
     }
 
     fn drain(&mut self) -> usize {

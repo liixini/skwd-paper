@@ -25,17 +25,7 @@ fn version_requested(arguments: &[String]) -> bool {
     arguments.get(1).is_some_and(|argument| argument == "--version" || argument == "-V")
 }
 
-fn audio_source_env() {
-    if std::env::var_os("PULSE_SOURCE").is_none() {
-        unsafe { std::env::set_var("PULSE_SOURCE", paper_audio::spectrum::source_name()) };
-    }
-    if std::env::var_os("PIPEWIRE_PROPS").is_none() {
-        unsafe { std::env::set_var("PIPEWIRE_PROPS", "{ stream.capture.sink = true }") };
-    }
-}
-
 fn main() {
-    audio_source_env();
     let arguments: Vec<String> = std::env::args().collect();
     if version_requested(&arguments) {
         println!("skwd-wall-vk {}", env!("CARGO_PKG_VERSION"));

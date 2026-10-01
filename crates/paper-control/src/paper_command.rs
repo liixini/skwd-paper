@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperCommand {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<Box<crate::SurfacePolicy>>,
     #[serde(default, alias = "path")]
     pub to: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +88,7 @@ impl PaperCommand {
 
     pub fn swap_video(to: &str, mute: bool, volume: u32) -> Self {
         Self {
+            surface: None,
             to: to.to_string(),
             mute: Some(mute),
             volume: Some(volume.min(100)),
@@ -103,6 +106,7 @@ impl PaperCommand {
 
     pub fn swap_paper(to: &str, shader: &str, duration_ms: u64, mute: bool, volume: u32) -> Self {
         Self {
+            surface: None,
             to: to.to_string(),
             mute: Some(mute),
             volume: Some(volume.min(100)),
@@ -120,6 +124,7 @@ impl PaperCommand {
 
     pub fn audio(mute: Option<bool>, volume: Option<u32>) -> Self {
         Self {
+            surface: None,
             to: String::new(),
             mute,
             volume: volume.map(|value| value.min(100)),
@@ -149,6 +154,7 @@ impl PaperCommand {
 
     pub fn pause(paused: bool) -> Self {
         Self {
+            surface: None,
             to: String::new(),
             mute: None,
             volume: None,
@@ -166,6 +172,7 @@ impl PaperCommand {
 
     pub fn duck(ducked: bool) -> Self {
         Self {
+            surface: None,
             to: String::new(),
             mute: None,
             volume: None,
@@ -183,6 +190,7 @@ impl PaperCommand {
 
     pub fn freeze(path: &str) -> Self {
         Self {
+            surface: None,
             to: String::new(),
             mute: None,
             volume: None,
@@ -200,6 +208,7 @@ impl PaperCommand {
 
     pub fn retain_outputs(outputs: &[String]) -> Self {
         Self {
+            surface: None,
             to: String::new(),
             mute: None,
             volume: None,
@@ -222,6 +231,7 @@ impl PaperCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandClass {
+    Surface(crate::SurfacePolicy),
     Pointer(PointerState),
     Freeze(String),
     Pause(bool),
@@ -232,6 +242,9 @@ pub enum CommandClass {
 }
 
 pub fn classify_command(command: PaperCommand) -> CommandClass {
+    if let Some(surface) = command.surface {
+        return CommandClass::Surface(*surface);
+    }
     if let Some(pointer) = command.pointer {
         return CommandClass::Pointer(pointer);
     }

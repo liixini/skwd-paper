@@ -1,4 +1,55 @@
-use super::{BAND_COUNTS, Bands, GAIN, WINDOW, band_edges, fft, spectrum_levels};
+use std::ffi::OsStr;
+
+use super::{
+    Analyser, BAND_COUNTS, Bands, GAIN, WINDOW, band_edges, fft, monitor_source, spectrum_levels,
+};
+
+#[test]
+fn audio_source_accepts_only_the_default_output_monitor() {
+    assert_eq!(monitor_source(None).unwrap(), "@DEFAULT_MONITOR@");
+    assert_eq!(monitor_source(Some(OsStr::new("@DEFAULT_MONITOR@"))).unwrap(), "@DEFAULT_MONITOR@");
+    for source in [
+        "",
+        "@DEFAULT_SOURCE@",
+        "alsa_input.pci.mic",
+        "alsa_output.pci.monitor",
+        "@DEFAULT_MONITOR@.monitor",
+        " @DEFAULT_MONITOR@",
+    ] {
+        assert!(monitor_source(Some(OsStr::new(source))).is_err(), "accepted {source:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_source_override_is_rejected() {
+    use std::os::unix::ffi::OsStrExt;
+
+    assert!(monitor_source(Some(OsStr::from_bytes(b"@DEFAULT_MONITOR@\xff"))).is_err());
+}
+
+#[test]
+fn rejected_source_never_opens_capture() {
+    let error = Analyser::start_with_capture(Some(OsStr::new("@DEFAULT_SOURCE@")), |_, _| {
+        panic!("capture must not open for an input source")
+    })
+    .err()
+    .expect("source override must fail");
+    assert!(error.to_string().contains("SKWD_VK_AUDIO_SOURCE"));
+}
+
+#[test]
+fn monitor_capture_failure_returns_without_a_fallback() {
+    for source in [None, Some(OsStr::new("@DEFAULT_MONITOR@"))] {
+        let error = Analyser::start_with_capture(source, |name, _| {
+            assert_eq!(name, "@DEFAULT_MONITOR@");
+            Err(anyhow::anyhow!("monitor capture unavailable"))
+        })
+        .err()
+        .expect("capture failure must propagate");
+        assert_eq!(error.to_string(), "monitor capture unavailable");
+    }
+}
 
 fn tone_levels(hz: f32, amplitude: f32, rate: f32) -> [f32; 64] {
     let mut re: Vec<f32> = super::hann()

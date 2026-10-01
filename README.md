@@ -155,6 +155,7 @@ Use a separate `SKWD_PAPER_V2_SOCKET` for an independently controlled backdrop. 
 | Pause after 60 seconds without input (requires idle-notify) | `skwd-paper-v2 apply DP-1 video.mp4 --idle-seconds 60 --replace-all` |
 | Show current wallpapers | `skwd-paper-v2 status` |
 | Show supported features | `skwd-paper-v2 capabilities` |
+| Save a PNG thumbnail of a scene or video | `echo '{"source":"/path/to/item","destination":"/tmp/thumb.png"}' \| skwd-paper-v2 capture-scenes` |
 | Show installed commands | `skwd-paper-v2 --help` |
 | Stop wallpapers on two monitors | `skwd-paper-v2 stop DP-1 DP-2` |
 | Stop all wallpapers and exit | `skwd-paper-v2 stop` |

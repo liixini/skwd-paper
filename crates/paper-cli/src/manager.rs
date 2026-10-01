@@ -159,6 +159,7 @@ impl ApplyTransaction {
 }
 
 pub(crate) struct Manager {
+    surface_override: Option<paper_control::SurfacePolicy>,
     backends: Option<BackendPaths>,
     workers: Vec<Worker>,
     overlays: Vec<Worker>,
@@ -173,6 +174,7 @@ pub(crate) struct Manager {
 impl Manager {
     pub(crate) fn new() -> Self {
         Self {
+            surface_override: None,
             backends: None,
             workers: Vec::new(),
             overlays: Vec::new(),
@@ -188,6 +190,7 @@ impl Manager {
     #[cfg(test)]
     pub(crate) fn with_backends(backends: BackendPaths, freeze_parent: PathBuf) -> Self {
         Self {
+            surface_override: None,
             backends: Some(backends),
             workers: Vec::new(),
             overlays: Vec::new(),
@@ -202,6 +205,36 @@ impl Manager {
     #[cfg(test)]
     pub(crate) fn refresh_sweeps(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         Arc::clone(&self.refresh_sweeps)
+    }
+
+    pub(crate) async fn set_surface(
+        &mut self,
+        surface: paper_control::SurfacePolicy,
+    ) -> Result<()> {
+        surface.validate()?;
+        if !self.is_empty() {
+            let current = self
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.surface.as_ref())
+                .ok_or_else(|| anyhow!("active composition has no surface policy"))?;
+            if current.namespace != surface.namespace {
+                return Err(anyhow!("surface namespace does not match active composition"));
+            }
+            let previous = (**current).clone();
+            let mut workers: Vec<_> = self.workers.iter_mut().chain(&mut self.overlays).collect();
+            for index in 0..workers.len() {
+                if let Err(error) = workers[index].set_surface(&surface).await {
+                    for worker in &mut workers[..index] {
+                        let _ = worker.set_surface(&previous).await;
+                    }
+                    return Err(error);
+                }
+            }
+            self.policy.as_mut().unwrap().surface = Some(Box::new(surface.clone()));
+        }
+        self.surface_override = Some(surface);
+        Ok(())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -258,16 +291,19 @@ impl Manager {
     ) -> Result<ApplyTransaction> {
         request.validate().map_err(|error| anyhow!(error.to_string()))?;
         self.refresh()?;
-        if !self.workers.is_empty()
-            && !request.replace_all
-            && request.policy.as_ref().is_some_and(|policy| Some(policy) != self.policy.as_ref())
-        {
-            return Err(anyhow!("changing renderer policy requires replace_all"));
-        }
         if self.paused {
             return Err(anyhow!("resume Paper before applying a new composition"));
         }
-        let policy = request.policy.clone().or_else(|| self.policy.clone());
+        let mut policy = request.policy.clone().or_else(|| self.policy.clone());
+        if let Some(surface) = policy.as_mut().and_then(|policy| policy.surface.as_mut())
+            && let Some(effects) = &self.surface_override
+            && surface.namespace == effects.namespace
+        {
+            **surface = effects.clone();
+        }
+        if !self.workers.is_empty() && !request.replace_all && policy != self.policy {
+            return Err(anyhow!("changing renderer policy requires replace_all"));
+        }
         if policy.as_ref().and_then(|policy| policy.transitions_enabled) == Some(false)
             && request.assignments.iter().any(|assignment| assignment.transition.is_some())
         {

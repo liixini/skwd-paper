@@ -455,7 +455,7 @@ fn response_goldens() {
             r#""video_engines":["default","tinier"],"#,
             r#""fill_modes":["fill","fit","stretch","center","tile","span"],"#,
             r#""layers":["background","bottom","top","overlay"],"#,
-            r#""controls":{"pause":true,"audio":true},"#,
+            r#""controls":{"pause":true,"audio":true,"surface_effects":true},"#,
             r#""transitions":{"startup_source_kinds":["video","we"],"#,
             r#""static_overlay":true,"default_effect":"fade","default_duration_ms":600,"#,
             r#""min_duration_ms":50,"max_duration_ms":10000},"#,
@@ -690,4 +690,31 @@ fn background_round_trip_and_legacy_default() {
         AssignmentStatus::from_assignment(&assignment, 1, None, true).background,
         assignment.background
     );
+}
+
+#[test]
+fn surface_control_is_validated_and_round_trips() {
+    let request = Request::new(
+        77,
+        RequestParams::SurfaceSet(SurfacePolicy {
+            namespace: "skwd-paper-stationary".into(),
+            blur: 20,
+            dim: 30,
+        }),
+    );
+    assert!(request.validate().is_ok());
+    let line = encode_ndjson(&request).unwrap();
+    assert!(line.contains("paper.surface.set"));
+    assert_eq!(decode_ndjson::<Request>(&line).unwrap(), request);
+    for surface in [
+        SurfacePolicy { namespace: String::new(), blur: 0, dim: 0 },
+        SurfacePolicy { namespace: "stationary".into(), blur: 101, dim: 0 },
+        SurfacePolicy { namespace: "stationary".into(), blur: 0, dim: 101 },
+    ] {
+        assert_eq!(
+            Request::new(1, RequestParams::SurfaceSet(surface)).validate(),
+            Err(ValidationError::InvalidSurfacePolicy)
+        );
+    }
+    assert!(CapabilitiesResult::current().controls.surface_effects);
 }

@@ -22,6 +22,7 @@ fn ctl_reduce() {
     let mut ctl = Ctl::with_receiver(rx);
 
     tx.send(PaperCommand {
+        surface: None,
         to: String::new(),
         mute: Some(false),
         volume: Some(40),
@@ -41,6 +42,7 @@ fn ctl_reduce() {
     assert_eq!(ctl.volume, 40);
 
     tx.send(PaperCommand {
+        surface: None,
         to: String::new(),
         mute: None,
         volume: None,
@@ -179,4 +181,22 @@ fn duck_command_leaves_mute_and_pause_alone() {
     assert!(ctl.poll().is_none());
     assert!(!ctl.ducked);
     assert!(!ctl.mute);
+}
+
+#[test]
+fn surface_effects_redraw_without_resuming_or_swapping() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut ctl = Ctl::with_receiver(rx);
+    ctl.set_paused(true);
+    let mut command = PaperCommand::audio(None, None);
+    command.surface = Some(Box::new(paper_control::SurfacePolicy {
+        namespace: "stationary".into(),
+        blur: 20,
+        dim: 10,
+    }));
+    tx.send(command).unwrap();
+    assert!(ctl.poll().is_none());
+    assert!(ctl.paused);
+    assert!(ctl.take_surface_change());
+    assert!(!ctl.take_surface_change());
 }

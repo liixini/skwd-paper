@@ -36,6 +36,7 @@ pub struct Renderer {
     pub(super) scene_pass: vk::RenderPass,
     pub(super) format_passes: Vec<(vk::Format, vk::RenderPass)>,
     pub(super) format_passes_load: Vec<(vk::Format, vk::RenderPass)>,
+    pub(super) format_passes_append: Vec<(vk::Format, vk::RenderPass)>,
     pub(super) scene_pool: vk::DescriptorPool,
     pub(super) fx_pool: vk::DescriptorPool,
     pub(super) pipeline_layout_layer: vk::PipelineLayout,
@@ -474,6 +475,7 @@ impl Renderer {
                 scene_pass: vk::RenderPass::null(),
                 format_passes: Vec::new(),
                 format_passes_load: Vec::new(),
+                format_passes_append: Vec::new(),
                 scene_pool: vk::DescriptorPool::null(),
                 fx_pool: vk::DescriptorPool::null(),
                 pipeline_layout_layer: vk::PipelineLayout::null(),
@@ -556,8 +558,11 @@ impl Drop for Renderer {
             }
             if self.scene_pass != vk::RenderPass::null() {
                 self.device.destroy_render_pass(self.scene_pass, None);
-                for (_, pass) in
-                    self.format_passes.drain(..).chain(self.format_passes_load.drain(..))
+                for (_, pass) in self
+                    .format_passes
+                    .drain(..)
+                    .chain(self.format_passes_load.drain(..))
+                    .chain(self.format_passes_append.drain(..))
                 {
                     self.device.destroy_render_pass(pass, None);
                 }

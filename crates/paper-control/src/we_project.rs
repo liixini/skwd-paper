@@ -1,7 +1,7 @@
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const MAX_PRESET_DEPTH: usize = 32;
 
@@ -122,6 +122,39 @@ impl Project {
 
     pub fn scene_package(&self) -> io::Result<PathBuf> {
         package_in(&self.source)
+    }
+
+    pub fn kind(&self) -> Option<String> {
+        self.document.get("type").and_then(Value::as_str).map(str::to_ascii_lowercase)
+    }
+
+    pub fn video_file(&self) -> io::Result<PathBuf> {
+        let relative = self
+            .document
+            .get("file")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| io::Error::other("Wallpaper Engine video file is missing"))?;
+        let relative = Path::new(relative);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(io::Error::other(
+                "Wallpaper Engine video path must stay inside its item directory",
+            ));
+        }
+        let video = self.source.join(relative).canonicalize().map_err(|error| {
+            io::Error::new(error.kind(), format!("resolve Wallpaper Engine video file: {error}"))
+        })?;
+        if !video.starts_with(&self.source) || !video.is_file() {
+            return Err(io::Error::other("Wallpaper Engine video path escapes its item directory"));
+        }
+        Ok(video)
     }
 }
 

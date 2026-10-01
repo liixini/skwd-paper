@@ -963,25 +963,31 @@ fn particle_batches<'a>(
     image_orders: &[usize],
     particle_quads: &[OrderedParticleQuad],
     draws: &[OrderedParticleDraw],
+    from: usize,
     before: Option<usize>,
     grab: Option<&'a vk::SceneTarget>,
 ) -> Vec<vk::ParticleDraw<'a>> {
     let mut out: Vec<vk::ParticleDraw<'a>> = draws
         .iter()
-        .filter(|draw| before.is_none_or(|limit| draw.scene_order < limit))
+        .filter(|draw| {
+            draw.scene_order >= from && before.is_none_or(|limit| draw.scene_order < limit)
+        })
         .filter_map(|draw| {
             let group = groups.get(draw.group)?;
             let engine = group.engine.as_ref()?;
             let after = image_orders
                 .iter()
                 .filter(|order| {
-                    before.is_none_or(|limit| **order < limit) && **order <= draw.scene_order
+                    **order >= from
+                        && before.is_none_or(|limit| **order < limit)
+                        && **order <= draw.scene_order
                 })
                 .count()
                 + particle_quads
                     .iter()
                     .filter(|quad| {
-                        before.is_none_or(|limit| quad.scene_order < limit)
+                        quad.scene_order >= from
+                            && before.is_none_or(|limit| quad.scene_order < limit)
                             && quad.scene_order <= draw.scene_order
                     })
                     .count();
@@ -1089,6 +1095,10 @@ struct Group {
     target: vk::SceneTarget,
     scene_snapshot: Option<vk::SceneTarget>,
     scene_grab: Option<vk::SceneTarget>,
+    #[cfg(test)]
+    replay_snapshots: bool,
+    #[cfg(test)]
+    snapshot_draws: Vec<(usize, usize)>,
     frozen: bool,
     composed_at: f32,
     from: Option<FadeSource>,
@@ -1364,6 +1374,7 @@ impl Group {
             );
         }
         if let Some(snapshot) = &self.scene_snapshot {
+            self.renderer.scene_pass_append_for(snapshot.format)?;
             for slot in self.fx.iter().filter_map(|fx| fx.snapshot_slot) {
                 self.renderer.point_slot_at(&self.textures[slot], snapshot.view);
             }
@@ -1833,12 +1844,13 @@ impl Group {
         if self.fx.is_empty() {
             let clear = [self.clear[0], self.clear[1], self.clear[2], 1.0];
             let quads =
-                ordered_scene_quads(&self.quads, &self.quad_scene_order, &particle_quads, None);
+                ordered_scene_quads(&self.quads, &self.quad_scene_order, &particle_quads, 0, None);
             let batches = particle_batches(
                 &self.particles,
                 &self.quad_scene_order,
                 &particle_quads,
                 &particle_draws,
+                0,
                 None,
                 self.scene_grab.as_ref(),
             );
@@ -1871,6 +1883,13 @@ impl Group {
             scene_targets.insert((layer.layer_id.clone(), CompositeBuffer::A), sample);
             scene_targets.insert((layer.layer_id.clone(), CompositeBuffer::B), sample);
         }
+        let incremental_snapshots =
+            !debug_fx && self.fx.windows(2).all(|pair| pair[0].scene_order <= pair[1].scene_order);
+        #[cfg(test)]
+        let incremental_snapshots = incremental_snapshots && !self.replay_snapshots;
+        #[cfg(test)]
+        self.snapshot_draws.clear();
+        let mut snapshot_before = None;
         for fx_index in 0..self.fx.len() {
             if self.scripts.is_some()
                 && self.quads[self.fx[fx_index].quad].tint[3] <= 0.0
@@ -1887,6 +1906,7 @@ impl Group {
                 .as_ref()
                 .map(|target| (target.view, target.sampler, target.extent));
             if needs_snapshot {
+                let from = if incremental_snapshots { snapshot_before.unwrap_or(0) } else { 0 };
                 let target = self
                     .scene_snapshot
                     .as_ref()
@@ -1895,6 +1915,7 @@ impl Group {
                     &self.quads,
                     &self.quad_scene_order,
                     &particle_quads,
+                    from,
                     Some(scene_order),
                 );
                 let batches = particle_batches(
@@ -1902,12 +1923,24 @@ impl Group {
                     &self.quad_scene_order,
                     &particle_quads,
                     &particle_draws,
+                    from,
                     Some(scene_order),
                     self.scene_grab.as_ref(),
                 );
+                #[cfg(test)]
+                self.snapshot_draws.push((prefix.len(), batches.len()));
                 let clear = [self.clear[0], self.clear[1], self.clear[2], 1.0];
                 if debug_fx {
                     self.renderer.render_scene_with_canvas(
+                        target,
+                        logical_canvas,
+                        clear,
+                        &prefix,
+                        &self.textures,
+                        &batches,
+                    )?;
+                } else if incremental_snapshots && snapshot_before.is_some() {
+                    self.renderer.record_scene_append_with_canvas(
                         target,
                         logical_canvas,
                         clear,
@@ -1925,6 +1958,7 @@ impl Group {
                         &batches,
                     );
                 }
+                snapshot_before = Some(scene_order);
             }
             let quad = &self.quads[self.fx[fx_index].quad];
             let projection = background_projection(quad.rect, quad.angle, self.canvas);
@@ -2136,12 +2170,14 @@ impl Group {
             }
         }
         let clear = [self.clear[0], self.clear[1], self.clear[2], 1.0];
-        let quads = ordered_scene_quads(&self.quads, &self.quad_scene_order, &particle_quads, None);
+        let quads =
+            ordered_scene_quads(&self.quads, &self.quad_scene_order, &particle_quads, 0, None);
         let batches = particle_batches(
             &self.particles,
             &self.quad_scene_order,
             &particle_quads,
             &particle_draws,
+            0,
             None,
             self.scene_grab.as_ref(),
         );
@@ -2527,13 +2563,14 @@ fn ordered_scene_quads(
     image_quads: &[vk::SceneQuad],
     image_order: &[usize],
     particle_quads: &[OrderedParticleQuad],
+    from: usize,
     before: Option<usize>,
 ) -> Vec<vk::SceneQuad> {
     let mut ordered: Vec<(usize, usize, vk::SceneQuad)> = image_quads
         .iter()
         .zip(image_order)
         .enumerate()
-        .filter(|(_, (_, order))| before.is_none_or(|limit| **order < limit))
+        .filter(|(_, (_, order))| **order >= from && before.is_none_or(|limit| **order < limit))
         .map(|(serial, (quad, order))| (*order, serial, quad.clone()))
         .collect();
     let offset = ordered.len();
@@ -2541,7 +2578,9 @@ fn ordered_scene_quads(
         particle_quads
             .iter()
             .enumerate()
-            .filter(|(_, entry)| before.is_none_or(|limit| entry.scene_order < limit))
+            .filter(|(_, entry)| {
+                entry.scene_order >= from && before.is_none_or(|limit| entry.scene_order < limit)
+            })
             .map(|(serial, entry)| (entry.scene_order, offset + serial, entry.quad.clone())),
     );
     ordered.sort_by_key(|(order, serial, quad)| (*order, quad.order_bias, *serial));
@@ -3714,6 +3753,10 @@ fn build_group(
         target,
         scene_snapshot: None,
         scene_grab: None,
+        #[cfg(test)]
+        replay_snapshots: tests::REPLAY_SNAPSHOTS.get(),
+        #[cfg(test)]
+        snapshot_draws: Vec::new(),
         frozen: false,
         composed_at: 0.0,
         from: None,
@@ -4562,6 +4605,11 @@ pub(super) fn run_scene(
             }
         }
         // Commit one frame before parking so startup/swap readiness cannot deadlock while idle.
+        let surface_changed = ctl.take_surface_change();
+        if surface_changed {
+            presented = false;
+            render_pending.fill(true);
+        }
         let idle_should_pause = target.app.idle && presented && fade_start.is_none();
         if !idle_should_pause && idle_paused {
             idle_paused = false;

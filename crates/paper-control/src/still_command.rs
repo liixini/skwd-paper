@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StillCommand {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<crate::SurfacePolicy>,
     #[serde(default)]
     pub path: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -19,6 +21,7 @@ pub struct StillCommand {
 impl StillCommand {
     pub fn new(path: &str) -> Self {
         Self {
+            surface: None,
             path: path.to_string(),
             reveal: false,
             slide: None,
@@ -34,6 +37,7 @@ impl StillCommand {
 
     pub fn slide(path: &str, direction: &str, duration_ms: u64) -> Self {
         Self {
+            surface: None,
             path: path.to_string(),
             reveal: false,
             slide: Some(direction.to_string()),
@@ -45,6 +49,7 @@ impl StillCommand {
 
     pub fn preload(paths: Vec<String>) -> Self {
         Self {
+            surface: None,
             path: String::new(),
             reveal: false,
             slide: None,

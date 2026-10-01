@@ -75,6 +75,21 @@ impl Worker {
         self.send_line(&command.line()).await
     }
 
+    pub(crate) async fn set_surface(
+        &mut self,
+        surface: &paper_control::SurfacePolicy,
+    ) -> Result<()> {
+        if self.dynamic() {
+            let mut command = PaperCommand::audio(None, None);
+            command.surface = Some(Box::new(surface.clone()));
+            self.send(&command).await
+        } else {
+            let mut command = StillCommand::new("");
+            command.surface = Some(surface.clone());
+            self.send_line(&command.line()).await
+        }
+    }
+
     pub(crate) async fn reveal_still(&mut self) -> Result<bool> {
         if !static_transition(&self.assignment) {
             return Ok(false);
@@ -747,6 +762,7 @@ fn scene_properties_arg(source: &Source) -> Option<String> {
 fn clear_policy_env(command: &mut Command) {
     for key in [
         "SKWD_PAPER_NAMESPACE",
+        "SKWD_PAPER_DYNAMIC_EFFECTS",
         "SKWD_PAPER_BLUR",
         "SKWD_PAPER_DIM",
         "SKWD_PAPER_IDLE_SEC",
@@ -788,6 +804,7 @@ fn apply_policy(command: &mut Command, policy: &RendererPolicy) {
         command.env("SKWD_VK_INPUT", "passthrough");
         command.env_remove("SKWD_VK_LAYER");
         command.env("SKWD_PAPER_NAMESPACE", &surface.namespace);
+        command.env("SKWD_PAPER_DYNAMIC_EFFECTS", "1");
         command.env("SKWD_PAPER_BLUR", surface.blur.to_string());
         command.env("SKWD_PAPER_DIM", surface.dim.to_string());
         command.arg("--namespace").arg(&surface.namespace);

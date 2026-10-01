@@ -31,7 +31,9 @@ pub(crate) enum Command {
     Outputs,
     #[command(about = "List supported media types, placement modes and controls as JSON")]
     Capabilities(CapabilitiesArgs),
-    #[command(about = "Capture scene thumbnails offscreen using newline-delimited JSON requests")]
+    #[command(
+        about = "Capture Wallpaper Engine and video thumbnails offscreen using newline-delimited JSON requests"
+    )]
     CaptureScenes,
     #[command(hide = true)]
     PresentPlasma(PresentPlasmaArgs),

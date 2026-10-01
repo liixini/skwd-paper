@@ -1,5 +1,9 @@
 use super::*;
 
+thread_local! {
+    pub(super) static REPLAY_SNAPSHOTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn texture_key(rgba: &[u8], clamp: bool, nearest: bool) -> TextureKey {
     TextureKey { pixels: paper_scene::tex::Pixels::rgba(2, 1, rgba.to_vec()), clamp, nearest }
 }
@@ -401,9 +405,9 @@ fn full_frame_prefix_merges_lower_particles_in_unified_order() {
     let images = [image(10), image(30)];
     let particles = [OrderedParticleQuad { scene_order: 1, quad: image(20) }];
 
-    let prefix = ordered_scene_quads(&images, &[0, 2], &particles, Some(2));
+    let prefix = ordered_scene_quads(&images, &[0, 2], &particles, 0, Some(2));
     assert_eq!(prefix.iter().map(|quad| quad.texture).collect::<Vec<_>>(), [10, 20]);
-    let full = ordered_scene_quads(&images, &[0, 2], &particles, None);
+    let full = ordered_scene_quads(&images, &[0, 2], &particles, 0, None);
     assert_eq!(full.iter().map(|quad| quad.texture).collect::<Vec<_>>(), [10, 20, 30]);
 }
 
@@ -1068,4 +1072,154 @@ fn background_only_scenes_distinguish_hidden_content_from_failed_content() {
         paper_scene::model::load_with(&package, &paper_scene::effects::Assets::discover(None))
             .unwrap();
     assert!(validate_scene_content(&model).is_err());
+}
+
+#[test]
+fn scene_prefix_segments_preserve_interleaved_order_without_replaying_particles() {
+    let quad = |texture, order_bias| vk::SceneQuad {
+        projection: None,
+        order_bias,
+        rect: [0.0; 4],
+        uv: [0.0; 4],
+        tint: [1.0; 4],
+        angle: 0.0,
+        texture,
+        blend: vk::SceneBlend::Alpha,
+    };
+    let images = [quad(1, 0), quad(3, 0), quad(5, 0), quad(7, 0)];
+    let orders = [0, 2, 4, 6];
+    let particles = [
+        OrderedParticleQuad { scene_order: 1, quad: quad(2, 0) },
+        OrderedParticleQuad { scene_order: 3, quad: quad(4, 0) },
+        OrderedParticleQuad { scene_order: 4, quad: quad(6, 1) },
+    ];
+    let mut accumulated = Vec::new();
+    let mut from = 0;
+    for before in [2, 4, 6, 7] {
+        accumulated.extend(
+            ordered_scene_quads(&images, &orders, &particles, from, Some(before))
+                .iter()
+                .map(|quad| quad.texture),
+        );
+        let replay = ordered_scene_quads(&images, &orders, &particles, 0, Some(before));
+        assert_eq!(accumulated, replay.iter().map(|quad| quad.texture).collect::<Vec<_>>());
+        from = before;
+    }
+    assert_eq!(accumulated, [1, 2, 3, 4, 5, 6, 7]);
+    assert!(ordered_scene_quads(&images, &orders, &particles, 4, Some(4)).is_empty());
+}
+
+#[test]
+#[ignore = "requires Vulkan, Wallpaper Engine assets, and SKWD_WE_PREFIX_PROJECT"]
+fn incremental_scene_prefix_matches_replay_with_particles_and_grabs() {
+    let dir = std::path::PathBuf::from(
+        std::env::var("SKWD_WE_PREFIX_PROJECT").expect("Rooftop Garden Store Workshop path"),
+    );
+    let project: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let mut groups = [false, true].map(|replay| {
+        let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
+        let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
+        assert!(model.skipped.is_empty());
+        let host = model.scripts.as_ref().expect("scene clock scripts");
+        let properties = host.properties.clone();
+        let mut scene = pkg.scene_json().unwrap();
+        let mut clocks = 0;
+        for object in scene["objects"].as_array_mut().unwrap() {
+            if let Some(script) = object["text"]["script"].as_str()
+                && script.contains("new Date()")
+            {
+                object["text"]["script"] = serde_json::Value::String(script.replace(
+                    "new Date()",
+                    "new Date(engine.runtime < 100 ? 1790769600000 : 1790773200000)",
+                ));
+                clocks += 1;
+            }
+        }
+        assert_eq!(clocks, 3);
+        model.scripts =
+            paper_scene::script::SceneScripts::load(&mut scene, &properties, &project).unwrap();
+        let previous = REPLAY_SNAPSHOTS.replace(replay);
+        let built = build_group(&sd, &mut model, false, &[(2560, 1440)], FillMode::Fit);
+        REPLAY_SNAPSHOTS.set(previous);
+        let mut group = built.unwrap();
+        group.fixed_daytime = Some(0.5);
+        assert!(group.scene_grab.is_some());
+        assert!(group.particles.iter().any(|particle| particle.system.grab_slot.is_some()));
+        assert_eq!(group.fx.iter().filter(|fx| fx.snapshot).count(), 8);
+        group
+    });
+    matching_scene_pixels(&mut groups, "initial composition");
+    let mut first = None;
+    let mut changed = false;
+    for frame in 0..3000 {
+        let time = frame as f32 / 30.0;
+        for group in &mut groups {
+            group.compose(time, 1.0 / 30.0).unwrap();
+        }
+        if frame % 100 == 99 {
+            let actual = matching_scene_pixels(&mut groups, &format!("frame {frame}"));
+            if let Some(first) = &first {
+                changed |= first != &actual;
+            } else {
+                first = Some(actual);
+            }
+            let draws = |group: &Group| {
+                group
+                    .snapshot_draws
+                    .iter()
+                    .fold((0, 0), |(quads, particles), (q, p)| (quads + q, particles + p))
+            };
+            let incremental = draws(&groups[0]);
+            let replay = draws(&groups[1]);
+            assert!(incremental.0 < replay.0, "{incremental:?} versus {replay:?}");
+            assert!(incremental.1 < replay.1, "{incremental:?} versus {replay:?}");
+            eprintln!(
+                "frame {frame}: snapshot quads/particle batches {incremental:?} versus {replay:?}"
+            );
+        }
+    }
+    assert!(changed, "the scene must animate during the comparison");
+    let before_clock = matching_scene_pixels(&mut groups, "before clock change");
+    for group in &mut groups {
+        let before = group.scripts.as_ref().unwrap().host.as_ref().unwrap().scene.clone();
+        group.compose(100.0, 0.0).unwrap();
+        let after = &group.scripts.as_ref().unwrap().host.as_ref().unwrap().scene;
+        assert!(
+            before["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(after["objects"].as_array().unwrap())
+                .any(|(before, after)| before["text"] != after["text"])
+        );
+    }
+    assert!(
+        before_clock != matching_scene_pixels(&mut groups, "after clock change"),
+        "clock update did not change rendered pixels"
+    );
+    for group in &mut groups {
+        group.fx.rotate_left(1);
+        assert!(group.fx.windows(2).any(|pair| pair[0].scene_order > pair[1].scene_order));
+    }
+    for frame in 3000..3006 {
+        for group in &mut groups {
+            group.compose(frame as f32 / 30.0, 1.0 / 30.0).unwrap();
+        }
+        assert_eq!(groups[0].snapshot_draws, groups[1].snapshot_draws);
+        matching_scene_pixels(&mut groups, &format!("reordered frame {frame}"));
+    }
+    for group in groups {
+        group.destroy();
+    }
+}
+
+fn matching_scene_pixels(groups: &mut [Group; 2], phase: &str) -> Vec<u8> {
+    let (width, height, actual) = groups[0].read_canvas().unwrap();
+    let (expected_width, expected_height, expected) = groups[1].read_canvas().unwrap();
+    assert_eq!((width, height, actual.len()), (expected_width, expected_height, expected.len()));
+    let different = actual.iter().zip(&expected).filter(|(a, b)| a != b).count();
+    assert_eq!(different, 0, "{phase}: incremental prefix changed pixels");
+    actual
 }

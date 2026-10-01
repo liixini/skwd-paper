@@ -288,6 +288,17 @@ async fn handle(
                 .await
             }
         },
+        RequestParams::SurfaceSet(surface) => {
+            let response = match manager.set_surface(surface.clone()).await {
+                Ok(()) => paper_control::Response::success(request.id, surface),
+                Err(error) => paper_control::Response::failure(
+                    request.id,
+                    "surface_failed",
+                    error.to_string(),
+                ),
+            };
+            write_response(&mut stream, &response).await
+        }
         RequestParams::Status(_) => {
             manager.refresh()?;
             let assignments = statuses(manager.status());

@@ -38,7 +38,18 @@ pub(super) struct SlideAnim {
     pub(super) target: String,
 }
 
+pub(super) struct EffectFrame {
+    pub(super) blur: f32,
+    pub(super) dim: u32,
+    pub(super) buffers: HashMap<(u32, u32), BufferSet>,
+    pub(super) raw: Vec<u8>,
+    pub(super) width: u32,
+    pub(super) height: u32,
+}
+
 pub(super) struct App {
+    pub(super) cache_effects: bool,
+    pub(super) effect_cache: Option<EffectFrame>,
     pub(super) registry_state: RegistryState,
     pub(super) output_state: OutputState,
     pub(super) compositor_state: CompositorState,
@@ -57,7 +68,7 @@ pub(super) struct App {
     pub(super) surfaces: Vec<SurfaceState>,
     pub(super) startup_readiness: StartupReadiness,
     pub(super) persist: bool,
-    pub(super) pending_cmd: Arc<Mutex<Option<StillCommand>>>,
+    pub(super) pending_cmd: Arc<Mutex<std::collections::VecDeque<StillCommand>>>,
     pub(super) namespace: String,
     pub(super) layer: paper_control::Layer,
     pub(super) blur: f32,

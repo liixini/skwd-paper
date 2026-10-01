@@ -14,18 +14,14 @@ pub(crate) fn resolve(path: &str) -> Result<WeTarget> {
         return Err(anyhow!("Wallpaper Engine item is not a directory: {}", root.display()));
     }
     let resolved = paper_control::we_project::Project::resolve(Path::new(path))?;
-    let project = &resolved.document;
-    let kind = project
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Wallpaper Engine project type is missing"))?
-        .to_ascii_lowercase();
+    let kind =
+        resolved.kind().ok_or_else(|| anyhow!("Wallpaper Engine project type is missing"))?;
     match kind.as_str() {
         "scene" => {
             resolved.scene_package()?;
             Ok(WeTarget::Scene(PathBuf::from(path)))
         }
-        "video" => resolve_video(&resolved.source, project),
+        "video" => Ok(WeTarget::Video(resolved.video_file()?)),
         unsupported => Err(anyhow!("unsupported Wallpaper Engine project type {unsupported:?}")),
     }
 }
@@ -79,28 +75,6 @@ fn preview_extension(path: &Path) -> bool {
             .chain(paper_control::VIDEO_EXTS)
             .any(|supported| extension.eq_ignore_ascii_case(supported))
     })
-}
-
-fn resolve_video(root: &Path, project: &Value) -> Result<WeTarget> {
-    let relative = project
-        .get("file")
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| anyhow!("Wallpaper Engine video file is missing"))?;
-    let relative = Path::new(relative);
-    if relative.is_absolute()
-        || relative.components().any(|component| {
-            matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
-        })
-    {
-        return Err(anyhow!("Wallpaper Engine video path must stay inside its item directory"));
-    }
-    let video = std::fs::canonicalize(root.join(relative))
-        .context("resolve Wallpaper Engine video file")?;
-    if !video.starts_with(root) || !video.is_file() {
-        return Err(anyhow!("Wallpaper Engine video path escapes its item directory"));
-    }
-    Ok(WeTarget::Video(video))
 }
 
 #[cfg(test)]
