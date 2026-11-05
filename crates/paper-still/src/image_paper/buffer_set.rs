@@ -114,6 +114,11 @@ impl BufferSet {
         self.buffers.iter().chain(&self.busy).any(|(_, active)| active.load(Ordering::Acquire))
     }
 
+    pub(super) fn write(&mut self, fill: impl FnOnce(&mut [u8], Format)) -> Option<()> {
+        let format = self.format;
+        self.canvas().map(|bytes| fill(bytes, format))
+    }
+
     pub(super) fn canvas(&mut self) -> Option<&mut [u8]> {
         (!self.has_active_buffers()).then(|| self.bytes())
     }

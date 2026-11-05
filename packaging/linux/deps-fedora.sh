@@ -5,7 +5,7 @@ dnf install -y \
     libshaderc-devel vulkan-headers \
     alsa-lib-devel pulseaudio-libs-devel libxkbcommon-devel \
     wayland-devel vulkan-loader-devel \
-    libdav1d-devel libyuv-devel \
+    libdav1d-devel libyuv-devel freetype-devel \
     libavcodec-free-devel libavformat-free-devel libavutil-free-devel \
     libswscale-free-devel libswresample-free-devel \
     python3 ffmpeg-free procps-ng

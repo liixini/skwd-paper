@@ -1,7 +1,7 @@
 use super::*;
 use paper_control::{
     AudioSetRequest, FillMode, Layer, RendererPolicy, SandPolicy, SandQuality, SandScope,
-    ScenePolicy, Source, SourceKind, TransitionPolicy, VideoEngine,
+    ScenePolicy, Source, SourceKind, TransitionPolicy,
 };
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -19,15 +19,17 @@ fn fake_worker(directory: &Path) -> PathBuf {
             "#!/bin/sh\n",
             "umask 077\n",
             "base=$(dirname \"$0\")\n",
-            "printf '%s\\n' \"$@\" > \"$base/args-$$\"\n",
+            "printf '%s\\n' \"$@\" > \"$base/args-$$.part\"\n",
+            "mv \"$base/args-$$.part\" \"$base/args-$$\"\n",
             "env | sort > \"$base/env-$$\"\n",
             "trap 'exit 0' TERM\n",
             "while IFS= read -r line; do\n",
             "  printf '%s\\n' \"$line\" >> \"$base/stdin-$$\"\n",
             "  case \"$line\" in\n",
-            "    *'\"freeze\":\"'*) path=${line#*'\"freeze\":\"'}; path=${path%%'\"'*}; printf 'P6\\n1 1\\n255\\n\\000\\000\\000' > \"$path.part\"; ln \"$path.part\" \"$path\"; rm \"$path.part\";;\n",
+            "    *'\"freeze\":\"'*|*'\"snapshot\":{'*) if [ -f \"$base/finish-on-freeze\" ]; then exit 0; fi; path=${line#*'\"freeze\":\"'}; case \"$line\" in *'\"snapshot\":{'*) path=${line#*'\"path\":\"'};; esac; path=${path%%'\"'*}; printf 'P6\\n1 1\\n255\\n\\000\\000\\000' > \"$path.part\"; ln \"$path.part\" \"$path\"; rm \"$path.part\";;\n",
             "  esac\n",
             "done\n",
+            "printf 'eof' > \"$base/eof-$$\"\n",
         )
         .as_bytes(),
     )
@@ -53,7 +55,7 @@ fn freeze_error_worker(directory: &Path) -> PathBuf {
             "while IFS= read -r line; do\n",
             "  printf '%s\\n' \"$line\" >> \"$base/stdin-$$\"\n",
             "  case \"$line\" in\n",
-            "    *'\"freeze\":\"'*) path=${line#*'\"freeze\":\"'}; path=${path%%'\"'*}; printf 'capture failed' > \"$path.error.part\"; ln \"$path.error.part\" \"$path.error\"; rm \"$path.error.part\";;\n",
+            "    *'\"freeze\":\"'*|*'\"snapshot\":{'*) path=${line#*'\"freeze\":\"'}; case \"$line\" in *'\"snapshot\":{'*) path=${line#*'\"path\":\"'};; esac; path=${path%%'\"'*}; printf 'capture failed' > \"$path.error.part\"; ln \"$path.error.part\" \"$path.error\"; rm \"$path.error.part\";;\n",
             "  esac\n",
             "done\n",
         )
@@ -116,63 +118,11 @@ impl Fixture {
         Self { directory, manager, socket }
     }
 
-    fn new_with_tinier() -> Self {
-        let directory = tempfile::tempdir().unwrap();
-        let worker = fake_worker(directory.path());
-        let backends =
-            BackendPaths::from_executables_with_tinier(worker.clone(), worker.clone(), worker);
-        let socket = directory.path().join("paper.sock");
-        let manager = Manager::with_backends(backends, directory.path().to_path_buf());
-        Self { directory, manager, socket }
-    }
-
     async fn commit(&mut self, request: &ApplyRequest) -> Vec<WorkerStatus> {
         let mut transaction = self.manager.begin_apply(request, &self.socket).await.unwrap();
         ready(&mut transaction).await;
         self.manager.commit(transaction).await.unwrap()
     }
-}
-
-#[test]
-fn tinier_group_retarget() {
-    block_on(async {
-        let mut fixture = Fixture::new_with_tinier();
-        let source = Source::tinier_video("/wall/one.ivf", "30000/1001");
-        let status = fixture
-            .commit(&apply(
-                vec![
-                    assignment("DP-1", source.clone()),
-                    assignment("DP-2", source.clone()),
-                    assignment("DP-3", source),
-                ],
-                false,
-            ))
-            .await;
-        assert_eq!(status.len(), 1);
-        assert_eq!(status[0].assignment.outputs, ["DP-1", "DP-2", "DP-3"]);
-        let pid = status[0].pid;
-        let args = wait_log(fixture.directory.path(), "args", pid, "DP-1,DP-2,DP-3");
-        assert!(args.contains("--output\nDP-1,DP-2,DP-3"));
-
-        fixture
-            .commit(&apply(vec![assignment("DP-1", Source::static_file("/wall/two.png"))], false))
-            .await;
-        let status = fixture.manager.status();
-        assert_eq!(status.len(), 2);
-        let retained = status.iter().find(|entry| entry.pid == pid).unwrap();
-        assert_eq!(retained.assignment.outputs, ["DP-2", "DP-3"]);
-        wait_log(fixture.directory.path(), "stdin", pid, "\"outputs\":[\"DP-2\",\"DP-3\"]");
-        assert_eq!(
-            fixture.manager.stop(&StopRequest { outputs: vec!["DP-2".into()] }).await.unwrap(),
-            1
-        );
-        let status = fixture.manager.status();
-        assert_eq!(status.len(), 2);
-        assert_eq!(
-            status.iter().find(|entry| entry.pid == pid).unwrap().assignment.outputs,
-            ["DP-3"]
-        );
-    });
 }
 
 #[test]
@@ -182,7 +132,7 @@ fn span_patch_stop() {
             let mut fixture = Fixture::new();
             let source = match kind {
                 SourceKind::Static => Source::static_file("/wall/one.png"),
-                SourceKind::Video => Source::video("/wall/one.mp4", None),
+                SourceKind::Video => Source::video("/wall/one.mp4"),
                 SourceKind::WallpaperEngine => {
                     let project = fixture.directory.path().join("scene");
                     std::fs::create_dir(&project).unwrap();
@@ -244,7 +194,7 @@ fn span_patch_stop() {
 
 #[test]
 fn span_groups_compatible_assignments() {
-    let source = Source::video("/wall/one.mp4", None);
+    let source = Source::video("/wall/one.mp4");
     let mut first = assignment("DP-1", source.clone());
     first.fill_mode = FillMode::Span;
     first.mute = false;
@@ -260,7 +210,7 @@ fn span_groups_compatible_assignments() {
     assert_eq!(grouped[0].0.volume, 45);
 
     let mut different_source = second.clone();
-    different_source.source = Source::video("/wall/two.mp4", None);
+    different_source.source = Source::video("/wall/two.mp4");
     let mut different_mode = second.clone();
     different_mode.fill_mode = FillMode::Fit;
     assert_eq!(expand(&[first.clone(), different_source], None).len(), 2);
@@ -272,10 +222,14 @@ fn span_groups_compatible_assignments() {
 
 #[test]
 fn span_mixed_hints_cut() {
-    let mut first = assignment("DP-1", Source::video("/wall/new.mp4", None));
+    let mut first = assignment("DP-1", Source::video("/wall/new.mp4"));
     first.fill_mode = FillMode::Span;
-    first.transition =
-        Some(TransitionPolicy { from: Some("/wall/old-one.mp4".into()), ..Default::default() });
+    first.transition = Some(TransitionPolicy {
+        drawing_source: None,
+        drawing: None,
+        from: Some("/wall/old-one.mp4".into()),
+        ..Default::default()
+    });
     let mut second = first.clone();
     second.outputs = vec!["DP-2".into()];
     second.transition.as_mut().unwrap().from = Some("/wall/old-two.mp4".into());
@@ -298,13 +252,13 @@ fn span_mixed_incumbents_cut() {
         fixture
             .commit(&apply(
                 vec![
-                    assignment("DP-1", Source::video("/wall/old-one.mp4", None)),
-                    assignment("DP-2", Source::video("/wall/old-two.mp4", None)),
+                    assignment("DP-1", Source::video("/wall/old-one.mp4")),
+                    assignment("DP-2", Source::video("/wall/old-two.mp4")),
                 ],
                 true,
             ))
             .await;
-        let mut wildcard = assignment("*", Source::video("/wall/another.mp4", None));
+        let mut wildcard = assignment("*", Source::video("/wall/another.mp4"));
         wildcard.transition = Some(TransitionPolicy::default());
         let error = fixture
             .manager
@@ -313,10 +267,8 @@ fn span_mixed_incumbents_cut() {
             .err()
             .unwrap();
         assert!(error.to_string().contains("explicit from hint"));
-        let mut span = Assignment::new(
-            vec!["DP-1".into(), "DP-2".into()],
-            Source::video("/wall/new.mp4", None),
-        );
+        let mut span =
+            Assignment::new(vec!["DP-1".into(), "DP-2".into()], Source::video("/wall/new.mp4"));
         span.fill_mode = FillMode::Span;
         span.transition = Some(TransitionPolicy::default());
         let mut transaction =
@@ -348,16 +300,24 @@ fn span_missing_preview_cut() {
             ))
             .await;
 
-        let mut span = Assignment::new(
-            vec!["DP-1".into(), "DP-2".into()],
-            Source::video("/wall/new.mp4", None),
-        );
+        let mut span =
+            Assignment::new(vec!["DP-1".into(), "DP-2".into()], Source::video("/wall/new.mp4"));
         span.fill_mode = FillMode::Span;
         span.transition = Some(TransitionPolicy::default());
         let transaction =
             fixture.manager.begin_apply(&apply(vec![span], true), &fixture.socket).await.unwrap();
         assert_eq!(transaction.candidates.len(), 1);
         assert!(transaction.candidates[0].assignment.transition.is_none());
+        transaction.rollback().await;
+
+        std::fs::write(project.join("preview.gif"), b"gif").unwrap();
+        let mut span =
+            Assignment::new(vec!["DP-1".into(), "DP-2".into()], Source::video("/wall/new.mp4"));
+        span.fill_mode = FillMode::Span;
+        span.transition = Some(TransitionPolicy::default());
+        let transaction =
+            fixture.manager.begin_apply(&apply(vec![span], true), &fixture.socket).await.unwrap();
+        assert!(transaction.candidates[0].assignment.transition.is_some());
         transaction.rollback().await;
     });
 }
@@ -373,6 +333,7 @@ fn span_spawn_failure() {
         span.fill_mode = FillMode::Span;
         let first = fixture.commit(&apply(vec![span], false)).await;
         let original_pid = first[0].pid;
+        wait_log(fixture.directory.path(), "args", original_pid, "DP-1");
         std::fs::remove_file(fixture.directory.path().join("worker")).unwrap();
 
         let replacement =
@@ -391,13 +352,14 @@ fn span_spawn_failure() {
 }
 
 #[test]
-fn tinier_pause_resume() {
+fn span_pause_resume() {
     block_on(async {
-        let mut fixture = Fixture::new_with_tinier();
-        let assignment = Assignment::new(
+        let mut fixture = Fixture::new();
+        let mut assignment = Assignment::new(
             vec!["DP-1".into(), "DP-2".into(), "DP-3".into()],
-            Source::tinier_video("/wall/one.ivf", "30000/1001"),
+            Source::video("/wall/one.mp4"),
         );
+        assignment.fill_mode = FillMode::Span;
         let initial = fixture.commit(&apply(vec![assignment], false)).await;
         let initial_pid = initial[0].pid;
 
@@ -427,14 +389,14 @@ fn patch_vs_replace_all() {
         let first_pid = fixture.manager.status()[0].pid;
 
         fixture
-            .commit(&apply(vec![assignment("DP-2", Source::video("/wall/two.mp4", None))], false))
+            .commit(&apply(vec![assignment("DP-2", Source::video("/wall/two.mp4"))], false))
             .await;
         let status = fixture.manager.status();
         assert_eq!(status.len(), 2);
         assert!(status.iter().any(|entry| entry.pid == first_pid));
 
         let replacement =
-            apply(vec![assignment("HDMI-A-1", Source::video("/wall/three.mp4", None))], true);
+            apply(vec![assignment("HDMI-A-1", Source::video("/wall/three.mp4"))], true);
         let mut transaction =
             fixture.manager.begin_apply(&replacement, &fixture.socket).await.unwrap();
         assert_eq!(fixture.manager.status().len(), 2);
@@ -457,7 +419,7 @@ fn rollback_keeps_prior() {
 
         let replacement = apply(
             vec![
-                assignment("DP-1", Source::video("/wall/two.mp4", Some(VideoEngine::Default))),
+                assignment("DP-1", Source::video("/wall/two.mp4")),
                 assignment("DP-2", Source::static_file("/wall/three.png")),
             ],
             false,
@@ -490,7 +452,7 @@ fn spawn_failure_keeps_incumbents() {
         let mixed = apply(
             vec![
                 assignment("DP-1", Source::static_file("/wall/two.png")),
-                assignment("DP-2", Source::video("/wall/three.mp4", None)),
+                assignment("DP-2", Source::video("/wall/three.mp4")),
             ],
             false,
         );
@@ -512,7 +474,7 @@ fn missing_still_replacement_keeps_video_incumbent() {
         let mut manager = Manager::with_backends(backends, temp.path().to_path_buf());
         let socket = temp.path().join("paper.sock");
 
-        let initial = apply(vec![assignment("DP-1", Source::video("/wall/one.mp4", None))], false);
+        let initial = apply(vec![assignment("DP-1", Source::video("/wall/one.mp4"))], false);
         let mut transaction = manager.begin_apply(&initial, &socket).await.unwrap();
         ready(&mut transaction).await;
         manager.commit(transaction).await.unwrap();
@@ -557,7 +519,7 @@ fn stop_one_or_all() {
 fn pause_freeze_resume() {
     block_on(async {
         let mut fixture = Fixture::new();
-        let mut initial = assignment("DP-1", Source::video("/wall/one.mp4", None));
+        let mut initial = assignment("DP-1", Source::video("/wall/one.mp4"));
         initial.layer = Layer::Top;
         fixture.commit(&apply(vec![initial], false)).await;
         let first_pid = fixture.manager.status()[0].pid;
@@ -573,7 +535,7 @@ fn pause_freeze_resume() {
         assert!(frozen_path.is_file());
         assert!(frozen_args.contains("--layer\ntop\n"));
 
-        let mut replacement_assignment = assignment("DP-1", Source::video("/wall/two.mp4", None));
+        let mut replacement_assignment = assignment("DP-1", Source::video("/wall/two.mp4"));
         replacement_assignment.transition = Some(TransitionPolicy::default());
         let replacement = apply(vec![replacement_assignment], false);
         assert!(fixture.manager.begin_apply(&replacement, &fixture.socket).await.is_err());
@@ -603,7 +565,7 @@ fn freeze_failure_unpauses() {
         let backends = BackendPaths::from_executables(worker.clone(), worker);
         let mut manager = Manager::with_backends(backends, directory.path().to_path_buf());
         let socket = directory.path().join("paper.sock");
-        let initial = apply(vec![assignment("DP-1", Source::video("/wall/one.mp4", None))], false);
+        let initial = apply(vec![assignment("DP-1", Source::video("/wall/one.mp4"))], false);
         let mut transaction = manager.begin_apply(&initial, &socket).await.unwrap();
         ready(&mut transaction).await;
         let status = manager.commit(transaction).await.unwrap();
@@ -626,7 +588,7 @@ fn audio_updates_state() {
         let mut fixture = Fixture::new();
         let request = apply(
             vec![
-                assignment("DP-1", Source::video("/wall/one.mp4", None)),
+                assignment("DP-1", Source::video("/wall/one.mp4")),
                 assignment("DP-2", Source::static_file("/wall/two.png")),
             ],
             false,
@@ -641,9 +603,11 @@ fn audio_updates_state() {
             .pid;
 
         let update = AudioSetRequest {
+            duck: None,
             outputs: vec!["DP-1".into(), "DP-2".into()],
             mute: Some(false),
             volume: Some(42),
+            system_audio: Some(false),
         };
         let (updated, status) = fixture.manager.audio(&update).await.unwrap();
         assert_eq!(updated, 2);
@@ -651,6 +615,8 @@ fn audio_updates_state() {
         assert!(status.iter().all(|entry| entry.assignment.volume == 42));
         let input = wait_log(fixture.directory.path(), "stdin", dynamic_pid, "\"volume\":42");
         assert!(input.contains("\"mute\":false"));
+        assert!(input.contains("\"system_audio\":false"));
+        assert!(status.iter().all(|entry| entry.assignment.system_audio == Some(false)));
     });
 }
 
@@ -672,8 +638,7 @@ fn policy_inheritance() {
             scene: Some(ScenePolicy { fps: Some(60), strict: Some(true), ..Default::default() }),
             output_fps: [("DP-1".into(), 60)].into(),
         };
-        let mut initial =
-            apply(vec![assignment("DP-1", Source::video("/wall/one.mp4", None))], false);
+        let mut initial = apply(vec![assignment("DP-1", Source::video("/wall/one.mp4"))], false);
         initial.policy = Some(policy.clone());
         let status = fixture.commit(&initial).await;
         let environment =
@@ -687,13 +652,11 @@ fn policy_inheritance() {
         assert!(environment.contains("SKWD_PAPER_OUTPUT_FPS=DP-1=60"));
         assert_eq!(fixture.manager.policy(), Some(policy.clone()));
 
-        let mut changed =
-            apply(vec![assignment("DP-2", Source::video("/wall/two.mp4", None))], false);
+        let mut changed = apply(vec![assignment("DP-2", Source::video("/wall/two.mp4"))], false);
         changed.policy = Some(RendererPolicy { idle_seconds: Some(60), ..Default::default() });
         assert!(fixture.manager.begin_apply(&changed, &fixture.socket).await.is_err());
 
-        let inherited =
-            apply(vec![assignment("DP-2", Source::video("/wall/two.mp4", None))], false);
+        let inherited = apply(vec![assignment("DP-2", Source::video("/wall/two.mp4"))], false);
         let status = fixture.commit(&inherited).await;
         let second = status.iter().find(|status| status.assignment.outputs == ["DP-2"]).unwrap();
         wait_log(fixture.directory.path(), "env", second.pid, "SKWD_PAPER_IDLE_SEC=30");
@@ -705,14 +668,16 @@ fn sand_primary_scope() {
     block_on(async {
         let mut fixture = Fixture::new();
         let transition = Some(TransitionPolicy {
+            drawing_source: None,
+            drawing: None,
             fps: None,
             from: Some("/wall/old.png".into()),
             effect: Some("sand-donut".into()),
             duration_ms: Some(800),
         });
-        let mut first = assignment("DP-1", Source::video("/wall/new.mp4", None));
+        let mut first = assignment("DP-1", Source::video("/wall/new.mp4"));
         first.transition.clone_from(&transition);
-        let mut second = assignment("DP-2", Source::video("/wall/new.mp4", None));
+        let mut second = assignment("DP-2", Source::video("/wall/new.mp4"));
         second.transition = transition;
         let mut request = apply(vec![first, second], true);
         request.policy = Some(RendererPolicy {
@@ -737,8 +702,12 @@ fn sand_primary_scope() {
 
 #[test]
 fn sand_primary_fallback() {
-    let transition =
-        Some(TransitionPolicy { effect: Some("sand-donut".into()), ..Default::default() });
+    let transition = Some(TransitionPolicy {
+        drawing_source: None,
+        drawing: None,
+        effect: Some("sand-donut".into()),
+        ..Default::default()
+    });
     let mut first = assignment("DP-4", Source::static_file("/wall/new.png"));
     first.transition.clone_from(&transition);
     let mut second = assignment("eDP-1", Source::static_file("/wall/new.png"));
@@ -760,8 +729,9 @@ fn sand_primary_fallback() {
 
 #[test]
 fn sand_primary_ignores_fade() {
-    let mut first = assignment("DP-1", Source::video("/wall/new.mp4", None));
-    first.transition = Some(TransitionPolicy { effect: Some("fade".into()), ..Default::default() });
+    let mut first = assignment("DP-1", Source::video("/wall/new.mp4"));
+    first.transition =
+        Some(TransitionPolicy { drawing: None, effect: Some("fade".into()), ..Default::default() });
     let policy = RendererPolicy {
         sand: Some(SandPolicy {
             scope: Some(SandScope::Primary),
@@ -782,8 +752,10 @@ fn transition_from_incumbent() {
             .commit(&apply(vec![assignment("DP-1", Source::static_file("/wall/one.png"))], false))
             .await;
 
-        let mut next = assignment("DP-1", Source::video("/wall/two.mp4", None));
+        let mut next = assignment("DP-1", Source::video("/wall/two.mp4"));
         next.transition = Some(TransitionPolicy {
+            drawing_source: None,
+            drawing: None,
             fps: None,
             from: None,
             effect: Some("fade".into()),
@@ -854,7 +826,7 @@ fn static_transition_rollback_preserves_prior_composition() {
     block_on(async {
         let mut fixture = Fixture::new();
         let initial = fixture
-            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/one.mp4", None))], false))
+            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/one.mp4"))], false))
             .await;
         let mut next = assignment("DP-1", Source::static_file("/wall/two.png"));
         next.transition = Some(TransitionPolicy::default());
@@ -875,7 +847,7 @@ fn failed_overlay_spawn_retires_the_hidden_steady_on_rollback() {
     block_on(async {
         let mut fixture = Fixture::new();
         let initial = fixture
-            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/one.mp4", None))], false))
+            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/one.mp4"))], false))
             .await;
         let mut next = assignment("DP-1", Source::static_file("/wall/two.png"));
         next.transition = Some(TransitionPolicy::default());
@@ -902,7 +874,7 @@ fn overview_surface_pause_retains_video_player() {
             .unwrap();
         std::fs::write(project.join("clip.mp4"), []).unwrap();
         for source in [
-            Source::video("/wall/clip.mp4", None),
+            Source::video("/wall/clip.mp4"),
             Source::wallpaper_engine(project.display().to_string()),
         ] {
             let mut request = apply(vec![assignment("DP-1", source)], true);
@@ -923,8 +895,9 @@ fn overview_surface_pause_retains_video_player() {
                 assert!(!fixture.manager.paused());
                 assert_eq!(fixture.manager.status()[0].pid, initial[0].pid);
             }
-            let commands = wait_log(fixture.directory.path(), "stdin", initial[0].pid, "false");
-            assert!(commands.contains("true"));
+            let cycle = "{\"to\":\"\",\"pause\":true}\n{\"to\":\"\",\"pause\":false}\n";
+            let commands =
+                wait_log(fixture.directory.path(), "stdin", initial[0].pid, &cycle.repeat(3));
             assert!(!commands.contains("freeze"));
         }
     });
@@ -938,7 +911,7 @@ fn static_transition_rollback_preserves_incumbents_at_each_stage() {
             let initial = fixture
                 .commit(&apply(
                     vec![
-                        assignment("DP-1", Source::video("/wall/old.mp4", None)),
+                        assignment("DP-1", Source::video("/wall/old.mp4")),
                         assignment("DP-2", Source::static_file("/wall/other.png")),
                     ],
                     false,
@@ -985,7 +958,7 @@ fn mixed_transition_waits_for_reveal_on_every_static_output() {
         let mut assignments = vec![
             assignment("DP-1", Source::static_file("/wall/a.png")),
             assignment("DP-2", Source::static_file("/wall/b.png")),
-            assignment("DP-3", Source::video("/wall/c.mp4", None)),
+            assignment("DP-3", Source::video("/wall/c.mp4")),
         ];
         for assignment in &mut assignments {
             assignment.transition = Some(TransitionPolicy::default());
@@ -1059,7 +1032,7 @@ fn video_transitions_preserve_all_requested_layers_without_hidden_preparation() 
                     false,
                 ))
                 .await;
-            let mut next = assignment("DP-1", Source::video("/wall/new.mp4", None));
+            let mut next = assignment("DP-1", Source::video("/wall/new.mp4"));
             next.layer = layer;
             next.transition = Some(TransitionPolicy::default());
             let transaction = fixture
@@ -1121,9 +1094,7 @@ fn live_surface_effects_preserve_workers_and_follow_replacement() {
         let sharp =
             paper_control::SurfacePolicy { namespace: "stationary".into(), blur: 0, dim: 0 };
         let blurred = paper_control::SurfacePolicy { blur: 20, dim: 15, ..sharp.clone() };
-        for source in
-            [Source::static_file("/wall/still.png"), Source::video("/wall/clip.mp4", None)]
-        {
+        for source in [Source::static_file("/wall/still.png"), Source::video("/wall/clip.mp4")] {
             let mut request = apply(vec![assignment("DP-1", source)], true);
             request.policy = Some(RendererPolicy {
                 surface: Some(Box::new(sharp.clone())),
@@ -1168,12 +1139,8 @@ fn live_surface_effects_preserve_workers_and_follow_replacement() {
 #[test]
 fn mirror_routes_output() {
     block_on(async {
-        for source in [
-            Source::static_file("/wall/a.png"),
-            Source::video("/wall/a.mp4", None),
-            Source::tinier_video("/wall/a.ivf", "30"),
-        ] {
-            let mut fixture = Fixture::new_with_tinier();
+        for source in [Source::static_file("/wall/a.png"), Source::video("/wall/a.mp4")] {
+            let mut fixture = Fixture::new();
             let status = fixture
                 .commit(&apply(
                     vec![
@@ -1220,9 +1187,7 @@ fn mirrors_follow_replacement() {
         let mut fixture = Fixture::new();
         let socket = fixture.directory.path().join("mirror.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        fixture
-            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/a.mp4", None))], false))
-            .await;
+        fixture.commit(&apply(vec![assignment("DP-1", Source::video("/wall/a.mp4"))], false)).await;
         let target = paper_control::MirrorTarget {
             output: "DP-1".into(),
             socket: socket.display().to_string(),
@@ -1264,9 +1229,7 @@ fn mirrors_follow_replacement() {
 fn disable_removes_registration() {
     block_on(async {
         let mut fixture = Fixture::new();
-        fixture
-            .commit(&apply(vec![assignment("DP-1", Source::video("/wall/a.mp4", None))], false))
-            .await;
+        fixture.commit(&apply(vec![assignment("DP-1", Source::video("/wall/a.mp4"))], false)).await;
         let mut target =
             paper_control::MirrorTarget { output: "DP-1".into(), socket: "/run/lock.sock".into() };
         fixture.manager.mirror(&target).await.unwrap();
@@ -1320,3 +1283,12 @@ fn span_mirror_survives_stop() {
         assert!(fixture.manager.is_empty());
     });
 }
+
+#[path = "handoff_tests.rs"]
+mod handoff;
+
+#[path = "playback_tests.rs"]
+mod playback_tests;
+
+#[path = "surface_tests.rs"]
+mod surface_tests;

@@ -16,6 +16,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 const MIRROR_FAILED: &str = "mirror_failed";
+const SURFACE_FAILED: &str = "surface_failed";
+const WIDGETS_FAILED: &str = "widgets_failed";
 const MAX_REQUEST: u64 = 1024 * 1024;
 const START_IDLE: Duration = Duration::from_secs(5);
 const EMPTY_IDLE: Duration = Duration::from_millis(750);
@@ -159,6 +161,7 @@ async fn handle(
     if let Err(error) = request.validate() {
         return write_failure(&mut stream, request.id, "invalid_request", &error.to_string()).await;
     }
+    let playback = matches!(&request.params, RequestParams::PlaybackPause(_));
     match request.params {
         RequestParams::Apply(apply) => {
             let mut transaction = match manager.begin_apply(&apply, socket).await {
@@ -233,8 +236,10 @@ async fn handle(
             };
             write_response(&mut stream, &response).await
         }
-        RequestParams::Pause(pause) => {
-            let transaction = if pause.paused {
+        RequestParams::Pause(pause) | RequestParams::PlaybackPause(pause) => {
+            let transaction = if playback || !pause.outputs.is_empty() {
+                manager.playback_pause(&pause).await.map(|()| None)
+            } else if pause.paused {
                 manager.begin_pause(socket).await
             } else {
                 manager.begin_resume(socket).await
@@ -280,33 +285,53 @@ async fn handle(
             )
             .await
         }
-        RequestParams::AudioSet(audio) => match manager.audio(&audio).await {
-            Ok((updated, assignments)) => {
-                write_response(
-                    &mut stream,
-                    &AudioSetResponse::success(
-                        request.id,
-                        AudioSetResult { updated, assignments: statuses(assignments) },
-                    ),
-                )
-                .await
+        RequestParams::AudioSet(audio) | RequestParams::PlaybackAudio(audio) => {
+            match manager.audio(&audio).await {
+                Ok((updated, assignments)) => {
+                    write_response(
+                        &mut stream,
+                        &AudioSetResponse::success(
+                            request.id,
+                            AudioSetResult { updated, assignments: statuses(assignments) },
+                        ),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    write_response(
+                        &mut stream,
+                        &AudioSetResponse::failure(request.id, "audio_failed", error.to_string()),
+                    )
+                    .await
+                }
             }
-            Err(error) => {
-                write_response(
-                    &mut stream,
-                    &AudioSetResponse::failure(request.id, "audio_failed", error.to_string()),
-                )
-                .await
-            }
-        },
+        }
+        RequestParams::SurfaceOverrides(overrides) => {
+            let response = match manager.set_surface_overrides(overrides.clone()).await {
+                Ok(()) => paper_control::Response::success(request.id, overrides),
+                Err(error) => paper_control::Response::failure(
+                    request.id,
+                    SURFACE_FAILED,
+                    format!("{error:#}"),
+                ),
+            };
+            write_response(&mut stream, &response).await
+        }
+        RequestParams::Widgets(scene) => {
+            let response = match manager.set_widgets((*scene).clone()).await {
+                Ok(()) => paper_control::Response::success(request.id, serde_json::json!({})),
+                Err(error) => {
+                    paper_control::Response::failure(request.id, WIDGETS_FAILED, error.to_string())
+                }
+            };
+            write_response(&mut stream, &response).await
+        }
         RequestParams::SurfaceSet(surface) => {
             let response = match manager.set_surface(surface.clone()).await {
                 Ok(()) => paper_control::Response::success(request.id, surface),
-                Err(error) => paper_control::Response::failure(
-                    request.id,
-                    "surface_failed",
-                    error.to_string(),
-                ),
+                Err(error) => {
+                    paper_control::Response::failure(request.id, SURFACE_FAILED, error.to_string())
+                }
             };
             write_response(&mut stream, &response).await
         }

@@ -1,0 +1,426 @@
+[
+  {
+    "probe": "matrix-detail",
+    "version": 1,
+    "cell": 1,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix detail 1",
+    "fields": [
+      {
+        "mat3": [
+          {
+            "key": "right",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          },
+          {
+            "key": "up",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          },
+          {
+            "key": "forward",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          },
+          {
+            "key": "toConfigString",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          }
+        ],
+        "mat4": [
+          {
+            "key": "right",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          },
+          {
+            "key": "up",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          },
+          {
+            "key": "forward",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          },
+          {
+            "key": "toConfigString",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "probe": "matrix-detail",
+    "version": 1,
+    "cell": 2,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix detail 2",
+    "fields": [
+      {
+        "assigned": {
+          "type": "boolean",
+          "value": "true"
+        },
+        "stored": [
+          "2",
+          "3",
+          "5",
+          "7",
+          "11",
+          "13",
+          "17",
+          "19",
+          "23"
+        ],
+        "right": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "2",
+          "y": "3",
+          "z": "5"
+        },
+        "up": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "7",
+          "y": "11",
+          "z": "13"
+        },
+        "forward": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "17",
+          "y": "19",
+          "z": "23"
+        },
+        "config": {
+          "type": "string",
+          "value": "2 3 5 7 11 13 17 19 23"
+        },
+        "text": {
+          "type": "string",
+          "value": "2 3 5 7 11 13 17 19 23"
+        }
+      }
+    ]
+  },
+  {
+    "probe": "matrix-detail",
+    "version": 1,
+    "cell": 3,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix detail 3",
+    "fields": [
+      {
+        "assigned": {
+          "type": "boolean",
+          "value": "true"
+        },
+        "stored": [
+          "2",
+          "3",
+          "5",
+          "7",
+          "11",
+          "13",
+          "17",
+          "19",
+          "23",
+          "29",
+          "31",
+          "37",
+          "41",
+          "43",
+          "47",
+          "53"
+        ],
+        "right": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "2",
+          "y": "3",
+          "z": "5"
+        },
+        "up": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "11",
+          "y": "13",
+          "z": "17"
+        },
+        "forward": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "23",
+          "y": "29",
+          "z": "31"
+        },
+        "config": {
+          "type": "string",
+          "value": "2 3 5 7 11 13 17 19 23 29 31 37 41 43 47 53"
+        },
+        "text": {
+          "type": "string",
+          "value": "2 3 5 7 11 13 17 19 23 29 31 37 41 43 47 53"
+        }
+      }
+    ]
+  },
+  {
+    "probe": "matrix-detail",
+    "version": 1,
+    "cell": 4,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix detail 4",
+    "fields": [
+      {
+        "assigned": {
+          "type": "boolean",
+          "value": "true"
+        },
+        "write": {
+          "type": "boolean",
+          "value": "true"
+        },
+        "stored": [
+          "0.6",
+          "0.3333333333333333",
+          "0",
+          "0.2",
+          "0.7",
+          "0",
+          "0.3",
+          "0.4",
+          "1"
+        ],
+        "before": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "0.1",
+          "y": "0.3333333333333333",
+          "z": "0"
+        },
+        "afterVec": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "0.1",
+          "y": "0.3333333333333333",
+          "z": "0"
+        },
+        "afterWrite": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "0.6",
+          "y": "0.3333333333333333",
+          "z": "0"
+        },
+        "config": {
+          "type": "string",
+          "value": "0.6 0.3333333333333333 0 0.2 0.7 0 0.3 0.4 1"
+        }
+      }
+    ]
+  },
+  {
+    "probe": "matrix-detail",
+    "version": 1,
+    "cell": 5,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix detail 5",
+    "fields": [
+      {
+        "assigned": {
+          "type": "boolean",
+          "value": "true"
+        },
+        "stored": [
+          "1",
+          "2"
+        ],
+        "right": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "1",
+          "y": "2",
+          "z": "0"
+        },
+        "forward": {
+          "type": "object",
+          "ctor": "Vec3",
+          "x": "0",
+          "y": "0",
+          "z": "0"
+        },
+        "config": {
+          "type": "string",
+          "value": "1 2 undefined undefined undefined undefined undefined undefined undefined"
+        },
+        "text": {
+          "type": "string",
+          "value": "1 2 undefined undefined undefined undefined undefined undefined undefined"
+        }
+      }
+    ]
+  },
+  {
+    "probe": "matrix-detail",
+    "version": 1,
+    "cell": 6,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix detail 6",
+    "fields": [
+      {
+        "vec3": {
+          "add": {
+            "type": "object",
+            "ctor": "Vec3",
+            "x": "9",
+            "y": "14",
+            "z": "18"
+          },
+          "dot": {
+            "type": "number",
+            "value": "112"
+          },
+          "length": {
+            "type": "number",
+            "value": "6.164414002968976"
+          },
+          "addDescriptor": {
+            "key": "add",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 1,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          },
+          "toStringDescriptor": {
+            "key": "toString",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          }
+        },
+        "vec4": {
+          "add": {
+            "type": "object",
+            "ctor": "Vec4",
+            "x": "13",
+            "y": "16",
+            "z": "22",
+            "w": "26"
+          },
+          "dot": {
+            "type": "number",
+            "value": "279"
+          },
+          "length": {
+            "type": "number",
+            "value": "9.327379053088816"
+          },
+          "addDescriptor": {
+            "key": "add",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 1,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          },
+          "toStringDescriptor": {
+            "key": "toString",
+            "own": true,
+            "type": "function",
+            "get": "undefined",
+            "set": "undefined",
+            "length": 0,
+            "writable": true,
+            "enumerable": false,
+            "configurable": true,
+            "in": true
+          }
+        }
+      }
+    ]
+  }
+]

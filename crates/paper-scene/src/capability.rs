@@ -1,5 +1,7 @@
 use crate::scene::SceneFeatures;
 
+pub const EFFECT_CHAIN_BUDGET_GAP: &str = "effect-chain-budget";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeGap {
     EventDrivenSounds(usize),
@@ -81,7 +83,7 @@ pub struct NativeCompatibility {
 }
 
 impl NativeCompatibility {
-    pub fn full_fidelity(&self) -> bool {
+    pub fn has_no_known_gaps(&self) -> bool {
         self.gaps.is_empty()
     }
 
@@ -96,9 +98,6 @@ pub fn assess_native(features: &SceneFeatures) -> NativeCompatibility {
     if features.objects_sound_event > 0 {
         gaps.push(NativeGap::EventDrivenSounds(features.objects_sound_event));
     }
-    if features.objects_light > 0 {
-        gaps.push(NativeGap::LightObjects(features.objects_light));
-    }
     if features.objects_text > 0 {
         gaps.push(NativeGap::TextObjects(features.objects_text));
     }
@@ -107,9 +106,6 @@ pub fn assess_native(features: &SceneFeatures) -> NativeCompatibility {
     }
     if features.puppet_unsupported {
         gaps.push(NativeGap::Puppet);
-    }
-    if !features.animated_image_textures.is_empty() {
-        gaps.push(NativeGap::AnimatedImageTextures(features.animated_image_textures.len()));
     }
     if features.audio {
         gaps.push(NativeGap::AudioReactive);

@@ -236,28 +236,23 @@ fn array_varyings_are_copied_to_locals_in_the_fragment() {
 }
 
 #[test]
-fn long_scalar_varying_arrays_are_packed_into_vec4_slots() {
+fn long_scalar_varyings_pack() {
     let vert = "attribute vec3 a_Position;\nvarying vec2 v_TexCoord;\nvarying float audioValue[6];\nvoid main() {\n\tgl_Position = vec4(a_Position, 1.0);\n\tv_TexCoord = a_Position.xy;\n\tfor (int i = 0; i < 6; i++) { audioValue[i] = float(i); }\n}\n";
     let frag = "varying vec2 v_TexCoord;\nvarying float audioValue[6];\nvoid main() {\n\tfloat sum = 0.0;\n\tfor (int i = 0; i < 6; i++) { sum += audioValue[i] * audioValue[i + 1]; }\n\tgl_FragColor = vec4(v_TexCoord, sum, 1.0);\n}\n";
     let pair = rewrite_pair(vert, frag);
-    assert!(pair.vertex.contains("\tfloat4 audioValue[2] : TEXCOORD1;"), "{}", pair.vertex);
+    assert!(pair.vertex.contains("\tfloat4 skwd_io_audioValue[2] : TEXCOORD1;"), "{}", pair.vertex);
+    assert!(pair.vertex.contains("audioValue[i] = float(i);"), "{}", pair.vertex);
     assert!(
-        pair.vertex.contains("OUT.audioValue[int(i) / 4][int(i) % 4] = float(i);"),
+        pair.vertex.contains("OUT.skwd_io_audioValue[1].y = audioValue[5];"),
         "{}",
         pair.vertex
     );
     assert!(
-        pair.fragment.contains("\tfloat4 audioValue[2] = IN.audioValue;\n"),
+        pair.fragment.contains("audioValue[5] = IN.skwd_io_audioValue[1].y;"),
         "{}",
         pair.fragment
     );
-    assert!(
-        pair.fragment.contains(
-            "audioValue[int(i) / 4][int(i) % 4] * audioValue[int(i + 1) / 4][int(i + 1) % 4]"
-        ),
-        "{}",
-        pair.fragment
-    );
+    assert!(pair.fragment.contains("audioValue[i] * audioValue[i + 1]"), "{}", pair.fragment);
     if super::available() {
         super::compile(&pair.vertex, Stage::Vertex, "pack-v").expect("vertex compiles");
         super::compile(&pair.fragment, Stage::Fragment, "pack-f").expect("fragment compiles");
@@ -297,13 +292,180 @@ fn cpu_std140_offsets_match_dxc_after_a_vec3() {
 }
 
 #[test]
-fn dynamically_indexed_varying_arrays_keep_the_fragment_on_glsl() {
+fn packed_dynamic_varyings() {
     let dynamic = "varying vec2 v_TexCoord;\nvarying float audioValue[32];\nvoid main() {\n\tfloat s = 0.0;\n\tfor (int i = 0; i < 32; i++) { s += audioValue[i]; }\n\tgl_FragColor = vec4(s);\n}\n";
     let constant = "varying vec2 v_TexCoord;\nvarying float audioValue[32];\nvoid main() {\n\tgl_FragColor = vec4(audioValue[3] + audioValue[31]);\n}\n";
     let plain = "varying vec2 v_TexCoord;\nvoid main() {\n\tgl_FragColor = vec4(v_TexCoord, 0.0, 1.0);\n}\n";
     let vectors = "varying vec4 v_Taps[8];\nvoid main() {\n\tvec4 s = vec4(0.0);\n\tfor (int i = 0; i < 8; i++) { s += v_Taps[i]; }\n\tgl_FragColor = s;\n}\n";
-    assert!(super::fragment_indexes_varying_arrays_dynamically(dynamic));
-    assert!(!super::fragment_indexes_varying_arrays_dynamically(constant));
-    assert!(!super::fragment_indexes_varying_arrays_dynamically(plain));
-    assert!(!super::fragment_indexes_varying_arrays_dynamically(vectors));
+    let combos = BTreeMap::new();
+    assert!(!super::fragment_indexes_varying_arrays_dynamically(dynamic, &combos));
+    assert!(!super::fragment_indexes_varying_arrays_dynamically(constant, &combos));
+    assert!(!super::fragment_indexes_varying_arrays_dynamically(plain, &combos));
+    assert!(!super::fragment_indexes_varying_arrays_dynamically(vectors, &combos));
+}
+
+#[test]
+fn vector_kernel_varyings_pack() {
+    let vert = "attribute vec3 a_Position;\nvarying vec2 v_Kernel[49];\nvoid fill() { for (int i = 0; i < 49; i++) v_Kernel[i] = vec2(float(i), 0.0); }\nvoid main() { gl_Position = vec4(a_Position, 1.0); fill(); }\n";
+    let frag = "varying vec2 v_Kernel[49];\nfloat sum() { float result = 0.0; for (int i = 0; i < 49; i++) result += v_Kernel[i].x; return result; }\nvoid main() { gl_FragColor = CAST4(sum()); }\n";
+    let pair = rewrite_pair(vert, frag);
+    assert_eq!(super::varying_slots(vert, vert, &BTreeMap::new()), 25);
+    assert!(pair.vertex.contains("float4 skwd_io_v_Kernel[25] : TEXCOORD0;"));
+    assert!(pair.vertex.contains("OUT.skwd_io_v_Kernel[24].xy = v_Kernel[48];"));
+    assert!(
+        pair.fragment.contains("v_Kernel[48] = IN.skwd_io_v_Kernel[24].xy;"),
+        "{}",
+        pair.fragment
+    );
+    assert!(pair.fragment.contains("result += v_Kernel[i].x;"));
+    if super::available() {
+        super::compile(&pair.vertex, Stage::Vertex, "kernel-v").expect("vertex compiles");
+        super::compile(&pair.fragment, Stage::Fragment, "kernel-f").expect("fragment compiles");
+    }
+}
+
+#[test]
+fn triple_array_varyings() {
+    let vertex = "attribute vec3 a_Position;\nvarying vec2 v_Uv;\nvarying vec3 v_Colors[20];\nvarying vec3 v_Settings[20];\nvoid main() { gl_Position = vec4(a_Position, 1.0); v_Uv = a_Position.xy; for (int i = 0; i < 20; i++) { v_Colors[i] = vec3(float(i), 0.0, 1.0); v_Settings[i] = vec3(float(20 - i), 1.0, 0.0); } }\n";
+    let fragment = "varying vec2 v_Uv;\nvarying vec3 v_Colors[20];\nvarying vec3 v_Settings[20];\nvoid main() { int tap = int(v_Uv.x); gl_FragColor = vec4(v_Colors[tap] + v_Settings[tap], 1.0); }\n";
+    let combos = BTreeMap::new();
+    assert_eq!(super::varying_slots(vertex, vertex, &combos), 31);
+    let pair = rewrite_pair(vertex, fragment);
+    assert!(pair.vertex.contains("OUT.skwd_io_v_Colors[0].w = v_Colors[1].x;"));
+    assert!(pair.fragment.contains("v_Colors[1].yz = IN.skwd_io_v_Colors[1].xy;"));
+    assert!(pair.fragment.contains("v_Settings[19] = IN.skwd_io_v_Settings[14].yzw;"));
+    for (source, stage) in [(vertex, Stage::Vertex), (fragment, Stage::Fragment)] {
+        let translated = translate_with(source, stage, &combos, None);
+        crate::shader::compile(&translated.source, stage, "triple-array").unwrap();
+    }
+    if super::available() {
+        super::compile(&pair.vertex, Stage::Vertex, "triple-v").unwrap();
+        super::compile(&pair.fragment, Stage::Fragment, "triple-f").unwrap();
+    }
+}
+
+#[test]
+fn defined_array_varyings_pack() {
+    let vert = "#define RESOLUTION 32\nattribute vec3 a_Position;\nvarying float audioValue[RESOLUTION];\nvoid fill() { for (int i = 0; i < RESOLUTION; i++) audioValue[i] = float(i); }\nvoid main() { gl_Position = vec4(a_Position, 1.0); fill(); }\n";
+    let frag = "#define RESOLUTION 32\nvarying float audioValue[RESOLUTION];\nfloat sum() { float result = 0.0; for (int i = 0; i < RESOLUTION; i++) result += audioValue[i]; return result; }\nvoid main() { gl_FragColor = CAST4(sum()); }\n";
+    let combos = BTreeMap::new();
+    assert_eq!(super::varying_slots(vert, vert, &combos), 8);
+    assert!(!super::fragment_indexes_varying_arrays_dynamically(frag, &combos));
+    let pair = rewrite_pair(vert, frag);
+    assert!(pair.vertex.contains("skwd_io_audioValue[8] : TEXCOORD0"));
+    assert!(pair.vertex.contains("OUT.skwd_io_audioValue[7].w = audioValue[31];"));
+    assert!(pair.fragment.contains("audioValue[31] = IN.skwd_io_audioValue[7].w;"));
+    if super::available() {
+        super::compile(&pair.vertex, Stage::Vertex, "defined-v").expect("vertex compiles");
+        super::compile(&pair.fragment, Stage::Fragment, "defined-f").expect("fragment compiles");
+    }
+}
+
+#[test]
+fn sampler_alias_compiles() {
+    let vert = "attribute vec3 a_Position;\nvarying vec2 v_Uv;\nvoid main() { gl_Position = vec4(a_Position, 1.0); v_Uv = a_Position.xy; }\n";
+    let frag = "uniform sampler2D g_Texture0;\nvarying vec2 v_Uv;\n#define UI_MASK g_Texture0\nvoid main() { gl_FragColor = texSample2D(UI_MASK, v_Uv); }\n";
+    let pair = rewrite_pair(vert, frag);
+    assert!(pair.fragment.contains("texSample2D(UI_MASK, IN.v_Uv)"));
+    if super::available() {
+        super::compile(&pair.fragment, Stage::Fragment, "alias-f").expect("alias compiles");
+    }
+}
+
+#[test]
+fn field_varyings_pack() {
+    use std::fmt::Write;
+
+    let mut vert =
+        String::from("attribute vec3 a_Position;\nvarying vec3 v_A;\nvarying vec2 v_B;\n");
+    let mut frag = String::from("varying vec3 v_A;\nvarying vec2 v_B;\n");
+    for index in 0..34 {
+        let _ = writeln!(vert, "varying float v_{index};");
+        let _ = writeln!(frag, "varying float v_{index};");
+    }
+    vert.push_str("void main() { gl_Position = vec4(a_Position, 1.0); v_A = vec3(0.1, 0.2, 0.3); v_B = vec2(0.4, 0.5);");
+    for index in 0..34 {
+        let _ = write!(vert, " v_{index} = float({index}) / 34.0;");
+    }
+    vert.push_str(" }\n");
+    frag.push_str("void main() { float sum = v_A.z + v_B.y + v_0 + v_33; gl_FragColor = vec4(sum, sum, sum, 1.0); }\n");
+    assert_eq!(super::varying_slots(&vert, &vert, &BTreeMap::new()), 10);
+    let pair = rewrite_pair(&vert, &frag);
+    assert!(pair.vertex.contains("float4 skwd_packed_fields[10] : TEXCOORD0"));
+    assert!(pair.vertex.contains("OUT.skwd_packed_fields[0].w = v_B.x;"));
+    assert!(pair.fragment.contains("v_B.y = IN.skwd_packed_fields[1].x;"));
+    if super::available() {
+        super::compile(&pair.vertex, Stage::Vertex, "fields-v").expect("vertex compiles");
+        super::compile(&pair.fragment, Stage::Fragment, "fields-f").expect("fragment compiles");
+    }
+}
+
+#[test]
+fn full_vectors_stay_capped() {
+    let vert = "#define RESOLUTION 32\nattribute vec3 a_Position;\nvarying vec4 audioValue[RESOLUTION];\nvarying vec2 v_TexCoord;\nvarying vec3 v_PerspCoord;\nvarying vec3 v_ViewCoord;\nvoid main() { gl_Position = vec4(a_Position, 1.0); for (int i = 0; i < RESOLUTION; i++) audioValue[i] = vec4(float(i), 0.0, 0.0, 1.0); v_TexCoord = a_Position.xy; v_PerspCoord = a_Position; v_ViewCoord = a_Position; }\n";
+    assert_eq!(super::varying_slots(vert, vert, &BTreeMap::new()), 34);
+    assert!(super::varying_slots(vert, vert, &BTreeMap::new()) > super::MAX_VARYING_SLOTS);
+}
+
+#[test]
+fn rectangular_array_declaration() {
+    let vertex = "uniform float before;\nuniform mat4x3 palette[2];\nuniform float after;\nattribute vec4 a_Position;\nvoid main() {\n gl_Position = vec4(mul(a_Position, palette[1]).xyz, before + after);\n}\n";
+    let fragment = "void main() {\n gl_FragColor = vec4(1.0);\n}\n";
+    let combos = BTreeMap::new();
+    let mut translated_vertex = translate_with(vertex, Stage::Vertex, &combos, None);
+    let mut translated_fragment = translate_with(fragment, Stage::Fragment, &combos, None);
+    unify_uniforms(&mut translated_vertex, &mut translated_fragment);
+    let pair = rewrite(vertex, fragment, &combos, &translated_vertex.uniforms, &[]);
+    assert_eq!(pair.vertex.matches("float4x3 palette[2];").count(), 1);
+    assert!(!pair.vertex.contains("[2][2]"));
+    assert!(pair.vertex.contains("mul(IN.a_Position, palette[1])"));
+}
+
+#[test]
+fn bounded_array_pair() {
+    let vertex = "#define SIZE 32\n#define COUNT SIZE\nattribute vec3 a_Position;\nvarying vec4 bins[SIZE];\nvarying vec4 tail[2];\nvoid main() { int index; for(index=0;index<COUNT;index+=4) { bins[uint(index)/uint(4)]=CAST4(float(index)/32.0); } tail[0]=CAST4(0); tail[1]=CAST4(1); gl_Position=vec4(a_Position,1); }";
+    let fragment = "#define SIZE 32\n#define COUNT SIZE\nvarying vec4 bins[SIZE];\nvarying vec4 tail[2];\nvoid main() { float frequency,amplitude,total=0; for(int index=0;index<COUNT;index+=1) { frequency=float(index); amplitude=bins[int(frequency*0.25)][index%int(4)]; total+=amplitude; } gl_FragColor=CAST4(total/32.0)+tail[0]+tail[1]*0.0; }";
+    assert_eq!(super::varying_slots(vertex, fragment, &BTreeMap::new()), 10);
+    let pair = rewrite_pair(vertex, fragment);
+    assert!(pair.vertex.contains("vec4 bins[8] : TEXCOORD0;"));
+    assert!(pair.fragment.contains("vec4 bins[8] : TEXCOORD0;"));
+    if super::available() {
+        super::compile(&pair.vertex, Stage::Vertex, "bounded-v").unwrap();
+        super::compile(&pair.fragment, Stage::Fragment, "bounded-f").unwrap();
+    }
+}
+
+#[test]
+fn stage_bounds_agree() {
+    let vertex = "varying vec4 bins[32];\nvoid main() { bins[7]=vec4(1); }";
+    for fragment in [
+        "varying vec4 bins[64];\nvoid main() { gl_FragColor=bins[7]; }",
+        "varying vec4 bins[32];\nvoid main() { gl_FragColor=bins[unknown]; }",
+        "varying vec3 bins[32];\nvoid main() { gl_FragColor=vec4(bins[7],1); }",
+    ] {
+        assert_eq!(super::varying_slots(vertex, fragment, &BTreeMap::new()), 32);
+    }
+    let fragment = "varying vec4 bins[32];\nvoid main() { gl_FragColor=bins[15]; }";
+    assert_eq!(super::varying_slots(vertex, fragment, &BTreeMap::new()), 16);
+}
+
+#[test]
+fn octal_declaration_preserved() {
+    let source = "varying vec4 bins[010];\nvoid main() { bins[0]=CAST4(1); }";
+    assert_eq!(super::varying_slots(source, source, &BTreeMap::new()), 10);
+    let pair = rewrite_pair(source, source);
+    assert!(pair.vertex.contains("vec4 bins[010] : TEXCOORD0;"));
+}
+
+#[test]
+fn removed_line_splice_rejected() {
+    let vertex = "varying vec4 bins[32];\nvoid main() { bins[0]=CAST4(1); }";
+    let fragment = r"varying vec4 bins[32];
+uniform float hidden; // \
+#define INDEX 0
+static const int INDEX=31;
+void main() { gl_FragColor=bins[INDEX]; }";
+    assert_eq!(super::varying_slots(vertex, fragment, &BTreeMap::new()), 32);
+    let pair = rewrite_pair(vertex, fragment);
+    assert!(pair.vertex.contains("vec4 bins[32] : TEXCOORD0;"));
 }

@@ -1,7 +1,18 @@
 use std::ffi::c_void;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use ash::vk;
+
+const MAX_ANISOTROPY: f32 = 8.0;
+
+fn anisotropy_limit(supported: bool, device_limit: f32) -> Option<f32> {
+    (supported && device_limit > 1.0).then(|| device_limit.min(MAX_ANISOTROPY))
+}
+
+fn sampler_anisotropy(limit: Option<f32>, filter: vk::Filter, mips: bool, requested: bool) -> f32 {
+    if requested && mips && filter == vk::Filter::LINEAR { limit.unwrap_or(1.0) } else { 1.0 }
+}
 
 pub struct Renderer {
     pub(super) owns_device: bool,
@@ -12,6 +23,7 @@ pub struct Renderer {
     pub(super) swapchain_fns: ash::khr::swapchain::Device,
     pub(super) ext_mem_fd: ash::khr::external_memory_fd::Device,
     pub device: ash::Device,
+    resource_device: OnceLock<Arc<ash::Device>>,
     pub(super) phys: vk::PhysicalDevice,
     pub(super) queue: vk::Queue,
     pub(super) queue_family: u32,
@@ -28,23 +40,28 @@ pub struct Renderer {
     pub(super) framebuffers: Vec<vk::Framebuffer>,
     pub(super) pipeline_layout: vk::PipelineLayout,
     pub(super) pipeline: vk::Pipeline,
+    pub(super) pipeline_scene_video: vk::Pipeline,
     pub(super) pipeline_fade: vk::Pipeline,
     pub(super) pipeline_layout_sand: vk::PipelineLayout,
     pub(super) pipeline_sand: vk::Pipeline,
     pub(super) pipeline_base: vk::Pipeline,
+    #[cfg(feature = "shared-device")]
+    pub(super) transition: Option<super::transition::Transition>,
     pub(super) effect_pipes: std::collections::HashMap<usize, vk::Pipeline>,
+    pub(super) scene_config: super::SceneConfig,
+    pub(super) scene_multisample: bool,
     pub(super) scene_pass: vk::RenderPass,
-    pub(super) format_passes: Vec<(vk::Format, vk::RenderPass)>,
-    pub(super) format_passes_load: Vec<(vk::Format, vk::RenderPass)>,
-    pub(super) format_passes_append: Vec<(vk::Format, vk::RenderPass)>,
-    pub(super) scene_pool: vk::DescriptorPool,
-    pub(super) fx_pool: vk::DescriptorPool,
+    pub(super) depth_passes:
+        Vec<((super::SceneConfig, vk::SampleCountFlags), super::pipelines::DepthPasses)>,
+    pub(super) format_passes: Vec<((vk::Format, vk::SampleCountFlags), vk::RenderPass)>,
+    pub(super) format_passes_load: Vec<((vk::Format, vk::SampleCountFlags), vk::RenderPass)>,
+    pub(super) format_passes_append: Vec<((vk::Format, vk::SampleCountFlags), vk::RenderPass)>,
+    pub(super) scene_pools: Vec<vk::DescriptorPool>,
+    pub(super) fx_pools: Vec<vk::DescriptorPool>,
     pub(super) pipeline_layout_layer: vk::PipelineLayout,
-    pub(super) pipeline_layer: vk::Pipeline,
-    pub(super) pipeline_layer_add: vk::Pipeline,
-    pub(super) pipeline_layer_copy: vk::Pipeline,
-    pub(super) pipeline_layer_screen: vk::Pipeline,
-    pub(super) pipeline_puppet: vk::Pipeline,
+    pub(super) raster_pipelines: [Option<super::pipelines::SceneRasterPipelines>; 2],
+    pub(super) pipeline_layout_clip: vk::PipelineLayout,
+    pub(super) clip_pipelines: [Option<super::pipelines::ClipPipelines>; 2],
     pub(super) pipeline_rgba: vk::Pipeline,
     pub(super) pipeline_rgba_fade: vk::Pipeline,
     pub(super) direct_render: bool,
@@ -58,6 +75,8 @@ pub struct Renderer {
     pub(super) sampler_nearest_repeat: vk::Sampler,
     pub(super) sampler_mip: vk::Sampler,
     pub(super) sampler_mip_repeat: vk::Sampler,
+    pub(super) sampler_aniso: vk::Sampler,
+    pub(super) sampler_aniso_repeat: vk::Sampler,
     pub(super) sampler_mip_nearest: vk::Sampler,
     pub(super) sampler_mip_nearest_repeat: vk::Sampler,
     pub(super) bc_supported: bool,
@@ -65,8 +84,9 @@ pub struct Renderer {
     pub(super) cmd_pool: vk::CommandPool,
     pub(super) cmd: vk::CommandBuffer,
     pub(super) acquire_sem: vk::Semaphore,
-    pub(super) render_sem: vk::Semaphore,
+    pub(super) render_sems: Vec<vk::Semaphore>,
     pub(super) fence: vk::Fence,
+    pub(super) fence_pending: std::cell::Cell<bool>,
     pub(super) scene_query_pool: Option<vk::QueryPool>,
     pub(super) scene_timestamp_period: f64,
     pub(super) scene_timestamp_valid_bits: u32,
@@ -75,6 +95,10 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    pub(super) fn resource_device(&self) -> Arc<ash::Device> {
+        Arc::clone(self.resource_device.get_or_init(|| Arc::new(self.device.clone())))
+    }
+
     pub fn direct_render(&self) -> bool {
         self.direct_render
     }
@@ -260,7 +284,8 @@ impl Renderer {
                 .queue_priorities(&prio)];
             let supported = instance.get_physical_device_features(phys);
             let features = vk::PhysicalDeviceFeatures::default()
-                .texture_compression_bc(supported.texture_compression_bc == vk::TRUE);
+                .texture_compression_bc(supported.texture_compression_bc == vk::TRUE)
+                .sampler_anisotropy(supported.sampler_anisotropy == vk::TRUE);
             let device = instance
                 .create_device(
                     phys,
@@ -336,12 +361,21 @@ impl Renderer {
                 })
                 .collect::<std::result::Result<_, _>>()?;
 
-            let make_sampler = |filter: vk::Filter, mode: vk::SamplerAddressMode, mips: bool| {
+            let supported = instance.get_physical_device_features(phys);
+            let device_limit =
+                instance.get_physical_device_properties(phys).limits.max_sampler_anisotropy;
+            let anisotropy =
+                anisotropy_limit(supported.sampler_anisotropy == vk::TRUE, device_limit);
+            let make_sampler = |filter: vk::Filter,
+                                mode: vk::SamplerAddressMode,
+                                mips: bool,
+                                anisotropic: bool| {
                 let mipmap_mode = if filter == vk::Filter::NEAREST {
                     vk::SamplerMipmapMode::NEAREST
                 } else {
                     vk::SamplerMipmapMode::LINEAR
                 };
+                let amount = sampler_anisotropy(anisotropy, filter, mips, anisotropic);
                 device.create_sampler(
                     &vk::SamplerCreateInfo::default()
                         .mag_filter(filter)
@@ -350,20 +384,25 @@ impl Renderer {
                         .address_mode_u(mode)
                         .address_mode_v(mode)
                         .address_mode_w(mode)
+                        .anisotropy_enable(amount > 1.0)
+                        .max_anisotropy(amount)
                         .max_lod(if mips { vk::LOD_CLAMP_NONE } else { 0.0 }),
                     None,
                 )
             };
             let clamp = vk::SamplerAddressMode::CLAMP_TO_EDGE;
             let repeat = vk::SamplerAddressMode::REPEAT;
-            let sampler = make_sampler(vk::Filter::LINEAR, clamp, false)?;
-            let sampler_repeat = make_sampler(vk::Filter::LINEAR, repeat, false)?;
-            let sampler_nearest = make_sampler(vk::Filter::NEAREST, clamp, false)?;
-            let sampler_nearest_repeat = make_sampler(vk::Filter::NEAREST, repeat, false)?;
-            let sampler_mip = make_sampler(vk::Filter::LINEAR, clamp, true)?;
-            let sampler_mip_repeat = make_sampler(vk::Filter::LINEAR, repeat, true)?;
-            let sampler_mip_nearest = make_sampler(vk::Filter::NEAREST, clamp, true)?;
-            let sampler_mip_nearest_repeat = make_sampler(vk::Filter::NEAREST, repeat, true)?;
+            let sampler = make_sampler(vk::Filter::LINEAR, clamp, false, false)?;
+            let sampler_repeat = make_sampler(vk::Filter::LINEAR, repeat, false, false)?;
+            let sampler_nearest = make_sampler(vk::Filter::NEAREST, clamp, false, false)?;
+            let sampler_nearest_repeat = make_sampler(vk::Filter::NEAREST, repeat, false, false)?;
+            let sampler_mip = make_sampler(vk::Filter::LINEAR, clamp, true, false)?;
+            let sampler_mip_repeat = make_sampler(vk::Filter::LINEAR, repeat, true, false)?;
+            let sampler_aniso = make_sampler(vk::Filter::LINEAR, clamp, true, true)?;
+            let sampler_aniso_repeat = make_sampler(vk::Filter::LINEAR, repeat, true, true)?;
+            let sampler_mip_nearest = make_sampler(vk::Filter::NEAREST, clamp, true, false)?;
+            let sampler_mip_nearest_repeat =
+                make_sampler(vk::Filter::NEAREST, repeat, true, false)?;
             let env_on = |name: &str| std::env::var(name).as_deref() != Ok("0");
             let bc_supported = env_on("SKWD_PAPER_TEX_BC")
                 && instance.get_physical_device_features(phys).texture_compression_bc == vk::TRUE;
@@ -374,12 +413,12 @@ impl Renderer {
                     .binding(0)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
             ];
             let desc_layout = device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -418,7 +457,6 @@ impl Renderer {
                     .command_buffer_count(1),
             )?[0];
             let acquire_sem = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
-            let render_sem = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
             let fence = device.create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
                 None,
@@ -451,6 +489,7 @@ impl Renderer {
                 swapchain_fns,
                 ext_mem_fd,
                 device,
+                resource_device: OnceLock::new(),
                 phys,
                 queue,
                 queue_family,
@@ -467,23 +506,27 @@ impl Renderer {
                 framebuffers,
                 pipeline_layout,
                 pipeline,
+                pipeline_scene_video: vk::Pipeline::null(),
                 pipeline_fade: vk::Pipeline::null(),
                 pipeline_layout_sand,
                 pipeline_sand: vk::Pipeline::null(),
                 pipeline_base: vk::Pipeline::null(),
+                #[cfg(feature = "shared-device")]
+                transition: None,
                 effect_pipes: std::collections::HashMap::new(),
+                scene_config: super::SceneConfig::default(),
+                scene_multisample: true,
                 scene_pass: vk::RenderPass::null(),
+                depth_passes: Vec::new(),
                 format_passes: Vec::new(),
                 format_passes_load: Vec::new(),
                 format_passes_append: Vec::new(),
-                scene_pool: vk::DescriptorPool::null(),
-                fx_pool: vk::DescriptorPool::null(),
+                scene_pools: Vec::new(),
+                fx_pools: Vec::new(),
                 pipeline_layout_layer: vk::PipelineLayout::null(),
-                pipeline_layer: vk::Pipeline::null(),
-                pipeline_layer_add: vk::Pipeline::null(),
-                pipeline_layer_copy: vk::Pipeline::null(),
-                pipeline_layer_screen: vk::Pipeline::null(),
-                pipeline_puppet: vk::Pipeline::null(),
+                raster_pipelines: [None, None],
+                pipeline_layout_clip: vk::PipelineLayout::null(),
+                clip_pipelines: [None, None],
                 pipeline_rgba: vk::Pipeline::null(),
                 pipeline_rgba_fade: vk::Pipeline::null(),
                 direct_render,
@@ -497,6 +540,8 @@ impl Renderer {
                 sampler_nearest_repeat,
                 sampler_mip,
                 sampler_mip_repeat,
+                sampler_aniso,
+                sampler_aniso_repeat,
                 sampler_mip_nearest,
                 sampler_mip_nearest_repeat,
                 bc_supported,
@@ -504,14 +549,16 @@ impl Renderer {
                 cmd_pool,
                 cmd,
                 acquire_sem,
-                render_sem,
+                render_sems: Vec::new(),
                 fence,
+                fence_pending: std::cell::Cell::new(false),
                 scene_query_pool,
                 scene_timestamp_period,
                 scene_timestamp_valid_bits,
                 scene_timestamp_active,
                 scene_gpu_time_ns: None,
             };
+            renderer.render_sems = renderer.create_present_semaphores()?;
             if drm_modifier_ext {
                 renderer.import_modifiers = [
                     renderer.single_plane_import_modifiers(vk::Format::R8_UNORM),
@@ -523,10 +570,16 @@ impl Renderer {
     }
 }
 
+#[cfg(test)]
+#[path = "renderer/tests.rs"]
+mod tests;
+
 impl Drop for Renderer {
     fn drop(&mut self) {
+        let _ = crate::shared::wait_idle(&self.device);
         unsafe {
-            let _ = self.device.device_wait_idle();
+            #[cfg(feature = "shared-device")]
+            drop(self.transition.take());
             for (_, (lv, cv)) in self.plane_views.drain() {
                 self.device.destroy_image_view(lv, None);
                 self.device.destroy_image_view(cv, None);
@@ -536,25 +589,42 @@ impl Drop for Renderer {
             }
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_semaphore(self.acquire_sem, None);
-            self.device.destroy_semaphore(self.render_sem, None);
+            for semaphore in self.render_sems.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_pipeline(self.pipeline_scene_video, None);
             self.device.destroy_pipeline(self.pipeline_fade, None);
-            self.device.destroy_pipeline(self.pipeline_layer, None);
-            self.device.destroy_pipeline(self.pipeline_layer_add, None);
-            self.device.destroy_pipeline(self.pipeline_layer_copy, None);
-            self.device.destroy_pipeline(self.pipeline_layer_screen, None);
-            self.device.destroy_pipeline(self.pipeline_puppet, None);
+            for set in self.raster_pipelines.into_iter().flatten() {
+                for pipeline in set
+                    .layers
+                    .into_iter()
+                    .chain(set.text)
+                    .chain(set.puppet)
+                    .chain(set.culled_puppet)
+                {
+                    self.device.destroy_pipeline(pipeline, None);
+                }
+            }
             self.device.destroy_pipeline(self.pipeline_rgba, None);
             self.device.destroy_pipeline(self.pipeline_rgba_fade, None);
+            for pipeline in self
+                .clip_pipelines
+                .into_iter()
+                .flatten()
+                .flat_map(super::pipelines::ClipPipelines::all)
+            {
+                self.device.destroy_pipeline(pipeline, None);
+            }
+            if self.pipeline_layout_clip != vk::PipelineLayout::null() {
+                self.device.destroy_pipeline_layout(self.pipeline_layout_clip, None);
+            }
             if self.pipeline_layout_layer != vk::PipelineLayout::null() {
                 self.device.destroy_pipeline_layout(self.pipeline_layout_layer, None);
             }
-            if self.scene_pool != vk::DescriptorPool::null() {
-                self.device.destroy_descriptor_pool(self.scene_pool, None);
-            }
-            if self.fx_pool != vk::DescriptorPool::null() {
-                self.device.destroy_descriptor_pool(self.fx_pool, None);
+            for pool in self.scene_pools.drain(..).chain(self.fx_pools.drain(..)) {
+                self.device.destroy_descriptor_pool(pool, None);
             }
             if self.scene_pass != vk::RenderPass::null() {
                 self.device.destroy_render_pass(self.scene_pass, None);
@@ -564,6 +634,11 @@ impl Drop for Renderer {
                     .chain(self.format_passes_load.drain(..))
                     .chain(self.format_passes_append.drain(..))
                 {
+                    self.device.destroy_render_pass(pass, None);
+                }
+            }
+            for (_, passes) in self.depth_passes.drain(..) {
+                for pass in [passes.clear, passes.append, passes.initialize] {
                     self.device.destroy_render_pass(pass, None);
                 }
             }
@@ -582,6 +657,8 @@ impl Drop for Renderer {
             self.device.destroy_sampler(self.sampler_nearest_repeat, None);
             self.device.destroy_sampler(self.sampler_mip, None);
             self.device.destroy_sampler(self.sampler_mip_repeat, None);
+            self.device.destroy_sampler(self.sampler_aniso, None);
+            self.device.destroy_sampler(self.sampler_aniso_repeat, None);
             self.device.destroy_sampler(self.sampler_mip_nearest, None);
             self.device.destroy_sampler(self.sampler_mip_nearest_repeat, None);
             for fb in &self.framebuffers {

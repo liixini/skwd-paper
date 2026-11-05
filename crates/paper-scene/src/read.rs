@@ -24,6 +24,11 @@ impl<'a> Reader<'a> {
         Ok(slice)
     }
 
+    pub(crate) fn at(&self, offset: usize, len: usize) -> Result<&'a [u8]> {
+        let end = offset.checked_add(len).ok_or_else(|| anyhow!("length overflow"))?;
+        self.data.get(offset..end).ok_or_else(|| anyhow!("truncated: need {len} bytes at {offset}"))
+    }
+
     pub(crate) fn skip(&mut self, len: usize) -> Result<()> {
         self.take(len).map(|_| ())
     }

@@ -2,17 +2,17 @@
 
 use crate::{audit, effects, model, pkg, scene, tex};
 
-fn push_len_str(out: &mut Vec<u8>, text: &str) {
+pub(crate) fn push_len_str(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(&(u32::try_from(text.len()).unwrap()).to_le_bytes());
     out.extend_from_slice(text.as_bytes());
 }
 
-fn push_nul_str(out: &mut Vec<u8>, text: &str) {
+pub(crate) fn push_nul_str(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(text.as_bytes());
     out.push(0);
 }
 
-fn push_i32(out: &mut Vec<u8>, value: i32) {
+pub(crate) fn push_i32(out: &mut Vec<u8>, value: i32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -89,6 +89,54 @@ pub(crate) fn build_tex(
     out
 }
 
+pub(crate) const FULL_VARIANT: [i32; 4] = [0, 0, 4, 4];
+
+pub(crate) fn variant_fill(fill: u8) -> [u8; 64] {
+    std::array::from_fn(|byte| fill.wrapping_mul(byte as u8))
+}
+
+pub(crate) fn build_variant_tex(variants: &[(u32, &str, [i32; 4])], compress: bool) -> Vec<u8> {
+    let encode = |fill: u8| {
+        let raw = variant_fill(fill);
+        if compress { lz4_flex::block::compress(&raw) } else { raw.to_vec() }
+    };
+    let mut out = Vec::new();
+    push_nul_str(&mut out, "TEXV0005");
+    push_nul_str(&mut out, "TEXI0001");
+    for value in [0, 0, 4, 4, 4, 4, 0] {
+        push_i32(&mut out, value);
+    }
+    push_nul_str(&mut out, "TEXB0004");
+    for value in [1, -1, i32::try_from(variants.len()).unwrap()] {
+        push_i32(&mut out, value);
+    }
+    for (index, condition, _) in variants {
+        for value in [1, i32::try_from(*index).unwrap(), 0] {
+            push_i32(&mut out, value);
+        }
+        push_nul_str(&mut out, condition);
+    }
+    let base = encode(0);
+    for value in [1, 4, 4, i32::from(compress), 64, i32::try_from(base.len()).unwrap()] {
+        push_i32(&mut out, value);
+    }
+    out.extend(base);
+    push_i32(&mut out, 1);
+    push_i32(&mut out, i32::try_from(variants.len()).unwrap());
+    for (index, _, rect) in variants {
+        let payload = encode(u8::try_from(*index).unwrap());
+        push_i32(&mut out, 1);
+        push_i32(&mut out, i32::try_from(*index).unwrap());
+        for value in rect {
+            push_i32(&mut out, *value);
+        }
+        push_i32(&mut out, 13);
+        push_i32(&mut out, i32::try_from(payload.len()).unwrap());
+        out.extend(payload);
+    }
+    out
+}
+
 #[test]
 fn pkg_round_trip() {
     let bytes = build_pkg(&[("a/b.json", b"{}"), ("scene.json", b"{\"objects\":[]}")]);
@@ -112,12 +160,12 @@ fn pkg_rejects_garbage() {
 fn tex_uncompressed_and_lz4() {
     let payload = [7u8; 64];
     let plain = build_tex("TEXB0001", 0, 0, &payload, false, None);
-    let parsed = tex::parse(&plain).unwrap();
+    let parsed = tex::parse(&plain, None).unwrap();
     assert_eq!(parsed.meta.format, tex::TexFormat::Rgba8888);
     assert_eq!(parsed.images[0][0].data, payload);
 
     let packed = build_tex("TEXB0002", 7, 0, &payload, true, None);
-    let parsed = tex::parse(&packed).unwrap();
+    let parsed = tex::parse(&packed, None).unwrap();
     assert_eq!(parsed.meta.format, tex::TexFormat::Dxt1);
     assert_eq!(parsed.images[0][0].data, payload);
 
@@ -130,7 +178,7 @@ fn tex_uncompressed_and_lz4() {
 fn tex_gif_frames() {
     let bytes =
         build_tex("TEXB0003", 0, tex::FLAG_IS_GIF as i32, &[1u8; 64], false, Some("TEXS0003"));
-    let parsed = tex::parse(&bytes).unwrap();
+    let parsed = tex::parse(&bytes, None).unwrap();
     assert_eq!(parsed.meta.frame_count, 1);
     assert!((parsed.frames[0].width - 4.0).abs() < f32::EPSILON);
 }
@@ -142,19 +190,19 @@ fn tex_decode_argb_and_r8() {
         argb.extend_from_slice(&[1, 2, 3, 4]);
     }
     let bytes = build_tex("TEXB0002", 0, 0, &argb, true, None);
-    let (w, h, rgba) = tex::decode_rgba(&mut tex::parse(&bytes).unwrap()).unwrap();
+    let (w, h, rgba) = tex::decode_rgba(&mut tex::parse(&bytes, None).unwrap()).unwrap();
     assert_eq!((w, h), (4, 4));
     assert_eq!(&rgba[0..4], &[1, 2, 3, 4]);
 
     let bytes = build_tex("TEXB0002", 9, 0, &[9u8; 16], true, None);
-    let mut parsed = tex::parse(&bytes).unwrap();
+    let mut parsed = tex::parse(&bytes, None).unwrap();
     let pixels = tex::take_pixels(&mut parsed).unwrap();
     assert_eq!(pixels.format, tex::PixelFormat::R8);
     assert_eq!(pixels.bytes(), 16);
     assert_eq!(&pixels.base_rgba().unwrap()[0..4], &[9, 0, 0, 255]);
 }
 
-fn build_tex_levels(format: i32, levels: &[(i32, i32, &[u8])]) -> Vec<u8> {
+pub(crate) fn build_tex_levels(format: i32, levels: &[(i32, i32, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     push_nul_str(&mut out, "TEXV0005");
     push_nul_str(&mut out, "TEXI0001");
@@ -181,7 +229,7 @@ fn build_tex_levels(format: i32, levels: &[(i32, i32, &[u8])]) -> Vec<u8> {
 #[test]
 fn tex_native_levels_keep_shipped_chain_and_stop_at_bad_level() {
     let bytes = build_tex_levels(7, &[(8, 4, &[1u8; 16]), (4, 2, &[2u8; 8]), (2, 1, &[3u8; 8])]);
-    let pixels = tex::take_pixels(&mut tex::parse(&bytes).unwrap()).unwrap();
+    let pixels = tex::take_pixels(&mut tex::parse(&bytes, None).unwrap()).unwrap();
     assert_eq!(pixels.format, tex::PixelFormat::Bc1);
     assert!(pixels.format.compressed());
     assert_eq!(pixels.levels.len(), 3);
@@ -194,16 +242,131 @@ fn tex_native_levels_keep_shipped_chain_and_stop_at_bad_level() {
     assert_eq!(rgba.levels[0].data.len(), 8 * 4 * 4);
 
     let bytes = build_tex_levels(0, &[(4, 4, &[1u8; 64]), (3, 3, &[2u8; 36]), (1, 1, &[3u8; 4])]);
-    let pixels = tex::take_pixels(&mut tex::parse(&bytes).unwrap()).unwrap();
+    let pixels = tex::take_pixels(&mut tex::parse(&bytes, None).unwrap()).unwrap();
     assert_eq!(pixels.levels.len(), 1);
 
     let bytes = build_tex_levels(8, &[(2, 2, &[1u8; 8]), (1, 1, &[2u8; 1])]);
-    let pixels = tex::take_pixels(&mut tex::parse(&bytes).unwrap()).unwrap();
+    let pixels = tex::take_pixels(&mut tex::parse(&bytes, None).unwrap()).unwrap();
     assert_eq!(pixels.format, tex::PixelFormat::Rg8);
     assert_eq!(pixels.levels.len(), 1);
 
     let bytes = build_tex_levels(4, &[(4, 4, &[1u8; 15])]);
-    assert!(tex::take_pixels(&mut tex::parse(&bytes).unwrap()).is_none());
+    assert!(tex::take_pixels(&mut tex::parse(&bytes, None).unwrap()).is_none());
+}
+
+fn free_png(width: u32, height: u32, red: u8) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(width, height, image::Rgba([red, 0, 0, 255]));
+    let mut bytes = Vec::new();
+    image.write_with_encoder(image::codecs::png::PngEncoder::new(&mut bytes)).unwrap();
+    bytes
+}
+
+fn free_tex(levels: &[(i32, i32, Vec<u8>)]) -> tex::Tex {
+    let records: Vec<_> =
+        levels.iter().map(|(width, height, png)| (*width, *height, png.as_slice())).collect();
+    let mut parsed = tex::parse(&build_tex_levels(0, &records), None).unwrap();
+    parsed.meta.free_image_format = Some(13);
+    parsed
+}
+
+#[test]
+fn free_image_mip_chain() {
+    let dimensions = [(16, 16), (8, 8), (4, 4), (2, 2), (1, 1)];
+    let levels: Vec<_> = dimensions
+        .iter()
+        .enumerate()
+        .map(|(index, &(width, height))| {
+            (width, height, free_png(width as u32, height as u32, index as u8))
+        })
+        .collect();
+    for count in [1, levels.len()] {
+        let pixels = tex::take_pixels(&mut free_tex(&levels[..count])).unwrap();
+        assert_eq!(pixels.format, tex::PixelFormat::Rgba8);
+        assert_eq!(pixels.levels.len(), count);
+        for (index, level) in pixels.levels.iter().enumerate() {
+            assert_eq!(
+                (level.width, level.height),
+                (dimensions[index].0 as u32, dimensions[index].1 as u32)
+            );
+            assert_eq!(&level.data[..4], &[index as u8, 0, 0, 255]);
+        }
+    }
+}
+
+#[test]
+fn truncated_free_mips() {
+    let base = free_png(4, 4, 1);
+    let next = free_png(2, 2, 2);
+    let last = free_png(1, 1, 3);
+    let mut corrupt = next.clone();
+    corrupt.truncate(20);
+    let mut cases = [
+        vec![(4, 4, base.clone()), (2, 2, corrupt)],
+        vec![(4, 4, base.clone()), (3, 3, next.clone())],
+        vec![(4, 4, base.clone()), (2, 2, next), (1, 1, last)],
+    ];
+    assert_eq!(tex::take_pixels(&mut free_tex(&cases[0])).unwrap().levels.len(), 1);
+    assert_eq!(tex::take_pixels(&mut free_tex(&cases[1])).unwrap().levels.len(), 1);
+    cases[2][2].2.truncate(20);
+    assert_eq!(tex::take_pixels(&mut free_tex(&cases[2])).unwrap().levels.len(), 2);
+    assert!(tex::take_pixels(&mut free_tex(&[(4, 4, vec![0])])).is_none());
+}
+
+#[test]
+#[ignore = "requires the private C05 TEX fixture"]
+fn c05_authored_mips() {
+    use sha2::Digest;
+
+    let root = std::path::PathBuf::from(std::env::var("SKWD_C05_MIP_FIXTURE").unwrap());
+    let cases = &[
+        (
+            "Plana 01.tex",
+            "b11d03cbed7bcd8a5d069b8acc49679a50a3097ad659bee7d61ff7dda53dc610",
+            &[(728, 769, "68319a1fa96164f960e8fa8585fcaa64519ab5e0060aee61d5d56f2be8677a90")][..],
+        ),
+        (
+            "Chibi Enano.tex",
+            "0c35ddc586cb5d2a2ceead2e3bae0578cfb6980cf0687161efd3d209092a3fc9",
+            &[
+                (945, 1130, "33d0a81a7e7ffc4663cbcc1a42d08faad043f5cd6a92d7c91aa4c08249c61ed9"),
+                (472, 565, "73afc3a2facf73f3a03aeeeaa5f5da1b037a948c821474ee333be514c53c72c6"),
+                (236, 282, "729827d44703dc0a6a494096f8047a08928d45883df721610f2946c7f5f05c36"),
+                (118, 141, "71a4022cf8a178882ed7a3fe73fbdee37d03a3353bcd7e729a36471e2680310e"),
+                (59, 70, "207a51bfd5650431f6261b580957f2aa16dd914cf57e42c7d32d0b951a0d075e"),
+            ][..],
+        ),
+    ];
+    for &(name, expected_tex, levels) in cases {
+        let bytes = std::fs::read(root.join(name)).unwrap();
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(&bytes)), expected_tex);
+        let mut parsed = tex::parse(&bytes, None).unwrap();
+        assert_eq!(parsed.meta.mip_counts, vec![levels.len()]);
+        for (mip, &(_, _, expected_png)) in parsed.images[0].iter().zip(levels) {
+            assert_eq!(format!("{:x}", sha2::Sha256::digest(&mip.data)), expected_png);
+        }
+        let pixels = tex::take_pixels(&mut parsed).unwrap();
+        assert_eq!(pixels.format, tex::PixelFormat::Rgba8);
+        assert_eq!(pixels.levels.len(), levels.len());
+        for (mip, &(width, height, _)) in pixels.levels.iter().zip(levels) {
+            assert_eq!((mip.width, mip.height), (width, height));
+            assert_eq!(mip.data.len(), width as usize * height as usize * 4);
+        }
+    }
+}
+
+#[test]
+fn puppet_gap_sticks() {
+    let scene_json =
+        br#"{"objects": [{"image": "models/broken.json"}, {"image": "models/good.json"}]}"#;
+    let puppet = crate::puppet::tests::fixture();
+    let bytes = build_pkg(&[
+        ("scene.json", scene_json),
+        ("models/broken.json", br#"{"puppet": "models/broken.mdl"}"#),
+        ("models/good.json", br#"{"puppet": "models/good.mdl"}"#),
+        ("models/good.mdl", &puppet),
+    ]);
+    let package = pkg::Package::parse(bytes).unwrap();
+    assert!(scene::extract(&package).unwrap().puppet_unsupported);
 }
 
 #[test]
@@ -265,7 +428,10 @@ fn features_animated_textures() {
     let bytes = build_pkg(&[
         ("scene.json", br#"{"objects":[{"image":"models/bg.json"}]}"#),
         ("models/bg.json", br#"{"material":"materials/bg.json"}"#),
-        ("materials/bg.json", br#"{"passes":[{"textures":["animated"]}]}"#),
+        (
+            "materials/bg.json",
+            br#"{"passes":[{"textures":["animated"],"combos":{"SPRITESHEET":1}}]}"#,
+        ),
         ("materials/animated.tex", &texture),
     ]);
     let package = pkg::Package::parse(bytes).unwrap();
@@ -295,6 +461,21 @@ fn features_unknown_objects() {
 }
 
 #[test]
+fn quad_shape_classification() {
+    let bytes = build_pkg(&[(
+        "scene.json",
+        br#"{"objects":[{"id":1,"shape":"quad"},{"id":2,"shape":"sphere"}]}"#,
+    )]);
+    let package = pkg::Package::parse(bytes).unwrap();
+    let features = scene::extract(&package).unwrap();
+    assert_eq!(features.objects_other, 1);
+    assert_eq!(features.other_objects[0].kind, "shape:quad");
+    assert_eq!(features.other_objects[1].kind, "shape");
+    let compatibility = crate::capability::assess_native(&features);
+    assert!(!compatibility.has_no_known_gaps());
+}
+
+#[test]
 fn audit_json_shape() {
     let mut totals = audit::Totals { scenes: 1, parsed: 1, ..Default::default() };
     totals.object_gaps.insert(
@@ -315,6 +496,14 @@ fn audit_json_shape() {
 }
 
 #[test]
+fn audit_reports_scan_coverage() {
+    let totals =
+        audit::Totals { scenes: 3, parsed: 2, without_known_gaps: 1, ..Default::default() };
+    let report = audit::render_markdown(&totals);
+    assert!(report.contains("No statically detected native gaps: 1 of 2 parsed scenes (50%)"));
+}
+
+#[test]
 fn tier_ladder() {
     let plain = scene::SceneFeatures::default();
     assert_eq!(plain.tier(), 0);
@@ -331,7 +520,7 @@ fn tex_rejects_oversized_mip() {
     let marker = 16i32.to_le_bytes();
     let at = bytes.windows(4).position(|window| window == marker).unwrap();
     bytes[at..at + 4].copy_from_slice(&i32::MAX.to_le_bytes());
-    let err = tex::parse(&bytes).unwrap_err().to_string();
+    let err = tex::parse(&bytes, None).unwrap_err().to_string();
     assert!(err.contains("over cap"), "{err}");
     assert!(tex::parse_meta(&bytes).is_err());
 }
@@ -348,7 +537,7 @@ fn tex_rejects_oversized_dimensions() {
     let mip_width = positions[4];
     bytes[mip_width..mip_width + 4]
         .copy_from_slice(&(tex::MAX_TEXTURE_EDGE as i32 + 1).to_le_bytes());
-    assert!(tex::parse(&bytes).unwrap_err().to_string().contains("invalid mip dimensions"));
+    assert!(tex::parse(&bytes, None).unwrap_err().to_string().contains("invalid mip dimensions"));
 }
 
 #[test]
@@ -361,7 +550,7 @@ fn json_input_budget() {
 #[test]
 fn tex_gif_missing_frames() {
     let bytes = build_tex("TEXB0002", 0, tex::FLAG_IS_GIF as i32, &[1u8; 16], true, None);
-    assert!(tex::parse(&bytes).is_err());
+    assert!(tex::parse(&bytes, None).is_err());
 }
 
 #[test]
@@ -407,6 +596,34 @@ fn malformed_tex_counted() {
     let features = scene::extract(&package).unwrap();
     assert_eq!(features.tex_failures, 1);
     assert!(features.sample_error.is_some());
+    assert_eq!(features.texture_gaps[0].path, "bad.tex");
+    assert!(features.texture_gaps[0].reason.contains("bad tex magic"));
+}
+
+#[test]
+fn texture_gap_limit() {
+    let unknown = build_tex("TEXB0001", 99, 0, &[0; 64], false, None);
+    let mut files = vec![
+        ("scene.json".to_owned(), br#"{"objects":[]}"#.to_vec()),
+        ("unknown.tex".to_owned(), unknown),
+    ];
+    files.extend((0..66).map(|index| (format!("bad{index}.tex"), b"XXXX\0nope".to_vec())));
+    let entries: Vec<_> =
+        files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
+    let package = pkg::Package::parse(build_pkg(&entries)).unwrap();
+    let features = scene::extract(&package).unwrap();
+    assert_eq!(features.tex_failures, 66);
+    assert_eq!(features.texture_gaps.len(), 64);
+    assert_eq!(features.texture_gaps_omitted, 3);
+    assert_eq!(features.texture_gaps[0].reason, "unmapped texture format format99");
+    let totals = audit::Totals {
+        texture_gaps: [("431960".to_owned(), features.texture_gaps)].into(),
+        texture_gaps_omitted: features.texture_gaps_omitted,
+        ..Default::default()
+    };
+    let report = audit::render_json(&totals);
+    assert_eq!(report["texture_gaps"]["431960"][0]["path"], "unknown.tex");
+    assert_eq!(report["texture_gaps_omitted"], 3);
 }
 
 #[test]
@@ -659,7 +876,7 @@ fn sprite_scripts_keep_original_object_indices_after_render_order_is_compacted()
     let package = pkg::Package::parse(build_pkg(&[
         ("scene.json", scene),
         ("models/sprite.json", br#"{"material":"materials/sprite.json"}"#),
-        ("materials/sprite.json", br#"{"passes":[{"textures":["sprite"]}]}"#),
+        ("materials/sprite.json", br#"{"passes":[{"shader":"genericimage2","textures":["sprite"],"combos":{"SPRITESHEET":1,"VERSION":2}}]}"#),
         ("materials/sprite.tex", &texture),
     ]))
     .unwrap();
@@ -803,6 +1020,7 @@ fn copy_command_passes_become_named_target_copies() {
     assert_eq!(passes[1].target.as_deref(), Some("_rt_A"));
     assert_eq!(passes[1].binds, [(0, effects::EffectBind::Named("_rt_B".into()))]);
     assert_eq!(passes[0].target.as_deref(), Some("_rt_B"));
+    assert!(!passes[1].vertex.source.contains("TRANSFORM"));
 }
 
 #[test]
@@ -810,7 +1028,7 @@ fn color_blend_modes_append_a_scene_blend_pass() {
     let scene = br#"{"objects":[
         {"id":1,"name":"overlay","image":"models/bg.json","colorBlendMode":9,
          "color":"1 0.5 0.25","alpha":0.5},
-        {"id":2,"name":"screen","image":"models/bg.json","colorBlendMode":6},
+        {"id":2,"name":"lighten","image":"models/bg.json","colorBlendMode":6},
         {"id":3,"name":"plain","image":"models/bg.json"}]}"#;
     let bytes = build_pkg(&[
         ("scene.json", scene),
@@ -838,9 +1056,28 @@ fn color_blend_modes_append_a_scene_blend_pass() {
     assert!((overlay.alpha - 0.5).abs() < 1e-6);
     assert!(pass.fragment.source.contains("#define BLENDMODE 9"));
     assert!(pass.fragment.samplers.iter().any(|sampler| sampler.index == 4));
-    assert!(scene.layers[1].effects.is_empty());
+    assert!(scene.layers[1].effects[0].passes[0].fragment.source.contains("#define BLENDMODE 6"));
     assert!(scene.layers[2].effects.is_empty());
-    assert!(!effects::shader_blend(0) && !effects::shader_blend(6) && !effects::shader_blend(8));
+    assert!(!effects::shader_blend(0) && !effects::shader_blend(effects::ADDITIVE_COLOR_BLEND));
+    assert!(effects::shader_blend(6) && effects::shader_blend(8));
+}
+
+#[test]
+fn puppet_blend_pass() {
+    let bytes = build_pkg(&[(
+        "shaders/common_blending.h",
+        b"vec3 ApplyBlending(const int mode, in vec3 A, in vec3 B, in float opacity) { return mix(A, B, opacity); }\n",
+    )]);
+    let package = pkg::Package::parse(bytes).unwrap();
+    let assets = effects::Assets::discover(Some("/nonexistent"));
+    let blend = effects::color_blend_effect(&package, &assets, 9, None, true).unwrap();
+    assert_eq!(blend.name, effects::COLOR_BLEND_MESH_EFFECT);
+    let pass = &blend.passes[0];
+    assert_eq!(pass.name, effects::COLOR_BLEND_MESH_SHADER);
+    assert!(pass.binds.is_empty());
+    assert!(pass.hlsl.is_none());
+    assert!(pass.fragment.source.contains("#define BLENDMODE 9"));
+    assert!(pass.fragment.source.contains("gl_FragCoord"));
 }
 
 #[test]
@@ -897,10 +1134,16 @@ fn vec2_and_float_varying_arrays_pack_into_vec4_locations_behind_a_local_array()
     assert!(compile(&vertex, Stage::Vertex, "pack.vert").is_ok(), "{vertex}");
     assert!(compile(&fragment, Stage::Fragment, "pack.frag").is_ok(), "{fragment}");
     let hlsl = "varying vec2 v_Kernel[49];\nvarying vec2 v_TexCoord;\nvoid main() {}\n";
-    assert_eq!(crate::hlsl::varying_slots(hlsl), 50);
-    assert!(crate::hlsl::varying_slots(hlsl) > crate::hlsl::MAX_VARYING_SLOTS);
+    assert_eq!(crate::hlsl::varying_slots(hlsl, hlsl, &BTreeMap::new()), 26);
+    assert!(
+        crate::hlsl::varying_slots(hlsl, hlsl, &BTreeMap::new()) <= crate::hlsl::MAX_VARYING_SLOTS
+    );
     assert_eq!(
-        crate::hlsl::varying_slots("varying float v_W[8];\nvarying vec4 v_T;\nvoid main() {}\n"),
+        crate::hlsl::varying_slots(
+            "varying float v_W[8];\nvarying vec4 v_T;\nvoid main() {}\n",
+            "",
+            &BTreeMap::new()
+        ),
         3
     );
 
@@ -967,17 +1210,20 @@ fn conditional_symbol_defaults_ignore_trailing_comments() {
 }
 
 #[test]
-fn atlas_frames_require_valid_images_and_unrotated_frames() {
+fn atlas_frames_validate_pages() {
     use crate::model::{SpriteFrame, Texture};
-    let frame = |image, rotated, time| SpriteFrame { uv: [0.0; 4], rotated, time, image };
+    let frame =
+        |image, rotated, time| SpriteFrame { axes: [0.0; 4], uv: [0.0; 4], rotated, time, image };
     let mut texture = model::solid_texture();
     assert!(texture.atlas_frames().is_none());
+    texture.frames = vec![frame(0, true, 0.1)];
+    assert_eq!(texture.atlas_frames().map(<[SpriteFrame]>::len), Some(1));
     texture.frames = vec![frame(0, false, 0.1), frame(0, false, 0.1)];
     assert_eq!(texture.atlas_frames().map(<[SpriteFrame]>::len), Some(2));
     texture.frames = vec![frame(0, false, 0.1), frame(1, false, 0.1)];
     assert!(texture.atlas_frames().is_none());
     texture.frames = vec![frame(0, true, 0.1), frame(0, false, 0.1)];
-    assert!(texture.atlas_frames().is_none());
+    assert_eq!(texture.atlas_frames().map(<[SpriteFrame]>::len), Some(2));
     texture.frames = vec![frame(0, false, 0.0), frame(0, false, 0.0)];
     assert_eq!(texture.atlas_frames().map(<[SpriteFrame]>::len), Some(2));
     let _: &Texture = &texture;
@@ -1115,7 +1361,15 @@ fn particle_sprite_texture_defines_tex0format_instead_of_remapping_channels() {
     ]);
     let package = pkg::Package::parse(bytes).unwrap();
     let assets = effects::Assets::discover(Some("/nonexistent"));
-    let system = crate::particles::load(&package, &assets, &object, "particles/p.json").unwrap();
+    let context = crate::particles::LoadContext {
+        pkg: &package,
+        assets: &assets,
+        defaults: crate::particles::ParticleDefaults::ORTHOGRAPHIC,
+        viewport: None,
+        bounds_static: false,
+        version: 0,
+    };
+    let system = crate::particles::load(&context, &object, "particles/p.json").0.unwrap();
     let texture = system.texture.as_ref().expect("sprite texture");
     assert_eq!(texture.pixels.format, tex::PixelFormat::R8);
     assert_eq!(texture.pixels.levels[0].data, vec![9u8; 16]);
@@ -1165,7 +1419,15 @@ void main() { gl_Position = vec4(a_Position, 1.0); }
     ]);
     let package = pkg::Package::parse(bytes).unwrap();
     let assets = effects::Assets::discover(Some("/nonexistent"));
-    let system = crate::particles::load(&package, &assets, &object, "particles/p.json").unwrap();
+    let context = crate::particles::LoadContext {
+        pkg: &package,
+        assets: &assets,
+        defaults: crate::particles::ParticleDefaults::ORTHOGRAPHIC,
+        viewport: None,
+        bounds_static: false,
+        version: 0,
+    };
+    let system = crate::particles::load(&context, &object, "particles/p.json").0.unwrap();
     let pass = system.pass.as_ref().expect("engine pass");
     assert_eq!(system.grab_slot, Some(3));
     assert_eq!(pass.binds, vec![(3, effects::EffectBind::SceneSoFar)]);
@@ -1182,6 +1444,32 @@ fn lighting_module_stub_is_valid_in_both_dialects() {
     let resolved = crate::shader::resolve_includes(source, &|_| None, 0).unwrap();
     assert!(resolved.contains("return CAST3(0.0); }"), "{resolved}");
     assert!(!resolved.contains("vec3(0.0)"), "{resolved}");
+}
+
+#[test]
+fn shader_version_matches_engine() {
+    let scene = br#"{"objects":[{"id":1,"name":"L","image":"models/bg.json",
+        "effects":[{"file":"effects/d.json"}]}]}"#;
+    let frag = b"void main() {\n#if SHADERVERSION < 62\n\tfloat k = 1.0;\n#else\n\tfloat k = 2.0;\n#endif\n\tgl_FragColor = CAST4(k);\n}\n";
+    let bytes = build_pkg(&[
+        ("scene.json", scene),
+        ("models/bg.json", br#"{"material":"materials/bg.json"}"#),
+        ("materials/bg.json", br#"{"passes":[{"shader":"flat"}]}"#),
+        ("effects/d.json", br#"{"passes":[{"material":"materials/d.json"}]}"#),
+        ("materials/d.json", br#"{"passes":[{"shader":"d"}]}"#),
+        (
+            "shaders/d.vert",
+            b"attribute vec3 a_Position;\nvoid main() { gl_Position = vec4(a_Position, 1.0); }\n",
+        ),
+        ("shaders/d.frag", frag),
+    ]);
+    let package = pkg::Package::parse(bytes).unwrap();
+    let scene =
+        model::load_with(&package, &effects::Assets::discover(Some("/nonexistent"))).unwrap();
+    let pass = &scene.layers[0].effects[0].passes[0];
+    let hlsl = &pass.hlsl.as_ref().expect("hlsl pair").fragment;
+    assert!(pass.fragment.source.contains("float k = 2.0;"), "{}", pass.fragment.source);
+    assert!(hlsl.contains("float k = 2.0;"), "{hlsl}");
 }
 
 #[test]
@@ -1261,7 +1549,7 @@ fn fbo_declarations_keep_size_format_wrap_clear_unique_and_conditions() {
     assert_eq!(tiles.size, FboSize::Fixed { width: 256, height: 256 });
     assert_eq!(tiles.format, FboFormat::R8);
     assert_eq!(tiles.repeat, Some(true));
-    assert_eq!(effect.fbos[4].size, FboSize::Scale(1.5));
+    assert_eq!(effect.fbos[4].size, FboSize::ScaleFloor(1.5));
     assert_eq!(effect.fbos[4].format, FboFormat::Rgba8);
     assert!(scene.skipped.iter().any(|skip| skip.contains("_rt_Odd")), "{:?}", scene.skipped);
     assert_eq!(v1.extent((1749, 984)), (256, 144));
@@ -1395,7 +1683,7 @@ fn media_thumbnail_layers_keep_transparent_slots_for_playback() {
         {"id":2,"name":"cover","image":"models/bg.json","origin":"100 100 0","size":"10 10","instance":{"textures":["util/white"],"usertextures":[{"name":"$mediaThumbnail","type":"system"}]}}]}"#;
     let bytes = build_pkg(&[
         ("scene.json", scene),
-        ("models/bg.json", br#"{"material":"materials/bg.json"}"#),
+        ("models/bg.json", br#"{"material":"materials/bg.json","instanced":true}"#),
         ("materials/bg.json", br#"{"passes":[{"shader":"genericimage4","textures":["mask"]}]}"#),
         ("materials/mask.tex", &mask),
     ]);
@@ -1427,8 +1715,12 @@ fn passes_whose_vertex_shader_ignores_the_projection_draw_an_ndc_quad() {
     ]);
     let package = pkg::Package::parse(bytes).unwrap();
     let object = package.find_json("scene.json").unwrap().unwrap()["objects"][0].clone();
-    let (effects, skipped) =
-        effects::load_effects(&package, &effects::Assets::discover(Some("/nonexistent")), &object);
+    let (effects, skipped) = effects::load_effects(
+        &package,
+        &effects::Assets::discover(Some("/nonexistent")),
+        &object,
+        false,
+    );
     assert_eq!(effects.len(), 2, "{skipped:?}");
     assert!(!effects::PassMeta::of(&effects[0].passes[0]).ndc());
     assert!(effects::PassMeta::of(&effects[1].passes[0]).ndc());
@@ -1439,11 +1731,12 @@ fn video_texture_payload_is_never_accepted_as_rgba() {
     let mut payload = vec![93_u8; 256];
     payload[..12].copy_from_slice(b"\x00\x00\x00\x20ftypisom");
     let bytes = build_tex("TEXB0003", 0, tex::FLAG_IS_VIDEO as i32, &payload, false, None);
-    let mut parsed = tex::parse(&bytes).unwrap();
+    let mut parsed = tex::parse(&bytes, None).unwrap();
     assert!(tex::take_pixels(&mut parsed).is_none());
     assert!(tex::decode_rgba(&mut parsed).is_none());
     let texture = model::load_texture_bytes(&bytes).unwrap();
-    assert_eq!(texture.video.as_deref(), Some(payload.as_slice()));
+    let Some(model::Video::Bytes(video)) = texture.video else { panic!("video bytes") };
+    assert_eq!(*video, payload[..]);
     assert_eq!((texture.width, texture.height), (4, 4));
     assert_eq!(texture.pixels.bytes(), 0);
     assert!(texture.frames.is_empty());
@@ -1531,7 +1824,7 @@ fn scene_entry_consumers_agree_on_declared_and_fallback_scenes() {
 }
 
 #[test]
-fn zero_duration_atlas_frames_remain_playable() {
+fn atlas_material_flags() {
     for version in ["TEXS0001", "TEXS0002", "TEXS0003"] {
         let mut texture =
             build_tex("TEXB0003", 0, tex::FLAG_IS_GIF as i32, &[255; 64], false, None);
@@ -1552,17 +1845,66 @@ fn zero_duration_atlas_frames_remain_playable() {
                 }
             }
         }
-        let package = pkg::Package::parse(build_pkg(&[
-            ("gifscene.json", br#"{"objects":[{"image":"models/bg.json"}]}"#),
-            ("models/bg.json", br#"{"material":"materials/bg.json"}"#),
-            ("materials/bg.json", br#"{"passes":[{"textures":["animated"]}]}"#),
-            ("materials/animated.tex", &texture),
+        for (combos, playable) in [
+            (serde_json::json!({"SPRITESHEET":1}), true),
+            (serde_json::json!({"spritesheet":1}), true),
+            (serde_json::json!({"SPRITESHEET":0}), false),
+            (serde_json::json!({}), false),
+        ] {
+            let material =
+                serde_json::json!({"passes":[{"textures":["animated"],"combos":combos}]})
+                    .to_string();
+            let package = pkg::Package::parse(build_pkg(&[
+                ("gifscene.json", br#"{"objects":[{"image":"models/bg.json"}]}"#),
+                ("models/bg.json", br#"{"material":"materials/bg.json"}"#),
+                ("materials/bg.json", material.as_bytes()),
+                ("materials/animated.tex", &texture),
+            ]))
+            .unwrap();
+            let scene = model::load(&package).unwrap();
+            let frames = scene.layers[0].atlas_frames();
+            assert_eq!(frames.is_some(), playable, "{version}");
+            if let Some(frames) = frames {
+                assert_eq!(frames.len(), 2);
+                assert_eq!(frames[0].time, 0.0);
+                assert_eq!(frames[1].uv, [0.0, 0.5, 1.0, 0.5]);
+            }
+        }
+    }
+}
+
+#[test]
+fn scene_bounds_admission() {
+    let particle = br#"{"renderer":[{"name":"sprite"}],"emitter":[{"name":"sphererandom"}],"operator":[{"name":"collisionbounds","collisionbehavior":"stop"}]}"#;
+    let assets = effects::Assets::discover(Some("/nonexistent"));
+    let cases = [
+        (serde_json::json!({"id":2,"particle":"particles/bounds.json","origin":"5 0 0"}), true),
+        (serde_json::json!({"id":2,"parent":1,"particle":"particles/bounds.json"}), false),
+        (
+            serde_json::json!({"id":2,"particle":"particles/bounds.json","visible":{"value":true,"script":"export function update(value) { return value; }"}}),
+            false,
+        ),
+    ];
+    for (object, supported) in cases {
+        let scene = serde_json::json!({
+            "general":{"orthogonalprojection":{"width":640,"height":360}},
+            "objects":[{"id":1,"name":"group"},object]
+        });
+        let scene_bytes = serde_json::to_vec(&scene).unwrap();
+        let pkg = pkg::Package::parse(build_pkg(&[
+            ("scene.json", &scene_bytes),
+            ("particles/bounds.json", particle),
         ]))
         .unwrap();
-        let scene = model::load(&package).unwrap();
-        let frames = scene.layers[0].texture.atlas_frames().expect(version);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].time, 0.0);
-        assert_eq!(frames[1].uv, [0.0, 0.5, 1.0, 0.5]);
+        let model = model::load_with(&pkg, &assets).unwrap();
+        let has_bounds =
+            model.particles[0].system.operators.iter().any(|operator| {
+                matches!(operator, crate::particles::Operator::CollisionBounds { .. })
+            });
+        assert_eq!(has_bounds, supported, "{:?}", model.skipped);
+        assert_eq!(
+            model.skipped.iter().any(|reason| reason.contains("collisionbounds")),
+            !supported
+        );
     }
 }

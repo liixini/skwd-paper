@@ -47,6 +47,30 @@ struct DeviceSelection {
     explicit: bool,
 }
 
+const PROBE_SELECTION_REASON: &str = "probe device identity";
+
+fn probe_selection(
+    candidates: &[DeviceCandidate],
+    expected: Option<&DecodeDevice>,
+    inherited: impl FnOnce() -> Result<DeviceSelection>,
+) -> Result<DeviceSelection> {
+    let Some(expected) = expected else { return inherited() };
+    let index = candidates
+        .iter()
+        .position(|candidate| {
+            candidate.uuid == expected.uuid
+                && candidate.driver_uuid == expected.driver_uuid
+                && candidate.drm_nodes.and_then(|nodes| nodes.render) == expected.render_node
+                && candidate.drm_nodes.and_then(|nodes| nodes.primary) == expected.primary_node
+        })
+        .context("probe adapter unavailable")?;
+    Ok(DeviceSelection {
+        candidate_index: index,
+        reason: PROBE_SELECTION_REASON.into(),
+        explicit: true,
+    })
+}
+
 fn shared_image_device(
     candidates: &[DeviceCandidate],
     uuid: [u8; 16],
@@ -57,29 +81,49 @@ fn shared_image_device(
     })
 }
 
+const DEVICE_EXTENSION_FAMILIES: &[&str] = &[
+    "video",
+    "external_memory",
+    "external_semaphore",
+    "external_fence",
+    "drm",
+    "push_descriptor",
+    "atomic_float",
+    "timeline_semaphore",
+    "synchronization2",
+    "sampler_ycbcr",
+    "descriptor_buffer",
+    "shader_object",
+    "expect_assume",
+    "subgroup_rotate",
+    "cooperative_matrix",
+    "queue_family_foreign",
+];
+const VIDEO_FEATURE_EXTENSIONS: &[&str] = &[
+    "VK_KHR_video_maintenance1",
+    "VK_KHR_video_maintenance2",
+    "VK_KHR_video_decode_vp9",
+    "VK_KHR_video_encode_av1",
+];
+const KHR_MAINTENANCE_PREFIX: &str = "VK_KHR_maintenance";
+
 fn wanted_device_extension(name: &str) -> bool {
-    [
-        "video",
-        "external_memory",
-        "external_semaphore",
-        "external_fence",
-        "drm",
-        "swapchain",
-        "push_descriptor",
-        "atomic_float",
-        "timeline_semaphore",
-        "synchronization2",
-        "maintenance",
-        "sampler_ycbcr",
-        "descriptor_buffer",
-        "shader_object",
-        "expect_assume",
-        "subgroup_rotate",
-        "cooperative_matrix",
-        "queue_family_foreign",
-    ]
-    .iter()
-    .any(|wanted| name.contains(wanted))
+    if VIDEO_FEATURE_EXTENSIONS.contains(&name) {
+        return false;
+    }
+    name.as_bytes() == ash::khr::swapchain::NAME.to_bytes()
+        || name.starts_with(KHR_MAINTENANCE_PREFIX)
+        || DEVICE_EXTENSION_FAMILIES.iter().any(|family| name.contains(family))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodeDevice {
+    pub uuid: [u8; 16],
+    pub driver_uuid: [u8; 16],
+    pub render_node: Option<(u32, u32)>,
+    pub primary_node: Option<(u32, u32)>,
+    pub fingerprint: String,
 }
 
 pub struct SharedDevice {
@@ -96,43 +140,139 @@ pub struct SharedDevice {
     pub video_decode: bool,
     pub render_node: Option<PathBuf>,
     pub decode_fingerprint: String,
+    pub decode_device: DecodeDevice,
 }
 
 unsafe impl Send for SharedDevice {}
 unsafe impl Sync for SharedDevice {}
 
-static mut QUEUE_MUTEXES: [libc::pthread_mutex_t; 64] = [libc::PTHREAD_MUTEX_INITIALIZER; 64];
+const QUEUE_LOCKS: u32 = 64;
+
+static mut QUEUE_MUTEXES: [libc::pthread_mutex_t; QUEUE_LOCKS as usize] =
+    [libc::PTHREAD_MUTEX_INITIALIZER; QUEUE_LOCKS as usize];
+
+static SUBMIT_LOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDLE_LEDGER: std::sync::Mutex<IdleLedger> = std::sync::Mutex::new(IdleLedger(Vec::new()));
 
 unsafe extern "C" fn lock_queue(_: *mut ff::ffi::AVHWDeviceContext, family: u32, _: u32) {
-    unsafe {
-        libc::pthread_mutex_lock(std::ptr::addr_of_mut!(QUEUE_MUTEXES[family as usize % 64]));
-    }
+    lock_for_submit(family);
+}
+
+fn lock_for_submit(family: u32) {
+    lock_queue_family(family);
+    SUBMIT_LOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 unsafe extern "C" fn unlock_queue(_: *mut ff::ffi::AVHWDeviceContext, family: u32, _: u32) {
+    unlock_queue_family(family);
+}
+
+fn lock_queue_family(family: u32) {
     unsafe {
-        libc::pthread_mutex_unlock(std::ptr::addr_of_mut!(QUEUE_MUTEXES[family as usize % 64]));
+        libc::pthread_mutex_lock(std::ptr::addr_of_mut!(
+            QUEUE_MUTEXES[(family % QUEUE_LOCKS) as usize]
+        ));
     }
 }
 
-pub fn lock_queue_family(family: u32) {
+fn unlock_queue_family(family: u32) {
     unsafe {
-        libc::pthread_mutex_lock(std::ptr::addr_of_mut!(QUEUE_MUTEXES[family as usize % 64]));
+        libc::pthread_mutex_unlock(std::ptr::addr_of_mut!(
+            QUEUE_MUTEXES[(family % QUEUE_LOCKS) as usize]
+        ));
     }
 }
 
-pub fn unlock_queue_family(family: u32) {
-    unsafe {
-        libc::pthread_mutex_unlock(std::ptr::addr_of_mut!(QUEUE_MUTEXES[family as usize % 64]));
+struct QueueGuard(u32);
+
+impl QueueGuard {
+    fn acquire(family: u32) -> Self {
+        lock_for_submit(family);
+        Self(family)
     }
+}
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        unlock_queue_family(self.0);
+    }
+}
+
+#[expect(clippy::disallowed_methods, reason = "the queue is locked here")]
+pub(crate) fn submit(
+    device: &ash::Device,
+    queue: vk::Queue,
+    family: u32,
+    submits: &[vk::SubmitInfo],
+    fence: vk::Fence,
+) -> ash::prelude::VkResult<()> {
+    let _guard = QueueGuard::acquire(family);
+    unsafe { device.queue_submit(queue, submits, fence) }
+}
+
+#[expect(clippy::disallowed_methods, reason = "the queue is locked here")]
+pub(crate) fn present(
+    swapchain: &ash::khr::swapchain::Device,
+    queue: vk::Queue,
+    family: u32,
+    info: &vk::PresentInfoKHR,
+) -> ash::prelude::VkResult<bool> {
+    let _guard = QueueGuard::acquire(family);
+    unsafe { swapchain.queue_present(queue, info) }
+}
+
+struct IdleLedger(Vec<(vk::Device, u64)>);
+
+impl IdleLedger {
+    fn quiet(&self, device: vk::Device, submits: u64) -> bool {
+        self.0.contains(&(device, submits))
+    }
+
+    fn record(&mut self, device: vk::Device, submits: u64) {
+        match self.0.iter_mut().find(|(known, _)| *known == device) {
+            Some(entry) => entry.1 = submits,
+            None => self.0.push((device, submits)),
+        }
+    }
+}
+
+pub(crate) fn wait_idle(device: &ash::Device) -> ash::prelude::VkResult<()> {
+    for family in 0..QUEUE_LOCKS {
+        lock_queue_family(family);
+    }
+    let submits = SUBMIT_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut ledger = IDLE_LEDGER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[expect(clippy::disallowed_methods, reason = "every queue is locked here")]
+    let idle = if ledger.quiet(device.handle(), submits) {
+        Ok(())
+    } else {
+        unsafe { device.device_wait_idle() }
+    };
+    if idle.is_ok() {
+        ledger.record(device.handle(), submits);
+    }
+    drop(ledger);
+    for family in (0..QUEUE_LOCKS).rev() {
+        unlock_queue_family(family);
+    }
+    idle
 }
 
 pub(crate) fn software_decode_required(software: bool, queue_sync: bool) -> bool {
     software || !queue_sync
 }
 
+impl SharedDevice {
+    pub(crate) fn open_decoder(&self, path: &str) -> Result<crate::decode::AnyDecoder> {
+        crate::decode::open_decoder(
+            &crate::decode::HardwareDecode::shared(self, path),
+            software_decode_required(self.software, self.queue_sync),
+        )
+    }
+}
+
 pub fn create(display: *mut std::ffi::c_void) -> Result<SharedDevice> {
-    create_with_policy(display, true)
+    create_with_policy(display, true, None)
 }
 
 pub(crate) fn unreliable_virtual_driver_name(name: &str) -> bool {
@@ -332,9 +472,10 @@ fn drm_nodes_for_device(
     Ok(Some(DrmNodes { primary, render }))
 }
 
-fn create_with_policy(
+pub(crate) fn create_with_policy(
     display: *mut std::ffi::c_void,
     avoid_unreliable_virtual_driver: bool,
+    expected: Option<&DecodeDevice>,
 ) -> Result<SharedDevice> {
     unsafe {
         let entry = ash::Entry::load().context("load libvulkan")?;
@@ -414,31 +555,34 @@ fn create_with_policy(
             );
         }
 
-        let selector_value = std::env::var("SKWD_VK_DEVICE").ok();
-        let selector = parse_device_selector(selector_value.as_deref());
         let choices: Vec<DeviceChoice> =
             candidates.iter().map(|candidate| candidate.choice.clone()).collect();
-        let mut selection = select_device(&choices, &selector);
-        if selector != DeviceSelector::Auto && !selection.explicit {
-            tracing::warn!(
-                value = selector_value.unwrap_or_default(),
-                "skwd-wall-vk: Vulkan device override did not match; using automatic selection"
-            );
-        }
-        if let Ok(value) = std::env::var("SKWD_PAPER_PLASMA_DEVICE_UUID") {
-            let uuid = parse_device_uuid(&value)?;
-            let driver = std::env::var("SKWD_PAPER_PLASMA_DRIVER_UUID")
-                .ok()
-                .map(|value| parse_device_uuid(&value))
-                .transpose()?;
-            let index = shared_image_device(&candidates, uuid, driver)
-                .context("no Vulkan device matches the Plasma OpenGL device and driver")?;
-            selection = DeviceSelection {
-                candidate_index: index,
-                reason: "Plasma shared-image device UUID".into(),
-                explicit: true,
-            };
-        }
+        let mut selection = probe_selection(&candidates, expected, || {
+            let selector_value = std::env::var("SKWD_VK_DEVICE").ok();
+            let selector = parse_device_selector(selector_value.as_deref());
+            let mut selection = select_device(&choices, &selector);
+            if selector != DeviceSelector::Auto && !selection.explicit {
+                tracing::warn!(
+                    value = selector_value.unwrap_or_default(),
+                    "skwd-wall-vk: Vulkan device override did not match; using automatic selection"
+                );
+            }
+            if let Ok(value) = std::env::var("SKWD_PAPER_PLASMA_DEVICE_UUID") {
+                let uuid = parse_device_uuid(&value)?;
+                let driver = std::env::var("SKWD_PAPER_PLASMA_DRIVER_UUID")
+                    .ok()
+                    .map(|value| parse_device_uuid(&value))
+                    .transpose()?;
+                let index = shared_image_device(&candidates, uuid, driver)
+                    .context("no Vulkan device matches the Plasma OpenGL device and driver")?;
+                selection = DeviceSelection {
+                    candidate_index: index,
+                    reason: "Plasma shared-image device UUID".into(),
+                    explicit: true,
+                };
+            }
+            Ok(selection)
+        })?;
         if avoid_unreliable_virtual_driver
             && !selection.explicit
             && unreliable_virtual_driver_name(&choices[selection.candidate_index].name)
@@ -619,6 +763,13 @@ fn create_with_policy(
             ffmpeg,
             env!("CARGO_PKG_VERSION")
         );
+        let decode_device = DecodeDevice {
+            uuid: selected.uuid,
+            driver_uuid: selected.driver_uuid,
+            render_node: selected.drm_nodes.and_then(|nodes| nodes.render),
+            primary_node: selected.drm_nodes.and_then(|nodes| nodes.primary),
+            fingerprint: decode_fingerprint.clone(),
+        };
         Ok(SharedDevice {
             entry,
             instance,
@@ -633,9 +784,34 @@ fn create_with_policy(
             video_decode,
             render_node,
             decode_fingerprint,
+            decode_device,
         })
     }
 }
 
 #[cfg(test)]
+pub(crate) fn test_device() -> std::sync::MutexGuard<'static, SharedDevice> {
+    static DEVICE: std::sync::OnceLock<std::sync::Mutex<SharedDevice>> = std::sync::OnceLock::new();
+    DEVICE
+        .get_or_init(|| std::sync::Mutex::new(create(std::ptr::null_mut()).expect("Vulkan device")))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
 mod tests;
+
+pub(crate) fn renderer(sd: &SharedDevice, width: u32, height: u32) -> Result<crate::vk::Renderer> {
+    crate::vk::Renderer::new_shared_headless(
+        (
+            sd.entry.clone(),
+            sd.instance.clone(),
+            sd.phys,
+            sd.device.clone(),
+            sd.gfx_family,
+            sd.queue,
+        ),
+        width,
+        height,
+    )
+}

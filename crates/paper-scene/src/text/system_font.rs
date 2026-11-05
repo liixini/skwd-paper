@@ -2,12 +2,14 @@ use crate::effects::Assets;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use swash::{FontRef, StringId};
 
 #[derive(Default)]
 pub(crate) struct Cache {
     prefix: Option<Vec<Entry>>,
     resolved: BTreeMap<String, Option<Vec<u8>>>,
+    fallbacks: Option<Vec<Arc<[u8]>>>,
 }
 
 struct Entry {
@@ -17,6 +19,27 @@ struct Entry {
 }
 
 impl Cache {
+    pub fn fallbacks(&mut self, assets: &Assets) -> Vec<Arc<[u8]>> {
+        const FAMILIES: [&str; 2] = ["arial", "malgungothic"];
+        const EMOJI_FONT: &str = "fonts/TwemojiMozilla.ttf";
+        self.fallbacks
+            .get_or_insert_with(|| {
+                let prefix = self.prefix.get_or_insert_with(|| prefix_fonts(assets.root()));
+                FAMILIES
+                    .iter()
+                    .filter_map(|family| {
+                        prefix
+                            .iter()
+                            .find(|entry| entry.regular && entry.names.contains(*family))
+                            .and_then(|entry| read(&entry.path))
+                            .map(Arc::from)
+                    })
+                    .chain(assets.read_bytes(EMOJI_FONT).map(Arc::from))
+                    .collect()
+            })
+            .clone()
+    }
+
     pub fn resolve(&mut self, assets: &Assets, family: &str) -> Option<Vec<u8>> {
         let key = normalized(family);
         if let Some(bytes) = self.resolved.get(&key) {
@@ -50,6 +73,7 @@ fn read(path: &Path) -> Option<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     file.take(LIMIT + 1).read_to_end(&mut bytes).ok()?;
+    crate::source::file(path, &bytes);
     (bytes.len() <= LIMIT as usize).then_some(bytes)
 }
 

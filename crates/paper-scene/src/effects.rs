@@ -1,7 +1,10 @@
+pub mod customshader;
+pub mod material;
+
 use crate::pkg::Package;
 use crate::shader::{self, Stage, Translated};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +14,35 @@ const SCENE_TEXTURE_TYPE_FIELD: &str = "type";
 const SCENE_TEXTURE_VALUE_FIELD: &str = "value";
 const GENERAL_FIELD: &str = "general";
 const PROPERTIES_FIELD: &str = "properties";
+pub(crate) const USER_SHADER_VALUES: &str = "usershadervalues";
+pub(crate) const CONSTANT_SHADER_VALUES: &str = "constantshadervalues";
+pub(crate) const EFFECTS_FIELD: &str = "effects";
+const VISIBLE_FIELD: &str = "visible";
+const FUNCTIONS_FIELD: &str = "functions";
+const FUNCTION_ACTION_FIELD: &str = "action";
+const FUNCTION_TARGETS_FIELD: &str = "fbos";
+const FUNCTION_CLEAR_ACTION: &str = "clear";
+const FBO_NAME_FIELD: &str = "name";
+const MAX_EFFECT_FUNCTIONS: usize = 64;
+const MAX_FUNCTION_TARGETS: usize = 32;
+pub(crate) const MAX_EFFECT_FUNCTION_NAME_BYTES: usize = 128;
+pub(crate) const SPRITESHEET_COMBO: &str = "SPRITESHEET";
+pub(crate) const COMBOS_FIELD: &str = "combos";
+const GEOMETRY_COMBO: &str = "GS_ENABLED";
+pub const MAX_TEXTURE_SLOTS: u32 = 16;
+const TEXTURE_UNIFORM_PREFIX: &str = "g_Texture";
+const TEXTURE_RESOLUTION: &str = "Resolution";
+const TEXTURE_ROTATION: &str = "Rotation";
+const TEXTURE_TRANSLATION: &str = "Translation";
+const IDENTITY_ROTATION: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+const ZERO_TRANSLATION: [f32; 2] = [0.0; 2];
+
+fn texture_uniform(name: &str) -> Option<(usize, &str)> {
+    let text = name.strip_prefix(TEXTURE_UNIFORM_PREFIX)?;
+    let split = text.find(|character: char| !character.is_ascii_digit())?;
+    let slot = text[..split].parse::<usize>().ok()?;
+    (slot < MAX_TEXTURE_SLOTS as usize).then_some((slot, &text[split..]))
+}
 
 fn confined_path(root: &Path, relative: &str) -> Option<PathBuf> {
     let relative = Path::new(relative);
@@ -30,22 +62,39 @@ fn confined_path(root: &Path, relative: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn read_confined_bytes(root: &Path, relative: &str, max: usize) -> Option<Vec<u8>> {
-    let path = confined_path(root, relative)?;
+    read_bounded(&confined_path(root, relative)?, max)
+}
+
+fn read_bounded(path: &Path, max: usize) -> Option<Vec<u8>> {
     let file = std::fs::File::open(path).ok()?;
     if file.metadata().ok()?.len() > max as u64 {
         return None;
     }
     let mut bytes = Vec::new();
     file.take(max as u64 + 1).read_to_end(&mut bytes).ok()?;
+    crate::source::file(path, &bytes);
     (bytes.len() <= max).then_some(bytes)
 }
 
 pub struct Assets {
     root: Option<PathBuf>,
+    effect_root: Option<PathBuf>,
     scene_textures: BTreeMap<String, (PathBuf, String)>,
+    custom_shaders: BTreeMap<String, String>,
     pub(crate) system_fonts: std::sync::Mutex<crate::text::system_font::Cache>,
     pub properties: BTreeMap<String, Vec<f32>>,
-    property_dependencies: std::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
+    property_dependencies:
+        std::sync::Arc<std::sync::Mutex<Option<std::collections::BTreeSet<String>>>>,
+    texture_cache:
+        Option<std::sync::Arc<std::sync::Mutex<crate::model::texture_cache::TextureCache>>>,
+    context: SceneContext,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SceneContext {
+    pub projection: Option<crate::model::ProjectionMode>,
+    pub lighting: crate::model::lighting::Config,
+    pub fog: crate::model::fog::Config,
 }
 
 pub(crate) fn property_dependencies(value: &Value) -> std::collections::BTreeSet<String> {
@@ -56,6 +105,9 @@ pub(crate) fn property_dependencies(value: &Value) -> std::collections::BTreeSet
                 && let Some(name) = user.as_str().or_else(|| user.get("name")?.as_str())
             {
                 names.insert(name.to_ascii_lowercase());
+            }
+            if let Some(bindings) = map.get(USER_SHADER_VALUES).and_then(Value::as_object) {
+                names.extend(bindings.keys().map(|name| name.to_ascii_lowercase()));
             }
             for child in map.values() {
                 names.extend(property_dependencies(child));
@@ -108,6 +160,28 @@ pub fn parse_property_overrides(
 }
 
 impl Assets {
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            effect_root: self.effect_root.clone(),
+            scene_textures: self.scene_textures.clone(),
+            custom_shaders: self.custom_shaders.clone(),
+            system_fonts: std::sync::Mutex::default(),
+            properties: self.properties.clone(),
+            property_dependencies: std::sync::Arc::default(),
+            texture_cache: None,
+            context: self.context.clone(),
+        }
+    }
+
+    pub(crate) fn with_scene(&self, context: SceneContext) -> Self {
+        let mut assets = self.snapshot();
+        assets.context = context;
+        assets.property_dependencies = self.property_dependencies.clone();
+        assets.texture_cache.clone_from(&self.texture_cache);
+        assets
+    }
+
     pub fn discover(configured: Option<&str>) -> Self {
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(path) = configured.filter(|text| !text.is_empty()) {
@@ -128,10 +202,16 @@ impl Assets {
             .and_then(|path| std::fs::canonicalize(path).ok());
         Self {
             root,
+            effect_root: None,
             scene_textures: BTreeMap::new(),
+            custom_shaders: BTreeMap::new(),
             system_fonts: std::sync::Mutex::default(),
             properties: BTreeMap::new(),
-            property_dependencies: std::sync::Mutex::new(Some(std::collections::BTreeSet::new())),
+            property_dependencies: std::sync::Arc::new(std::sync::Mutex::new(Some(
+                std::collections::BTreeSet::new(),
+            ))),
+            texture_cache: None,
+            context: SceneContext::default(),
         }
     }
 
@@ -172,7 +252,12 @@ impl Assets {
         }
         let documents = directories
             .iter()
-            .map(|dir| paper_control::we_project::read(dir).map(|document| (dir, document)))
+            .map(|dir| {
+                paper_control::we_project::read(dir).map(|document| {
+                    crate::source::declaration(dir, &document);
+                    (dir, document)
+                })
+            })
             .collect::<std::io::Result<Vec<_>>>()?;
         for (name, entry) in declarations {
             let Some(path) = entry
@@ -208,12 +293,9 @@ impl Assets {
     }
 
     pub fn read(&self, relative: &str) -> Option<String> {
-        let text = String::from_utf8(read_confined_bytes(
-            self.root.as_ref()?,
-            relative,
-            crate::json::MAX_JSON_BYTES,
-        )?)
-        .ok()?;
+        let text =
+            String::from_utf8(self.read_scoped_bytes(relative, crate::json::MAX_JSON_BYTES)?)
+                .ok()?;
         if relative.ends_with(".json") {
             let mut dependencies = self
                 .property_dependencies
@@ -229,15 +311,142 @@ impl Assets {
         Some(text)
     }
 
+    pub(crate) fn with_effect(&self, file: &str) -> Self {
+        let mut scoped = self.snapshot();
+        scoped.property_dependencies = self.property_dependencies.clone();
+        scoped.texture_cache.clone_from(&self.texture_cache);
+        scoped.effect_root = self
+            .root
+            .as_deref()
+            .and_then(|root| confined_path(root, file))
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        scoped
+    }
+
+    fn read_scoped_bytes(&self, relative: &str, max: usize) -> Option<Vec<u8>> {
+        self.effect_root
+            .as_deref()
+            .and_then(|root| read_confined_bytes(root, relative, max))
+            .or_else(|| read_confined_bytes(self.root.as_deref()?, relative, max))
+    }
+
+    pub(crate) fn with_texture_cache(mut self) -> Self {
+        self.texture_cache = Some(std::sync::Arc::default());
+        self
+    }
+
+    pub(crate) fn read_asset(&self, path: &Path) -> Option<Vec<u8>> {
+        let confined = [self.effect_root.as_deref(), self.root.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .any(|root| path.starts_with(root));
+        confined.then(|| read_bounded(path, crate::pkg::MAX_PACKAGE_ENTRY_BYTES)).flatten()
+    }
+
+    pub(crate) fn asset_path(&self, relative: &str) -> Option<PathBuf> {
+        self.effect_root
+            .as_deref()
+            .and_then(|root| confined_path(root, relative))
+            .or_else(|| confined_path(self.root.as_deref()?, relative))
+    }
+
+    pub(crate) fn cached_texture(
+        &self,
+        key: crate::model::texture_cache::Key,
+        load: impl FnOnce() -> Option<crate::model::Texture>,
+    ) -> Option<crate::model::Texture> {
+        let Some(cache) = &self.texture_cache else {
+            return load();
+        };
+        let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(texture) = cache.get(&key) {
+            return Some(texture);
+        }
+        let texture = load()?;
+        cache.insert(key, &texture);
+        Some(texture)
+    }
+
+    pub(crate) fn texture_charge(&self, texture: &crate::model::Texture) -> usize {
+        self.texture_cache.as_ref().map_or_else(
+            || texture.payload_bytes(),
+            |cache| cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).charge(texture),
+        )
+    }
+
+    pub(crate) fn depend(&self, name: &str) {
+        let mut dependencies =
+            self.property_dependencies.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(names) = &mut *dependencies {
+            names.insert(name.to_ascii_lowercase());
+        }
+    }
+
     pub(crate) fn property_dependencies(&self) -> Option<std::collections::BTreeSet<String>> {
         self.property_dependencies.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
+const BLENDING_FIELD: &str = "blending";
+const BLEND_COPY: &str = "normal";
+const BLEND_COVERAGE: &str = "alphatocoverage";
+const ALPHA_COVERAGE_COMBO: &str = "ALPHATOCOVERAGE";
+pub(crate) const SHADER_VERSION_COMBO: &str = "SHADERVERSION";
+pub(crate) const SHADER_VERSION: i64 = 69;
+const BLEND_ALPHA: &str = "translucent";
+const BLEND_ADD: &str = "additive";
+const BLEND_SCREEN: &str = "screen";
+pub(crate) const USER_TEXTURES_FIELD: &str = "usertextures";
+pub(crate) const TEXTURES_FIELD: &str = "textures";
+const TEXTURE_NAME_FIELD: &str = "name";
+
+pub(crate) fn texture_name(value: &Value) -> Option<&str> {
+    value.as_str().or_else(|| value.get(TEXTURE_NAME_FIELD)?.as_str())
+}
+
+pub(crate) fn merge_texture_slots(base: Option<&[Value]>, updates: &[Value]) -> Vec<Value> {
+    let mut slots = base.map_or_else(Vec::new, <[Value]>::to_vec);
+    slots.resize(slots.len().max(updates.len()), Value::Null);
+    for (slot, value) in updates.iter().enumerate() {
+        let name = texture_name(value);
+        if name.is_some_and(|name| !name.is_empty()) {
+            slots[slot] = value.clone();
+        }
+    }
+    slots
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PassBlend {
+    AlphaCoverage,
+    #[default]
+    Copy,
+    Alpha,
+    Add,
+    Screen,
+}
+
+impl PassBlend {
+    pub fn parse(value: Option<&str>) -> Option<Self> {
+        match value {
+            None | Some(BLEND_COPY) => Some(Self::Copy),
+            Some(BLEND_COVERAGE) => Some(Self::AlphaCoverage),
+            Some(BLEND_ALPHA) => Some(Self::Alpha),
+            Some(BLEND_ADD) => Some(Self::Add),
+            Some(BLEND_SCREEN) => Some(Self::Screen),
+            Some(_) => None,
+        }
+    }
+}
+
 pub struct EffectPass {
+    pub blend: PassBlend,
     pub property_source: Option<(usize, usize)>,
+    pub user_uniforms: BTreeSet<String>,
     pub name: String,
     pub vertex: Translated,
+    pub geometry: Option<Translated>,
     pub fragment: Translated,
     pub hlsl: Option<crate::hlsl::HlslPair>,
     pub textures: Vec<Option<crate::model::Texture>>,
@@ -246,11 +455,112 @@ pub struct EffectPass {
     pub binds: Vec<(usize, EffectBind)>,
 }
 
+const TIME_UNIFORM: &str = "g_Time";
+const FRAME_TIME_UNIFORM: &str = "g_Frametime";
+const DAY_TIME_UNIFORM: &str = "g_Daytime";
+const POINTER_UNIFORM: &str = "g_PointerPosition";
+const LAST_POINTER_UNIFORM: &str = "g_PointerPositionLast";
+const POINTER_STATE_UNIFORM: &str = "g_PointerState";
+const PARALLAX_UNIFORM: &str = "g_ParallaxPosition";
+
+#[derive(PartialEq)]
+enum FrameInput {
+    Time,
+    Clock,
+    Pointer,
+    Audio,
+}
+
+fn frame_input(name: &str) -> Option<FrameInput> {
+    match name {
+        TIME_UNIFORM | FRAME_TIME_UNIFORM => Some(FrameInput::Time),
+        DAY_TIME_UNIFORM => Some(FrameInput::Clock),
+        POINTER_UNIFORM | LAST_POINTER_UNIFORM | POINTER_STATE_UNIFORM | PARALLAX_UNIFORM => {
+            Some(FrameInput::Pointer)
+        }
+        name if name.starts_with(AUDIO_PREFIX) => Some(FrameInput::Audio),
+        _ => None,
+    }
+}
+
+impl EffectPass {
+    #[must_use]
+    pub fn clocked(&self) -> bool {
+        self.vertex
+            .uniforms
+            .iter()
+            .chain(self.geometry.iter().flat_map(|stage| &stage.uniforms))
+            .chain(&self.fragment.uniforms)
+            .any(|uniform| {
+                matches!(frame_input(&uniform.name), Some(FrameInput::Time | FrameInput::Clock))
+            })
+    }
+
+    #[must_use]
+    pub fn frame_dependent(&self) -> bool {
+        self.vertex
+            .uniforms
+            .iter()
+            .chain(self.geometry.iter().flat_map(|stage| &stage.uniforms))
+            .chain(&self.fragment.uniforms)
+            .any(|uniform| frame_input(&uniform.name).is_some())
+    }
+
+    pub fn bind_texture(&mut self, bind: &EffectBind, texture: fn() -> crate::model::Texture) {
+        let slots: Vec<usize> =
+            self.binds.iter().filter(|(_, bound)| bound == bind).map(|(slot, _)| *slot).collect();
+        for slot in slots {
+            if slot >= self.textures.len() {
+                self.textures.resize_with(slot + 1, || None);
+            }
+            self.textures[slot] = Some(texture());
+        }
+        self.binds.retain(|(_, bound)| bound != bind);
+    }
+
+    pub fn samples_reflection(&self) -> bool {
+        self.samples(|bind| *bind == EffectBind::Reflection)
+    }
+
+    pub fn samples(&self, wanted: impl Fn(&EffectBind) -> bool) -> bool {
+        let glsl = [&self.vertex.source, &self.fragment.source];
+        let hlsl = self.hlsl.iter().flat_map(|pair| [&pair.vertex, &pair.fragment]);
+        self.binds.iter().filter(|(_, bind)| wanted(bind)).any(|(slot, _)| {
+            self.vertex.samplers.iter().chain(&self.fragment.samplers).any(|sampler| {
+                let name = &sampler.name;
+                sampler.index as usize == *slot
+                    && (glsl
+                        .iter()
+                        .any(|source| shader::reads_sampler(source, &BTreeMap::new(), name))
+                        || hlsl.clone().any(|source| crate::hlsl::reads_texture(source, name)))
+            })
+        })
+    }
+
+    fn filter_binds(&mut self) {
+        self.binds.retain(|(slot, _)| {
+            self.vertex
+                .samplers
+                .iter()
+                .chain(&self.fragment.samplers)
+                .any(|sampler| sampler.index as usize == *slot)
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CompositeBuffer {
     A,
     B,
 }
+
+pub const REFLECTION_BUFFER: &str = "_rt_Reflection";
+const RENDER_TARGET_PREFIX: &str = "_rt_";
+pub const COOKIE_BUFFER: &str = "_alias_lightCookie";
+const SHADOW_BUFFER: &str = "_rt_shadowAtlas";
+
+pub const MIP_FRAME_BUFFER: &str = "_rt_MipMappedFrameBuffer";
+pub const SOURCE_COLOR_UNIFORM: &str = "g_Color4";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EffectBind {
@@ -259,6 +569,10 @@ pub enum EffectBind {
     LayerComposite { layer: String, buffer: CompositeBuffer },
     SceneSoFar,
     SceneUnderLayer,
+    SceneHistory,
+    Reflection,
+    ShadowAtlas,
+    LightCookie,
 }
 
 impl EffectBind {
@@ -269,6 +583,18 @@ impl EffectBind {
         }
         if name.eq_ignore_ascii_case("_rt_FullFrameBuffer") {
             return Self::SceneSoFar;
+        }
+        if name.eq_ignore_ascii_case(REFLECTION_BUFFER) {
+            return Self::Reflection;
+        }
+        if name.eq_ignore_ascii_case(COOKIE_BUFFER) {
+            return Self::LightCookie;
+        }
+        if name.eq_ignore_ascii_case(SHADOW_BUFFER) {
+            return Self::ShadowAtlas;
+        }
+        if name.eq_ignore_ascii_case(MIP_FRAME_BUFFER) {
+            return Self::SceneHistory;
         }
         if let Some((layer, suffix)) =
             name.strip_prefix("_rt_imageLayerComposite_").and_then(|rest| rest.rsplit_once('_'))
@@ -292,9 +618,27 @@ impl EffectBind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FboSize {
     Scale(f32),
+    ScaleFloor(f32),
     Fit(u32),
     Fixed { width: u32, height: u32 },
 }
+
+const FBO_FORMAT_NAMES: [(&str, FboFormat); 14] = [
+    ("", FboFormat::Rgba8),
+    ("rgba8888", FboFormat::Rgba8),
+    ("rgb888", FboFormat::Rgba8),
+    ("rgba_backbuffer", FboFormat::Rgba8),
+    ("rgb_backbuffer", FboFormat::Rgba8),
+    ("r8", FboFormat::R8),
+    ("rg88", FboFormat::Rg8),
+    ("r16f", FboFormat::R16f),
+    ("rg1616f", FboFormat::Rg16f),
+    ("rgba16f", FboFormat::Rgba16f),
+    ("rgba16161616f", FboFormat::Rgba16f),
+    ("rgb161616f", FboFormat::Rgba16f),
+    ("rgba16161616", FboFormat::Rgba16),
+    ("rgb161616", FboFormat::Rgba16),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FboFormat {
@@ -304,30 +648,24 @@ pub enum FboFormat {
     R16f,
     Rg16f,
     Rgba16f,
+    Rgba16,
 }
 
 impl FboFormat {
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "" | "rgba8888" | "rgba_backbuffer" | "rgb_backbuffer" => Some(Self::Rgba8),
-            "r8" => Some(Self::R8),
-            "rg88" => Some(Self::Rg8),
-            "r16f" => Some(Self::R16f),
-            "rg1616f" => Some(Self::Rg16f),
-            "rgba16f" | "rgba16161616f" => Some(Self::Rgba16f),
-            _ => None,
-        }
+        let name = text.trim().to_ascii_lowercase();
+        FBO_FORMAT_NAMES.iter().find(|(known, _)| *known == name).map(|(_, format)| *format)
     }
 
     #[must_use]
     pub fn bytes_per_pixel(self) -> u64 {
-        match self {
-            Self::R8 => 1,
-            Self::Rg8 | Self::R16f => 2,
-            Self::Rgba8 | Self::Rg16f => 4,
-            Self::Rgba16f => 8,
-        }
+        (match self {
+            Self::R8 => size_of::<u8>(),
+            Self::Rg8 | Self::R16f => size_of::<[u8; 2]>(),
+            Self::Rgba8 | Self::Rg16f => size_of::<[u8; 4]>(),
+            Self::Rgba16f | Self::Rgba16 => size_of::<[u16; 4]>(),
+        }) as u64
     }
 }
 
@@ -338,23 +676,36 @@ pub struct Fbo {
     pub format: FboFormat,
     pub repeat: Option<bool>,
     pub clear: [f32; 4],
+    pub clear_on_setup: bool,
     pub unique: bool,
 }
+
+const FBO_MAX_EXTENT: u32 = 8192;
+const FBO_MIN_SCALE: f32 = 1e-3;
 
 impl Fbo {
     #[must_use]
     pub fn extent(&self, base: (u32, u32)) -> (u32, u32) {
         let (w, h) = (base.0.max(1) as f32, base.1.max(1) as f32);
         let (out_w, out_h) = match self.size {
-            FboSize::Scale(scale) => (w / scale.max(1e-3), h / scale.max(1e-3)),
+            FboSize::Scale(scale) => (w / scale.max(FBO_MIN_SCALE), h / scale.max(FBO_MIN_SCALE)),
+            FboSize::ScaleFloor(scale) => {
+                ((w / scale.max(FBO_MIN_SCALE)).floor(), (h / scale.max(FBO_MIN_SCALE)).floor())
+            }
             FboSize::Fit(edge) => {
-                let edge = edge.max(1) as f32;
-                let k = edge / w.max(h);
-                (w * k, h * k)
+                let edge = (edge.max(1) as f32).min(w.max(h));
+                let maximum = w.max(h);
+                return (
+                    ((w / maximum * edge) as u32).clamp(1, FBO_MAX_EXTENT),
+                    ((h / maximum * edge) as u32).clamp(1, FBO_MAX_EXTENT),
+                );
             }
             FboSize::Fixed { width, height } => (width as f32, height as f32),
         };
-        ((out_w.round() as u32).clamp(1, 8192), (out_h.round() as u32).clamp(1, 8192))
+        (
+            (out_w.round() as u32).clamp(1, FBO_MAX_EXTENT),
+            (out_h.round() as u32).clamp(1, FBO_MAX_EXTENT),
+        )
     }
 }
 
@@ -365,14 +716,91 @@ pub struct Swap {
     pub target: String,
 }
 
+#[derive(Clone, Copy)]
+pub struct EffectState {
+    pub source: Option<usize>,
+    pub visible: bool,
+    pub available: bool,
+}
+
+impl Default for EffectState {
+    fn default() -> Self {
+        Self { source: None, visible: true, available: true }
+    }
+}
+
+impl EffectState {
+    pub fn apply_object(&mut self, object: &Value, properties: &BTreeMap<String, Vec<f32>>) {
+        if let Some(index) = self.source
+            && let Some(effect) = object.get(EFFECTS_FIELD).and_then(|effects| effects.get(index))
+        {
+            self.visible = is_visible(effect.get(VISIBLE_FIELD), properties);
+        }
+    }
+}
+
 pub struct Effect {
+    pub state: EffectState,
     pub name: String,
     pub passes: Vec<EffectPass>,
     pub fbos: Vec<Fbo>,
     pub swaps: Vec<Swap>,
+    pub clear_functions: BTreeMap<String, Vec<String>>,
 }
 
-fn conditions_hold(value: Option<&Value>, combos: &BTreeMap<String, i64>) -> bool {
+impl Effect {
+    #[must_use]
+    pub fn scene_capture(&self) -> bool {
+        let [pass] = self.passes.as_slice() else {
+            return false;
+        };
+        self.fbos.is_empty()
+            && self.swaps.is_empty()
+            && pass.target.is_none()
+            && matches!(pass.binds.as_slice(), [(0, EffectBind::SceneSoFar)])
+    }
+}
+
+pub(crate) fn clear_functions(definition: &Value) -> BTreeMap<String, Vec<String>> {
+    let Some(functions) = definition.get(FUNCTIONS_FIELD).and_then(Value::as_object) else {
+        return BTreeMap::new();
+    };
+    if functions.len() > MAX_EFFECT_FUNCTIONS {
+        return BTreeMap::new();
+    }
+    let available: BTreeSet<_> = definition
+        .get(FUNCTION_TARGETS_FIELD)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|fbo| fbo.get(FBO_NAME_FIELD).and_then(Value::as_str))
+        .collect();
+    functions
+        .iter()
+        .filter_map(|(name, function)| {
+            if name.is_empty()
+                || name.len() > MAX_EFFECT_FUNCTION_NAME_BYTES
+                || function.get(FUNCTION_ACTION_FIELD).and_then(Value::as_str)
+                    != Some(FUNCTION_CLEAR_ACTION)
+            {
+                return None;
+            }
+            let targets = function.get(FUNCTION_TARGETS_FIELD)?.as_array()?;
+            if targets.is_empty() || targets.len() > MAX_FUNCTION_TARGETS {
+                return None;
+            }
+            let names: Vec<_> = targets.iter().map(Value::as_str).collect::<Option<Vec<_>>>()?;
+            if names.iter().any(|name| !available.contains(*name)) {
+                return None;
+            }
+            let names: Vec<_> = names.into_iter().map(str::to_owned).collect();
+            let unique: BTreeSet<_> = names.iter().collect();
+            (unique.len() == names.len()).then_some((name.clone(), names))
+        })
+        .collect()
+}
+
+pub(crate) fn conditions_hold(value: Option<&Value>, combos: &BTreeMap<String, i64>) -> bool {
     let Some(entries) = value.and_then(Value::as_array) else {
         return true;
     };
@@ -399,8 +827,8 @@ fn parse_fbo(entry: &Value, skipped: &mut Vec<String>, effect: &str) -> Option<F
             FboSize::Fixed { width, height }
         }
         (_, _, Some(fit)) if fit > 0 => FboSize::Fit(u32::try_from(fit).unwrap_or(u32::MAX)),
-        _ => FboSize::Scale(
-            entry.get("scale").and_then(Value::as_f64).map_or(1.0, |v| v as f32).max(1e-3),
+        _ => FboSize::ScaleFloor(
+            entry.get("scale").and_then(Value::as_f64).map_or(1.0, |v| v as f32).max(FBO_MIN_SCALE),
         ),
     };
     let format_text = entry.get("format").and_then(Value::as_str).unwrap_or("");
@@ -410,7 +838,9 @@ fn parse_fbo(entry: &Value, skipped: &mut Vec<String>, effect: &str) -> Option<F
     });
     let repeat =
         entry.get("uvs").and_then(Value::as_str).map(|uvs| uvs.eq_ignore_ascii_case("repeat"));
-    let clear = entry.get("clear").and_then(json_numbers).map_or([0.0; 4], |parts| {
+    let clear = entry.get("clear").and_then(json_numbers);
+    let clear_on_setup = clear.is_some();
+    let clear = clear.map_or([0.0; 4], |parts| {
         let mut out = [0.0; 4];
         for (slot, value) in out.iter_mut().zip(parts.iter().chain(std::iter::repeat(&0.0))) {
             *slot = *value;
@@ -421,10 +851,10 @@ fn parse_fbo(entry: &Value, skipped: &mut Vec<String>, effect: &str) -> Option<F
         out
     });
     let unique = entry.get("unique").and_then(Value::as_bool).unwrap_or(false);
-    Some(Fbo { name, size, format, repeat, clear, unique })
+    Some(Fbo { name, size, format, repeat, clear, clear_on_setup, unique })
 }
 
-fn instance_combos(
+pub(crate) fn instance_combos(
     pkg: &Package,
     assets: &Assets,
     defs: &[Value],
@@ -469,7 +899,7 @@ pub fn json_numbers(value: &Value) -> Option<Vec<f32>> {
     }
 }
 
-fn combos_of(value: Option<&Value>) -> BTreeMap<String, i64> {
+pub(crate) fn combos_of(value: Option<&Value>) -> BTreeMap<String, i64> {
     let mut out = BTreeMap::new();
     if let Some(Value::Object(obj)) = value {
         for (key, raw) in obj {
@@ -545,32 +975,63 @@ fn constants_of(
 
 fn shader_values(value: Option<&Value>) -> Option<&Value> {
     let obj = value?.as_object()?;
-    obj.get("constantshadervalues").or_else(|| obj.get("constants"))
+    obj.get(CONSTANT_SHADER_VALUES).or_else(|| obj.get("constants"))
 }
 
-fn resolve_material_names(
-    values: &BTreeMap<String, Vec<f32>>,
-    uniforms: &[crate::shader::Uniform],
+pub(crate) fn material_values<'a>(
+    pass: &Value,
+    overrides: Option<&Value>,
+    assets: &Assets,
+    uniforms: &(impl Iterator<Item = (&'a str, Option<&'a str>)> + Clone),
 ) -> BTreeMap<String, Vec<f32>> {
-    let mut out = BTreeMap::new();
-    for uniform in uniforms {
-        let Some(material) = uniform.material.as_deref() else {
-            continue;
-        };
-        if let Some(found) = values.get(material).or_else(|| {
-            values.iter().find(|(key, _)| key.eq_ignore_ascii_case(material)).map(|(_, hit)| hit)
-        }) {
-            out.insert(uniform.name.clone(), found.clone());
+    let mut constants = constants_of(shader_values(Some(pass)), &assets.properties);
+    constants.extend(constants_of(shader_values(overrides), &assets.properties));
+    let mut values = resolve_material_names(&constants, uniforms.clone());
+    values.extend(user_values(pass, overrides, &assets.properties, uniforms));
+    values
+}
+
+fn user_values<'a>(
+    pass: &Value,
+    overrides: Option<&Value>,
+    properties: &BTreeMap<String, Vec<f32>>,
+    uniforms: &(impl Iterator<Item = (&'a str, Option<&'a str>)> + Clone),
+) -> BTreeMap<String, Vec<f32>> {
+    let mut values = BTreeMap::new();
+    let bindings: BTreeMap<_, _> = std::iter::once(pass)
+        .chain(overrides)
+        .filter_map(|pass| pass.get(USER_SHADER_VALUES).and_then(Value::as_object))
+        .flat_map(|bindings| bindings.iter())
+        .collect();
+    for (property, uniform) in bindings {
+        if let Some(uniform) = uniform.as_str()
+            && let Some(value) = properties.get(&property.to_ascii_lowercase())
+            && let Some((name, _)) = uniforms.clone().find(|(_, alias)| *alias == Some(uniform))
+        {
+            values.insert(name.to_owned(), value.clone());
         }
     }
-    for (key, value) in values {
-        out.entry(key.clone()).or_insert_with(|| value.clone());
+    values
+}
+
+fn resolve_material_names<'a>(
+    values: &BTreeMap<String, Vec<f32>>,
+    uniforms: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+) -> BTreeMap<String, Vec<f32>> {
+    let mut out = BTreeMap::new();
+    for (name, material) in uniforms {
+        if let Some(found) = material.and_then(|material| values.get(material)) {
+            out.insert(name.to_owned(), found.clone());
+        }
     }
     out
 }
 
 pub const COLOR_BLEND_EFFECT: &str = "colorblend";
 pub const COLOR_BLEND_SHADER: &str = "skwd/colorblend";
+pub const COLOR_BLEND_MESH_EFFECT: &str = "colorblend-mesh";
+pub const COLOR_BLEND_MESH_SHADER: &str = "skwd/colorblend-mesh";
+pub const COLOR_BLEND_BACKDROP_SLOT: usize = 4;
 
 const COLOR_BLEND_VERT: &str = "uniform mat4 g_ModelViewProjectionMatrix;
 attribute vec3 a_Position;
@@ -594,28 +1055,90 @@ void main() {
 }
 ";
 
+const COLOR_BLEND_MESH_VERT: &str = "uniform mat4 g_ModelViewProjectionMatrix;
+attribute vec2 a_Position;
+attribute vec2 a_TexCoord;
+attribute float a_VertexAlpha;
+varying vec2 v_TexCoord;
+varying float v_VertexAlpha;
+void main() {
+	gl_Position = mul(vec4(a_Position, 0.0, 1.0), g_ModelViewProjectionMatrix);
+	v_TexCoord = a_TexCoord;
+	v_VertexAlpha = a_VertexAlpha;
+}
+";
+
+const COLOR_BLEND_MESH_FRAG: &str = "#include \"common_blending.h\"
+uniform sampler2D g_Texture0;
+uniform sampler2D g_Texture4;
+uniform vec4 g_Texture4Resolution;
+uniform vec4 g_Color4;
+varying vec2 v_TexCoord;
+varying float v_VertexAlpha;
+void main() {
+	vec4 layer = texSample2D(g_Texture0, v_TexCoord) * g_Color4;
+	layer.a *= v_VertexAlpha;
+	if (layer.a <= 0.0) {
+		discard;
+	}
+	vec4 screen = texSample2D(g_Texture4, gl_FragCoord.xy / g_Texture4Resolution.xy);
+	gl_FragColor = vec4(ApplyBlending(BLENDMODE, screen.rgb, layer.rgb, layer.a), screen.a);
+}
+";
+
+pub const ADDITIVE_COLOR_BLEND: u32 = 31;
+const PASSTHROUGH_TRANSFORM: &str = "TRANSFORM";
+const WHITE_SOURCE_COLOR: [f32; 4] = [1.0; 4];
+
 #[must_use]
 pub fn shader_blend(mode: u32) -> bool {
-    !matches!(mode, 0 | 6 | 8)
+    !matches!(mode, 0 | ADDITIVE_COLOR_BLEND)
 }
 
 pub fn color_blend_effect(
     pkg: &Package,
     assets: &Assets,
     mode: u32,
-    color: [f32; 3],
-    alpha: f32,
     own_id: Option<&str>,
+    mesh: bool,
 ) -> Option<Effect> {
+    let (name, shader) = if mesh {
+        (COLOR_BLEND_MESH_EFFECT, COLOR_BLEND_MESH_SHADER)
+    } else {
+        (COLOR_BLEND_EFFECT, COLOR_BLEND_SHADER)
+    };
     let material = serde_json::json!({
-        "passes": [{"shader": COLOR_BLEND_SHADER, "combos": {"BLENDMODE": mode}}]
+        "passes": [{"shader": shader, "combos": {"BLENDMODE": mode}}]
     });
-    let mut passes = build_material(pkg, assets, &material, None, own_id, None)?;
+    let mut passes = build_material(pkg, assets, &material, None, own_id, None, None)?;
     let pass = passes.last_mut()?;
-    pass.binds.retain(|(slot, _)| *slot != 4);
-    pass.binds.push((4, EffectBind::SceneUnderLayer));
-    pass.values.insert("g_Color4".into(), vec![color[0], color[1], color[2], alpha]);
-    Some(Effect { name: COLOR_BLEND_EFFECT.into(), passes, fbos: Vec::new(), swaps: Vec::new() })
+    pass.binds.retain(|(slot, _)| *slot != COLOR_BLEND_BACKDROP_SLOT);
+    if mesh {
+        pass.hlsl = None;
+    } else {
+        pass.binds.push((COLOR_BLEND_BACKDROP_SLOT, EffectBind::SceneUnderLayer));
+    }
+    pass.values.insert(SOURCE_COLOR_UNIFORM.into(), WHITE_SOURCE_COLOR.to_vec());
+    Some(Effect {
+        state: EffectState::default(),
+        name: name.into(),
+        passes,
+        fbos: Vec::new(),
+        swaps: Vec::new(),
+        clear_functions: BTreeMap::new(),
+    })
+}
+
+pub fn passthrough_effect(pkg: &Package, assets: &Assets) -> Option<Effect> {
+    let passes = passthrough_passes(pkg, assets, None, true)?;
+    Some(Effect {
+        state: EffectState::default(),
+        name: material::PASSTHROUGH.into(),
+        passes,
+        fbos: Vec::new(),
+        swaps: Vec::new(),
+        clear_functions: BTreeMap::new(),
+    })
 }
 
 pub fn particle_pass(
@@ -625,21 +1148,44 @@ pub fn particle_pass(
     combos: &BTreeMap<String, i64>,
 ) -> Option<EffectPass> {
     let overrides = Value::Array(vec![serde_json::json!({ "combos": combos })]);
-    let mut passes = build_material(pkg, assets, material, Some(&overrides), None, None)?;
-    passes.pop()
+    let mut passes = build_material(pkg, assets, material, Some(&overrides), None, None, None)?;
+    let mut pass = passes.pop()?;
+    pass.filter_binds();
+    Some(pass)
 }
 
-fn load_shader(pkg: &Package, assets: &Assets, name: &str, ext: &str) -> Option<String> {
+const VERTEX_SHADER_EXT: &str = "vert";
+const GEOMETRY_SHADER_EXT: &str = "geom";
+const FRAGMENT_SHADER_EXT: &str = "frag";
+
+pub(crate) fn load_shader(pkg: &Package, assets: &Assets, name: &str, ext: &str) -> Option<String> {
     const MAX_SHADER_BYTES: usize = 4 * 1024 * 1024;
     if name == COLOR_BLEND_SHADER {
-        let source = if ext == "vert" { COLOR_BLEND_VERT } else { COLOR_BLEND_FRAG };
-        return Some(source.to_string());
+        return match ext {
+            VERTEX_SHADER_EXT => Some(COLOR_BLEND_VERT.to_string()),
+            FRAGMENT_SHADER_EXT => Some(COLOR_BLEND_FRAG.to_string()),
+            _ => None,
+        };
+    }
+    if name == COLOR_BLEND_MESH_SHADER {
+        return match ext {
+            VERTEX_SHADER_EXT => Some(COLOR_BLEND_MESH_VERT.to_string()),
+            FRAGMENT_SHADER_EXT => Some(COLOR_BLEND_MESH_FRAG.to_string()),
+            _ => None,
+        };
     }
     let rel = format!("shaders/{name}.{ext}");
     pkg.find(&rel)
         .filter(|bytes| bytes.len() <= MAX_SHADER_BYTES)
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-        .or_else(|| assets.read(&rel))
+        .or_else(|| {
+            (ext != GEOMETRY_SHADER_EXT
+                || ![VERTEX_SHADER_EXT, FRAGMENT_SHADER_EXT]
+                    .iter()
+                    .any(|stage| pkg.find(&format!("shaders/{name}.{stage}")).is_some()))
+            .then(|| assets.read(&rel))
+            .flatten()
+        })
 }
 
 fn texture_slot(
@@ -648,14 +1194,31 @@ fn texture_slot(
     raw: Option<&str>,
 ) -> Option<crate::model::Texture> {
     let name = raw.filter(|text| !text.is_empty())?;
-    crate::model::load_texture_named(pkg, name).or_else(|| {
-        crate::model::load_texture_bytes(&assets.read_bytes(&format!("materials/{name}.tex"))?)
-    })
+    crate::model::load_texture_or_asset(pkg, assets, name)
+        .filter(|texture| texture.stream.is_none())
+}
+
+fn texture_shipped(pkg: &Package, assets: &Assets, name: &str) -> bool {
+    name.starts_with(RENDER_TARGET_PREFIX)
+        || crate::model::tex_candidates(name)
+            .iter()
+            .any(|path| pkg.find(path).is_some() || assets.asset_path(path).is_some())
+}
+
+fn texture_components(pkg: &Package, assets: &Assets, name: &str) -> Option<u8> {
+    let candidates = crate::model::tex_candidates(name);
+    for path in &candidates {
+        if let Some(bytes) = pkg.find(path) {
+            return crate::tex::parse_meta(bytes).ok().map(|meta| meta.component_mask());
+        }
+    }
+    let bytes = candidates.iter().find_map(|path| assets.read_bytes(path))?;
+    crate::tex::parse_meta(&bytes).ok().map(|meta| meta.component_mask())
 }
 
 impl Assets {
     pub fn read_bytes(&self, relative: &str) -> Option<Vec<u8>> {
-        read_confined_bytes(self.root.as_ref()?, relative, crate::pkg::MAX_PACKAGE_ENTRY_BYTES)
+        self.read_scoped_bytes(relative, crate::pkg::MAX_PACKAGE_ENTRY_BYTES)
     }
 
     #[must_use]
@@ -677,7 +1240,21 @@ fn build_pass(
     let material = pkg.find_json(material_path).ok().flatten().or_else(|| {
         assets.read(material_path).and_then(|text| crate::json::parse(text.as_bytes()).ok())
     })?;
-    build_material(pkg, assets, &material, overrides, own_id, Some(property_source))
+    build_material(pkg, assets, &material, overrides, own_id, Some(property_source), None)
+}
+
+fn passthrough_passes(
+    pkg: &Package,
+    assets: &Assets,
+    own_id: Option<&str>,
+    transform: bool,
+) -> Option<Vec<EffectPass>> {
+    let mut pass = serde_json::json!({(material::SHADER): material::PASSTHROUGH});
+    if transform {
+        pass[COMBOS_FIELD] = serde_json::json!({(PASSTHROUGH_TRANSFORM): 1});
+    }
+    let material = serde_json::json!({(material::PASSES): [pass]});
+    build_material(pkg, assets, &material, None, own_id, None, None)
 }
 
 fn build_copy_pass(
@@ -691,8 +1268,7 @@ fn build_copy_pass(
     }
     let source = def.get("source").and_then(Value::as_str)?;
     let target = def.get("target").and_then(Value::as_str)?;
-    let material = serde_json::json!({"passes": [{"shader": "passthrough"}]});
-    let mut built = build_material(pkg, assets, &material, None, own_id, None)?;
+    let mut built = passthrough_passes(pkg, assets, own_id, false)?;
     let pass = built.last_mut()?;
     pass.name = "copy".to_string();
     pass.target = Some(target.to_string());
@@ -700,7 +1276,7 @@ fn build_copy_pass(
     Some(built)
 }
 
-const ENGINE_GLOBAL_TARGETS: [&str; 1] = ["_rt_shadowAtlas"];
+const SCENE_ORTHO: &str = "SCENE_ORTHO";
 
 fn dialect(combos: &BTreeMap<String, i64>, name: &str) -> BTreeMap<String, i64> {
     let mut out = combos.clone();
@@ -711,6 +1287,12 @@ fn dialect(combos: &BTreeMap<String, i64>, name: &str) -> BTreeMap<String, i64> 
     out
 }
 
+#[derive(Clone, Copy)]
+struct MaterialInput {
+    bones: Option<usize>,
+    component_mask: u8,
+}
+
 fn build_material(
     pkg: &Package,
     assets: &Assets,
@@ -718,63 +1300,90 @@ fn build_material(
     overrides: Option<&Value>,
     own_id: Option<&str>,
     property_source: Option<(usize, usize)>,
+    input: Option<MaterialInput>,
 ) -> Option<Vec<EffectPass>> {
     let passes = material.get("passes")?.as_array()?;
     let mut out = Vec::new();
     for (index, pass) in passes.iter().enumerate() {
-        let Some(shader_name) = pass.get("shader").and_then(Value::as_str) else {
-            continue;
-        };
-        let props = &assets.properties;
+        let shader_name = customshader::resolve(pass, assets)?;
         let mut combos = combos_of(pass.get("combos"));
-        let mut values = constants_of(shader_values(Some(pass)), props);
         if let Some(over) =
             overrides.and_then(|value| value.as_array()).and_then(|arr| arr.get(index))
         {
             for (key, value) in combos_of(over.get("combos")) {
                 combos.insert(key, value);
             }
-            for (key, value) in constants_of(shader_values(Some(over)), props) {
-                values.insert(key, value);
-            }
         }
-        let vert_src = load_shader(pkg, assets, shader_name, "vert")?;
-        let frag_src = load_shader(pkg, assets, shader_name, "frag")?;
+        if pass.get(BLENDING_FIELD).and_then(Value::as_str) == Some(BLEND_COVERAGE) {
+            combos.insert(ALPHA_COVERAGE_COMBO.into(), 1);
+        }
+        let vert_src = load_shader(pkg, assets, shader_name, VERTEX_SHADER_EXT)?;
+        let geom_src = load_shader(pkg, assets, shader_name, GEOMETRY_SHADER_EXT);
+        if geom_src.is_some() {
+            combos.insert(GEOMETRY_COMBO.into(), 1);
+        }
+        combos.insert(SHADER_VERSION_COMBO.into(), SHADER_VERSION);
+        combos.insert(crate::model::lighting::COMBO.into(), assets.context.lighting.count as i64);
+        combos.insert(
+            crate::model::lighting::COOKIE_COMBO.into(),
+            i64::from(assets.context.lighting.cookies),
+        );
+        combos.insert(
+            crate::model::lighting::SHADOW_COMBO.into(),
+            i64::from(assets.context.lighting.shadows),
+        );
+        combos.insert(
+            crate::model::lighting::spot::COMBO.into(),
+            assets.context.lighting.spots as i64,
+        );
+        combos.insert(
+            crate::model::lighting::directional::COMBO.into(),
+            assets.context.lighting.directionals as i64,
+        );
+        let frag_src = load_shader(pkg, assets, shader_name, FRAGMENT_SHADER_EXT)?;
         let loader = |name: &str| -> Option<String> {
             pkg.find(&format!("shaders/{name}"))
                 .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                 .or_else(|| assets.read(&format!("shaders/{name}")))
         };
-        let vert =
-            shader::relax_portability(&shader::resolve_includes(&vert_src, &loader, 0).ok()?);
-        let frag =
-            shader::relax_portability(&shader::resolve_includes(&frag_src, &loader, 0).ok()?);
-        for (name, value) in
-            shader::combo_defaults(&vert).into_iter().chain(shader::combo_defaults(&frag))
+        let vert = shader::relax_portability(
+            &assets.context.lighting.source(&shader::resolve_includes(&vert_src, &loader, 0).ok()?),
+        );
+        let frag = shader::relax_portability(
+            &assets.context.lighting.source(&shader::resolve_includes(&frag_src, &loader, 0).ok()?),
+        );
+        let geom = if let Some(source) = geom_src {
+            Some(shader::relax_portability(
+                &assets
+                    .context
+                    .lighting
+                    .source(&shader::resolve_includes(&source, &loader, 0).ok()?),
+            ))
+        } else {
+            None
+        };
+        for (name, value) in shader::combo_defaults(&vert)
+            .into_iter()
+            .chain(geom.iter().flat_map(|source| shader::combo_defaults(source)))
+            .chain(shader::combo_defaults(&frag))
         {
             combos.entry(name).or_insert(value);
         }
-        let mut names: Vec<Option<String>> = pass
-            .get("textures")
-            .and_then(Value::as_array)
-            .map(|slots| slots.iter().map(|entry| entry.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
-        if let Some(over) = overrides
+        assets.context.fog.combos(&mut combos);
+        let base = pass.get(TEXTURES_FIELD).and_then(Value::as_array);
+        let updates = overrides
             .and_then(Value::as_array)
             .and_then(|arr| arr.get(index))
-            .and_then(|value| value.get("textures"))
-            .and_then(Value::as_array)
-        {
-            if over.len() > names.len() {
-                names.resize(over.len(), None);
-            }
-            for (slot, entry) in over.iter().enumerate() {
-                if let Some(name) = entry.as_str().filter(|text| !text.is_empty()) {
-                    names[slot] = Some(name.to_string());
-                }
-            }
-        }
-        let probe = shader::translate(&frag, Stage::Fragment, &combos);
+            .and_then(|value| value.get(TEXTURES_FIELD))
+            .and_then(Value::as_array);
+        let texture_slots = updates.map_or_else(
+            || base.cloned().unwrap_or_default(),
+            |updates| merge_texture_slots(base.map(Vec::as_slice), updates),
+        );
+        let mut names: Vec<Option<String>> =
+            texture_slots.iter().map(|entry| texture_name(entry).map(str::to_owned)).collect();
+        let mut probe = shader::translate(&frag, Stage::Fragment, &combos);
+        probe.samplers.extend(shader::translate(&vert, Stage::Vertex, &combos).samplers);
         for sampler in &probe.samplers {
             let Some(combo) = sampler.combo.as_deref() else {
                 continue;
@@ -788,9 +1397,38 @@ fn build_material(
             }
         }
         let mut self_binds = Vec::new();
+        if assets.context.lighting.shadows
+            && probe.uniforms.iter().any(|uniform| {
+                uniform.name.starts_with(crate::model::lighting::SHADOW_PREFIX)
+                    || uniform.name.starts_with(crate::model::lighting::SHADOW_FEATURE_PREFIX)
+            })
+            && probe
+                .samplers
+                .iter()
+                .any(|sampler| sampler.index as usize == crate::model::lighting::SHADOW_SLOT)
+        {
+            self_binds.push((crate::model::lighting::SHADOW_SLOT, EffectBind::ShadowAtlas));
+        }
+        if assets.context.lighting.cookies
+            && probe
+                .uniforms
+                .iter()
+                .any(|uniform| uniform.name.starts_with(crate::model::lighting::COOKIE_PREFIX))
+            && probe
+                .samplers
+                .iter()
+                .any(|sampler| sampler.index as usize == crate::model::lighting::COOKIE_SLOT)
+        {
+            self_binds.push((crate::model::lighting::COOKIE_SLOT, EffectBind::LightCookie));
+        }
         for sampler in &probe.samplers {
             let slot = sampler.index as usize;
-            if slot == 0 || sampler.combo.is_some() {
+            if slot == 0
+                || self_binds.iter().any(|(bound, _)| *bound == slot)
+                || (sampler.combo.is_some()
+                    && !shader::reads_sampler(&frag, &combos, &sampler.name)
+                    && !shader::reads_sampler(&vert, &combos, &sampler.name))
+            {
                 continue;
             }
             let Some(default) = sampler.default.as_deref().filter(|text| !text.is_empty()) else {
@@ -802,10 +1440,10 @@ fn build_material(
             if names[slot].as_deref().is_some_and(|name| !name.is_empty()) {
                 continue;
             }
-            if ENGINE_GLOBAL_TARGETS.contains(&default) {
+            if default.eq_ignore_ascii_case(SHADOW_BUFFER) && !assets.context.lighting.shadows {
                 continue;
             }
-            if default.starts_with("_rt_") {
+            if default.starts_with(RENDER_TARGET_PREFIX) {
                 self_binds.push((slot, EffectBind::parse(default, own_id)));
             } else {
                 names[slot] = Some(default.to_string());
@@ -814,11 +1452,16 @@ fn build_material(
         let usertextures = overrides
             .and_then(Value::as_array)
             .and_then(|array| array.get(index))
-            .and_then(|v| v.get("usertextures"))
-            .and_then(Value::as_array);
-        if let Some(usertextures) = usertextures {
-            names.resize(names.len().max(usertextures.len()), None);
-        }
+            .and_then(|value| value.get(USER_TEXTURES_FIELD))
+            .and_then(Value::as_array)
+            .map(|updates| {
+                merge_texture_slots(
+                    pass.get(USER_TEXTURES_FIELD).and_then(Value::as_array).map(Vec::as_slice),
+                    updates,
+                )
+            })
+            .or_else(|| pass.get(USER_TEXTURES_FIELD).and_then(Value::as_array).cloned());
+        names.resize(names.len().max(usertextures.as_ref().map_or(0, Vec::len)), None);
         let textures: Vec<Option<crate::model::Texture>> = names
             .iter()
             .enumerate()
@@ -827,7 +1470,8 @@ fn build_material(
                     return None;
                 }
                 usertextures
-                    .and_then(|v| v.get(slot))
+                    .as_ref()
+                    .and_then(|slots| slots.get(slot))
                     .and_then(crate::model::MediaTexture::of)
                     .map(crate::model::MediaTexture::texture)
                     .or_else(|| texture_slot(pkg, assets, name.as_deref()))
@@ -839,47 +1483,134 @@ fn build_material(
             };
             combos.entry(format!("TEX{slot}FORMAT")).or_insert(texture.we_format());
         }
+        for sampler in &probe.samplers {
+            if sampler.components.iter().all(Option::is_none) {
+                continue;
+            }
+            let slot = sampler.index as usize;
+            let mask = if slot == 0 {
+                input.map(|input| input.component_mask).or_else(|| {
+                    names
+                        .first()
+                        .and_then(Option::as_deref)
+                        .and_then(|name| texture_components(pkg, assets, name))
+                })
+            } else {
+                textures.get(slot).and_then(Option::as_ref).map(|texture| texture.component_mask)
+            }
+            .unwrap_or(0);
+            for (index, combo) in sampler.components.iter().enumerate() {
+                if let Some(combo) = combo
+                    && mask & (1 << index) != 0
+                {
+                    combos.insert(combo.clone(), 1);
+                }
+            }
+        }
+        if let Some(bones) = input.and_then(|input| input.bones) {
+            let morph = combos.get(crate::puppet::morph::COMBO) == Some(&1);
+            material::puppet::combos(&mut combos, bones, morph).ok()?;
+        }
+        combos.insert(
+            SCENE_ORTHO.into(),
+            i64::from(matches!(
+                assets.context.projection,
+                Some(
+                    crate::model::ProjectionMode::Orthographic
+                        | crate::model::ProjectionMode::Automatic
+                )
+            )),
+        );
         let hlsl_symbols = dialect(&combos, "HLSL");
         let glsl_symbols = dialect(&combos, "GLSL");
         let vert_hlsl = shader::preprocess(&vert, &hlsl_symbols);
         let frag_hlsl = shader::preprocess(&frag, &hlsl_symbols);
         let vert = shader::preprocess(&vert, &glsl_symbols);
+        let geom = geom.map(|source| shader::preprocess(&source, &glsl_symbols));
         let frag = shader::preprocess(&frag, &glsl_symbols);
-        let varyings = shader::varying_map(&vert, &frag, &combos);
-        let mut vertex = shader::translate_with(&vert, Stage::Vertex, &combos, Some(&varyings));
-        let mut fragment = shader::translate_with(&frag, Stage::Fragment, &combos, Some(&varyings));
-        shader::unify_uniforms(&mut vertex, &mut fragment);
+        let (inputs, outputs) = geom
+            .as_deref()
+            .map_or_else(|| (String::new(), String::new()), shader::geometry_interfaces);
+        let vertex_varyings =
+            shader::varying_map(&vert, if geom.is_some() { &inputs } else { &frag }, &combos);
+        let fragment_varyings =
+            shader::varying_map(if geom.is_some() { &outputs } else { &vert }, &frag, &combos);
+        let mut vertex =
+            shader::translate_with(&vert, Stage::Vertex, &combos, Some(&vertex_varyings));
+        let mut geometry = geom
+            .as_deref()
+            .map(|source| {
+                shader::translate_geometry(source, &combos, &vertex_varyings, &fragment_varyings)
+            })
+            .transpose()
+            .ok()?;
+        let mut fragment =
+            shader::translate_with(&frag, Stage::Fragment, &combos, Some(&fragment_varyings));
+        let hlsl_available = geometry.is_none()
+            && !crate::hlsl::fragment_indexes_varying_arrays_dynamically(&frag_hlsl, &combos)
+            && crate::hlsl::varying_slots(&vert_hlsl, &frag_hlsl, &combos)
+                <= crate::hlsl::MAX_VARYING_SLOTS;
+        let present = textures.iter().map(Option::is_some).collect::<Vec<_>>();
+        shader::omit_unused_samplers(
+            &mut vertex,
+            &combos,
+            &present,
+            hlsl_available.then_some(vert_hlsl.as_str()),
+        );
+        shader::omit_unused_samplers(
+            &mut fragment,
+            &combos,
+            &present,
+            hlsl_available.then_some(frag_hlsl.as_str()),
+        );
+        if let Some(stage) = geometry.as_mut() {
+            shader::omit_unused_samplers(stage, &combos, &present, None);
+            shader::unify_uniform_stages(&mut [&mut vertex, stage, &mut fragment]);
+        } else {
+            shader::unify_uniforms(&mut vertex, &mut fragment);
+        }
         let mut sampler_union = vertex.samplers.clone();
-        for sampler in &fragment.samplers {
+        for sampler in geometry.iter().flat_map(|stage| &stage.samplers).chain(&fragment.samplers) {
             if !sampler_union.iter().any(|known| known.name == sampler.name) {
                 sampler_union.push(sampler.clone());
             }
         }
-        let hlsl = (!crate::hlsl::fragment_indexes_varying_arrays_dynamically(&frag_hlsl)
-            && crate::hlsl::varying_slots(&vert_hlsl) <= crate::hlsl::MAX_VARYING_SLOTS)
-            .then(|| {
-                crate::hlsl::rewrite(
-                    &vert_hlsl,
-                    &frag_hlsl,
-                    &combos,
-                    &vertex.uniforms,
-                    &sampler_union,
-                )
-            });
-        let values = resolve_material_names(&values, &fragment.uniforms);
-        for (slot, name) in names.iter().enumerate().skip(1) {
+        let hlsl = hlsl_available.then(|| {
+            crate::hlsl::rewrite(&vert_hlsl, &frag_hlsl, &combos, &vertex.uniforms, &sampler_union)
+        });
+        let uniforms = fragment
+            .uniforms
+            .iter()
+            .map(|uniform| (uniform.name.as_str(), uniform.material.as_deref()));
+        let overrides = overrides.and_then(Value::as_array).and_then(|passes| passes.get(index));
+        let mut values = material_values(pass, overrides, assets, &uniforms);
+        let user_uniforms =
+            user_values(pass, overrides, &assets.properties, &uniforms).into_keys().collect();
+        values.extend(assets.context.lighting.values.clone());
+        for uniform in &fragment.uniforms {
+            if let Some(value) = assets.context.fog.uniform(&uniform.name) {
+                values.insert(uniform.name.clone(), value);
+            }
+        }
+        for (slot, name) in names.iter().enumerate() {
             let Some(name) = name else {
                 continue;
             };
-            if !name.starts_with("_rt_") {
+            if !name.starts_with(RENDER_TARGET_PREFIX) {
                 continue;
             }
-            self_binds.push((slot, EffectBind::parse(name, own_id)));
+            let binding = EffectBind::parse(name, own_id);
+            if slot != 0 || matches!(binding, EffectBind::SceneHistory | EffectBind::Reflection) {
+                self_binds.push((slot, binding));
+            }
         }
         out.push(EffectPass {
+            blend: PassBlend::parse(pass.get(BLENDING_FIELD).and_then(Value::as_str))?,
             property_source: property_source.filter(|_| index == 0),
+            user_uniforms,
             name: shader_name.to_string(),
             vertex,
+            geometry,
             fragment,
             hlsl,
             textures,
@@ -907,15 +1638,8 @@ impl FrameClock {
 
 #[must_use]
 pub fn daytime_now() -> f32 {
-    let mut spec = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut spec) } != 0 {
-        return 0.0;
-    }
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&raw const spec.tv_sec, &raw mut tm) }.is_null() {
-        return 0.0;
-    }
-    daytime(tm.tm_hour, tm.tm_min, tm.tm_sec, (spec.tv_nsec / 1_000_000) as i32)
+    paper_runtime::clock::local_now()
+        .map_or(0.0, |now| daytime(now.hour, now.minute, now.second, now.millisecond))
 }
 
 #[must_use]
@@ -926,8 +1650,202 @@ pub fn daytime(hour: i32, minute: i32, second: i32, millisecond: i32) -> f32 {
         + f64::from(millisecond) / 86_400_000.0) as f32
 }
 
+const REDUCTION_SCALE_UNIFORM: &str = "g_TextureReductionScale";
+const SCREEN_UNIFORM: &str = "g_Screen";
+const ALPHA_UNIFORM: &str = "g_Alpha";
+const USER_ALPHA_UNIFORM: &str = "g_UserAlpha";
+const BRIGHTNESS_UNIFORM: &str = "g_Brightness";
+const COLOR_UNIFORM: &str = "g_Color";
+const TEXEL_UNIFORM: &str = "g_TexelSize";
+const TEXEL_HALF_UNIFORM: &str = "g_TexelSizeHalf";
+const EFFECT_MVP_UNIFORM: &str = "g_EffectModelViewProjectionMatrix";
+const EFFECT_MVP_INVERSE_UNIFORM: &str = "g_EffectModelViewProjectionMatrixInverse";
+const MVP_UNIFORM: &str = "g_ModelViewProjectionMatrix";
+const MVP_INVERSE_UNIFORM: &str = "g_ModelViewProjectionMatrixInverse";
+const VIEW_PROJECTION_UNIFORM: &str = "g_ViewProjectionMatrix";
+const RESOLUTION_UNIFORM: &str = "g_Resolution";
+const MAT4_LANES: usize = 16;
+const CENTER: [f32; 2] = [0.5; 2];
+const RELEASED: [f32; 4] = [0.0; 4];
+const UNIT: [f32; 1] = [1.0];
+const WHITE: [f32; 3] = [1.0; 3];
+const OPAQUE: [f32; 4] = [1.0; 4];
+const ALIASED_ARRAYS: [&str; 7] = [
+    AUDIO_PREFIX,
+    crate::model::lighting::UNIFORM_PREFIX,
+    crate::model::lighting::SHADOW_PREFIX,
+    crate::model::lighting::SHADOW_FEATURE_PREFIX,
+    crate::model::lighting::spot::PREFIX,
+    crate::model::lighting::directional::PREFIX,
+    crate::model::lighting::LEGACY_UNIFORM_PREFIX,
+];
+
+struct FrameShape {
+    clock: FrameClock,
+    quad: Option<(u32, u32)>,
+    width: u32,
+    height: u32,
+    screen: (u32, u32),
+    d3d_clip: bool,
+}
+
+struct FrameUniforms<'a> {
+    meta: &'a PassMeta,
+    clock: [[f32; 1]; 3],
+    screen: [f32; 3],
+    texel: [f32; 2],
+    texel_half: [f32; 2],
+    projection: Option<[[f32; MAT4_LANES]; 2]>,
+    view_projection: [f32; MAT4_LANES],
+    resolution: [f32; 4],
+    slots: [[f32; 4]; MAX_TEXTURE_SLOTS as usize],
+}
+
+impl<'a> FrameUniforms<'a> {
+    fn new(meta: &'a PassMeta, shape: &FrameShape, slot_sizes: &[Option<[f32; 4]>]) -> Self {
+        let (sw, sh) = (shape.screen.0.max(1) as f32, shape.screen.1.max(1) as f32);
+        let (w, h) = (shape.width as f32, shape.height as f32);
+        let ys = if shape.d3d_clip { 1.0 } else { -1.0 };
+        let projection = shape.quad.map(|(quad_w, quad_h)| {
+            let (qw, qh) = (quad_w.max(1) as f32, quad_h.max(1) as f32);
+            [
+                [
+                    2.0 / qw,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    ys * 2.0 / qh,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    -1.0,
+                    -ys,
+                    0.0,
+                    1.0,
+                ],
+                [
+                    qw / 2.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    ys * qh / 2.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    qw / 2.0,
+                    qh / 2.0,
+                    0.0,
+                    1.0,
+                ],
+            ]
+        });
+        Self {
+            meta,
+            clock: [[shape.clock.time], [shape.clock.dt], [shape.clock.daytime]],
+            screen: [sw, sh, sw / sh],
+            texel: [1.0 / sw, 1.0 / sh],
+            texel_half: [0.5 / sw, 0.5 / sh],
+            projection,
+            view_projection: [
+                2.0 / sw,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                ys * 2.0 / sh,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -1.0,
+                -ys,
+                0.5,
+                1.0,
+            ],
+            resolution: [w, h, 1.0 / w.max(1.0), 1.0 / h.max(1.0)],
+            slots: std::array::from_fn(|slot| {
+                slot_sizes
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .or_else(|| meta.resolutions.get(slot).copied().flatten())
+                    .unwrap_or([w, h, w, h])
+            }),
+        }
+    }
+
+    fn value<'b>(
+        &'b self,
+        key: &str,
+        overrides: &'b BTreeMap<String, Vec<f32>>,
+    ) -> Option<&'b [f32]> {
+        if let Some(value) = overrides.get(key) {
+            return Some(value);
+        }
+        match texture_uniform(key) {
+            Some((slot, TEXTURE_RESOLUTION)) => Some(&self.slots[slot]),
+            Some((_, TEXTURE_ROTATION)) => Some(self.derived(key).unwrap_or(&IDENTITY_ROTATION)),
+            Some((_, TEXTURE_TRANSLATION)) => Some(self.derived(key).unwrap_or(&ZERO_TRANSLATION)),
+            _ => self.derived(key),
+        }
+    }
+
+    fn derived(&self, key: &str) -> Option<&[f32]> {
+        match key {
+            RESOLUTION_UNIFORM => Some(&self.resolution),
+            VIEW_PROJECTION_UNIFORM => Some(self.projected(key).unwrap_or(&self.view_projection)),
+            _ => self.projected(key),
+        }
+    }
+
+    fn projected(&self, key: &str) -> Option<&[f32]> {
+        match (key, &self.projection) {
+            (EFFECT_MVP_UNIFORM | MVP_UNIFORM, Some([mvp, _])) => Some(mvp),
+            (EFFECT_MVP_INVERSE_UNIFORM | MVP_INVERSE_UNIFORM, Some([_, inverse])) => Some(inverse),
+            (TEXEL_UNIFORM, _) => Some(&self.texel),
+            (TEXEL_HALF_UNIFORM, _) => Some(&self.texel_half),
+            _ => self.clocked(key),
+        }
+    }
+
+    fn clocked(&self, key: &str) -> Option<&[f32]> {
+        let [time, dt, daytime] = &self.clock;
+        match key {
+            TIME_UNIFORM => Some(time),
+            FRAME_TIME_UNIFORM => Some(dt),
+            DAY_TIME_UNIFORM => Some(daytime),
+            PARALLAX_UNIFORM | POINTER_UNIFORM | LAST_POINTER_UNIFORM => Some(&CENTER),
+            POINTER_STATE_UNIFORM => Some(&RELEASED),
+            _ => self.meta.constants.get(key).map(Vec::as_slice).or_else(|| self.fallback(key)),
+        }
+    }
+
+    fn fallback(&self, key: &str) -> Option<&[f32]> {
+        match key {
+            REDUCTION_SCALE_UNIFORM | ALPHA_UNIFORM | USER_ALPHA_UNIFORM | BRIGHTNESS_UNIFORM => {
+                Some(&UNIT)
+            }
+            SCREEN_UNIFORM => Some(&self.screen),
+            COLOR_UNIFORM => Some(&WHITE),
+            SOURCE_COLOR_UNIFORM => Some(&OPAQUE),
+            _ => None,
+        }
+    }
+}
+
 pub struct PassMeta {
     property_source: Option<(usize, usize)>,
+    user_uniforms: BTreeSet<String>,
     pub name: String,
     uniforms: Vec<crate::shader::Uniform>,
     constants: BTreeMap<String, Vec<f32>>,
@@ -936,6 +1854,10 @@ pub struct PassMeta {
 }
 
 impl PassMeta {
+    pub fn source(&self) -> Option<(usize, usize)> {
+        self.property_source
+    }
+
     pub fn apply_object_values(&mut self, object: &Value, props: &BTreeMap<String, Vec<f32>>) {
         if let Some((effect, pass)) = self.property_source
             && let Some(values) = object
@@ -943,15 +1865,45 @@ impl PassMeta {
                 .and_then(|effects| effects.get(effect))
                 .and_then(|effect| effect.get("passes"))
                 .and_then(|passes| passes.get(pass))
-                .and_then(|pass| pass.get("constantshadervalues"))
+                .and_then(|pass| pass.get(CONSTANT_SHADER_VALUES))
         {
-            self.apply_script_values(values, props);
+            let values = constants_of(Some(values), props);
+            self.constants.extend(
+                resolve_material_names(
+                    &values,
+                    self.uniforms
+                        .iter()
+                        .map(|uniform| (uniform.name.as_str(), uniform.material.as_deref())),
+                )
+                .into_iter()
+                .filter(|(name, _)| !self.user_uniforms.contains(name)),
+            );
         }
     }
 
-    pub fn apply_script_values(&mut self, values: &Value, props: &BTreeMap<String, Vec<f32>>) {
+    pub fn apply_script_values(
+        &mut self,
+        values: &Value,
+        props: &BTreeMap<String, Vec<f32>>,
+    ) -> BTreeMap<String, Vec<f32>> {
         let values = constants_of(Some(values), props);
-        self.constants.extend(resolve_material_names(&values, &self.uniforms));
+        let mut resolved = values.clone();
+        resolved.extend(resolve_material_names(
+            &values,
+            self.uniforms
+                .iter()
+                .map(|uniform| (uniform.name.as_str(), uniform.material.as_deref())),
+        ));
+        self.constants.extend(resolved.clone());
+        resolved
+    }
+
+    pub fn apply_resolved_values(&mut self, values: &BTreeMap<String, Vec<f32>>) {
+        self.constants.extend(values.clone());
+    }
+
+    pub fn set_source_tint(&mut self, color: [f32; 4]) {
+        self.constants.insert(SOURCE_COLOR_UNIFORM.into(), color.to_vec());
     }
 
     #[must_use]
@@ -972,16 +1924,24 @@ impl PassMeta {
             .collect();
         Self {
             property_source: pass.property_source,
+            user_uniforms: pass.user_uniforms.clone(),
             name: pass.name.clone(),
             uniforms: pass.fragment.uniforms.clone(),
             constants: pass.values.clone(),
             resolutions,
-            ndc: !pass
-                .vertex
-                .uniforms
-                .iter()
-                .any(|uniform| uniform.name == "g_ModelViewProjectionMatrix"),
+            ndc: !pass.vertex.uniforms.iter().any(|uniform| uniform.name == MVP_UNIFORM),
         }
+    }
+
+    pub fn matrix_offset(&self, name: &str) -> Option<usize> {
+        self.uniforms
+            .iter()
+            .find(|uniform| {
+                uniform.name == name
+                    && uniform.kind == crate::shader::UniformKind::Mat4
+                    && uniform.count == 1
+            })
+            .map(|uniform| uniform.offset)
     }
 
     #[must_use]
@@ -991,24 +1951,16 @@ impl PassMeta {
 
     #[must_use]
     pub fn time_dependent(&self) -> bool {
-        self.uniforms.iter().any(|uniform| uniform.name == "g_Time")
+        self.uniforms.iter().any(|uniform| frame_input(&uniform.name) == Some(FrameInput::Time))
     }
 
     #[must_use]
     pub fn pointer_dependent(&self) -> bool {
-        self.uniforms.iter().any(|uniform| {
-            matches!(
-                uniform.name.as_str(),
-                "g_PointerPosition"
-                    | "g_PointerPositionLast"
-                    | "g_PointerState"
-                    | "g_ParallaxPosition"
-            )
-        })
+        self.uniforms.iter().any(|uniform| frame_input(&uniform.name) == Some(FrameInput::Pointer))
     }
 
     pub fn audio_dependent(&self) -> bool {
-        self.uniforms.iter().any(|uniform| uniform.name.starts_with(AUDIO_PREFIX))
+        self.uniforms.iter().any(|uniform| frame_input(&uniform.name) == Some(FrameInput::Audio))
     }
 
     #[must_use]
@@ -1046,122 +1998,15 @@ impl PassMeta {
         overrides: &BTreeMap<String, Vec<f32>>,
         d3d_clip: bool,
     ) -> Vec<u8> {
-        let mut values = self.constants.clone();
-        values.insert("g_Time".into(), vec![clock.time]);
-        values.insert("g_Frametime".into(), vec![clock.dt]);
-        values.insert("g_Daytime".into(), vec![clock.daytime]);
-        values.insert("g_ParallaxPosition".into(), vec![0.5, 0.5]);
-        values.insert("g_PointerPosition".into(), vec![0.5, 0.5]);
-        values.insert("g_PointerPositionLast".into(), vec![0.5, 0.5]);
-        values.insert("g_PointerState".into(), vec![0.0, 0.0, 0.0, 0.0]);
-        values.entry("g_TextureReductionScale".into()).or_insert_with(|| vec![1.0]);
-        let (sw, sh) = (screen.0.max(1) as f32, screen.1.max(1) as f32);
-        values.entry("g_Screen".into()).or_insert_with(|| vec![sw, sh, sw / sh]);
-        values.entry("g_Alpha".into()).or_insert_with(|| vec![1.0]);
-        values.entry("g_UserAlpha".into()).or_insert_with(|| vec![1.0]);
-        values.entry("g_Brightness".into()).or_insert_with(|| vec![1.0]);
-        values.entry("g_Color".into()).or_insert_with(|| vec![1.0, 1.0, 1.0]);
-        values.entry("g_Color4".into()).or_insert_with(|| vec![1.0, 1.0, 1.0, 1.0]);
-        values.entry("g_Texture0Rotation".into()).or_insert_with(|| vec![1.0, 0.0, 0.0, 1.0]);
-        values.entry("g_Texture0Translation".into()).or_insert_with(|| vec![0.0, 0.0]);
-        values.insert("g_TexelSize".into(), vec![1.0 / sw, 1.0 / sh]);
-        values.insert("g_TexelSizeHalf".into(), vec![0.5 / sw, 0.5 / sh]);
-        let ys = if d3d_clip { 1.0 } else { -1.0 };
-        let projection = if let Some((quad_w, quad_h)) = quad {
-            let (qw, qh) = ((quad_w.max(1)) as f32, (quad_h.max(1)) as f32);
-            Some((
-                vec![
-                    2.0 / qw,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    ys * 2.0 / qh,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    1.0,
-                    0.0,
-                    -1.0,
-                    -ys,
-                    0.0,
-                    1.0,
-                ],
-                vec![
-                    qw / 2.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    ys * qh / 2.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    1.0,
-                    0.0,
-                    qw / 2.0,
-                    qh / 2.0,
-                    0.0,
-                    1.0,
-                ],
-            ))
-        } else {
-            None
-        };
-        if let Some((mvp, inverse)) = projection {
-            values.insert("g_EffectModelViewProjectionMatrix".into(), mvp.clone());
-            values.insert("g_EffectModelViewProjectionMatrixInverse".into(), inverse.clone());
-            values.insert("g_ModelViewProjectionMatrix".into(), mvp);
-            values.insert("g_ModelViewProjectionMatrixInverse".into(), inverse);
-        }
-        values.entry("g_ViewProjectionMatrix".into()).or_insert_with(|| {
-            vec![
-                2.0 / sw,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                ys * 2.0 / sh,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                -1.0,
-                -ys,
-                0.5,
-                1.0,
-            ]
-        });
-        let (w, h) = (width as f32, height as f32);
-        values.insert("g_Resolution".into(), vec![w, h, 1.0 / w.max(1.0), 1.0 / h.max(1.0)]);
-        for slot in 0..8 {
-            let res = slot_sizes
-                .get(slot)
-                .copied()
-                .flatten()
-                .or_else(|| self.resolutions.get(slot).copied().flatten())
-                .unwrap_or([w, h, w, h]);
-            values.insert(format!("g_Texture{slot}Resolution"), res.to_vec());
-        }
-        for (name, value) in overrides {
-            values.insert(name.clone(), value.clone());
-        }
-        for uniform in &self.uniforms {
-            let Some((base, _)) = uniform.name.split_once('[') else {
-                continue;
-            };
-            if !base.starts_with(AUDIO_PREFIX) {
-                continue;
-            }
-            if let Some(bands) = overrides.get(base) {
-                values.insert(uniform.name.clone(), bands.clone());
-            }
-        }
-        crate::shader::pack_uniforms(&self.uniforms, &values)
+        let shape = FrameShape { clock, quad, width, height, screen, d3d_clip };
+        let frame = FrameUniforms::new(self, &shape, slot_sizes);
+        crate::shader::pack_with(&self.uniforms, |name| {
+            name.split_once('[')
+                .map(|(base, _)| base)
+                .filter(|base| ALIASED_ARRAYS.iter().any(|prefix| base.starts_with(prefix)))
+                .and_then(|base| frame.value(base, overrides))
+                .or_else(|| frame.value(name, overrides))
+        })
     }
 }
 
@@ -1204,7 +2049,27 @@ pub fn builtin_effect(file: &str) -> Option<Value> {
     }
 }
 
-pub fn load_effects(pkg: &Package, assets: &Assets, object: &Value) -> (Vec<Effect>, Vec<String>) {
+pub(crate) fn definition(
+    pkg: &Package,
+    assets: &Assets,
+    file: &str,
+    entry: &Value,
+) -> Option<Value> {
+    pkg.find_json(file).ok().flatten().or_else(|| {
+        assets
+            .read(file)
+            .and_then(|text| crate::json::parse(text.as_bytes()).ok())
+            .or_else(|| builtin_effect(file))
+            .or_else(|| crate::model::hdr::definition(file, entry))
+    })
+}
+
+pub fn load_effects(
+    pkg: &Package,
+    assets: &Assets,
+    object: &Value,
+    retain_hidden: bool,
+) -> (Vec<Effect>, Vec<String>) {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     let Some(entries) = object.get("effects").and_then(Value::as_array) else {
@@ -1219,122 +2084,164 @@ pub fn load_effects(pkg: &Package, assets: &Assets, object: &Value) -> (Vec<Effe
         let Some(file) = entry.get("file").and_then(Value::as_str) else {
             continue;
         };
-        if !is_visible(entry.get("visible"), &assets.properties) {
+        let visible = is_visible(entry.get(VISIBLE_FIELD), &assets.properties);
+        if !visible && !retain_hidden {
             continue;
         }
         let name = file.rsplit('/').nth(1).unwrap_or(file).to_string();
-        let definition = match pkg.find_json(file) {
-            Ok(Some(value)) => Some(value),
-            _ => assets
-                .read(file)
-                .and_then(|text| crate::json::parse(text.as_bytes()).ok())
-                .or_else(|| builtin_effect(file)),
-        };
-        let Some(definition) = definition else {
-            skipped.push(format!("{name}: effect json missing"));
-            continue;
-        };
-        let Some(defs) = definition.get("passes").and_then(Value::as_array) else {
-            skipped.push(format!("{name}: no passes"));
-            continue;
-        };
-        let overrides = entry.get("passes");
-        let combos = instance_combos(pkg, assets, defs, overrides);
-        let mut passes = Vec::new();
-        let mut swaps = Vec::new();
-        let mut failed = false;
-        for (index, def) in defs.iter().enumerate() {
-            if !conditions_hold(def.get("conditions"), &combos) {
-                continue;
-            }
-            let Some(material) = def.get("material").and_then(Value::as_str) else {
-                if def.get("command").and_then(Value::as_str) == Some("swap") {
-                    if let (Some(source), Some(target)) = (
-                        def.get("source").and_then(Value::as_str),
-                        def.get("target").and_then(Value::as_str),
-                    ) {
-                        swaps.push(Swap {
-                            after_pass: passes.len().checked_sub(1),
-                            source: source.to_string(),
-                            target: target.to_string(),
-                        });
-                    } else {
-                        skipped.push(format!("{name}: pass {index} swap incomplete"));
-                    }
+        let skipped_offset = skipped.len();
+        let loaded = 'load_effect: {
+            let Some(definition) = definition(pkg, assets, file, entry) else {
+                skipped.push(format!("{name}: effect json missing"));
+                break 'load_effect None;
+            };
+            let Some(defs) = definition.get("passes").and_then(Value::as_array) else {
+                skipped.push(format!("{name}: no passes"));
+                break 'load_effect None;
+            };
+            let effect_assets = assets.with_effect(file);
+            let overrides = entry.get("passes");
+            let combos = instance_combos(pkg, &effect_assets, defs, overrides);
+            let mut fbos: Vec<Fbo> = definition
+                .get("fbos")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| conditions_hold(entry.get("conditions"), &combos))
+                        .filter_map(|entry| parse_fbo(entry, &mut skipped, &name))
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::model::hdr::configure_targets(file, &mut fbos);
+            let mut clear_functions = clear_functions(&definition);
+            clear_functions.retain(|_, names| {
+                names.iter().all(|name| fbos.iter().any(|fbo| fbo.name.as_str() == name.as_str()))
+            });
+            let mut passes = Vec::new();
+            let mut swaps = Vec::new();
+            let mut failed = false;
+            for (index, def) in defs.iter().enumerate() {
+                if !conditions_hold(def.get("conditions"), &combos) {
                     continue;
                 }
-                match build_copy_pass(pkg, assets, def, own_id) {
-                    Some(built) => passes.extend(built),
-                    None if def.get("command").is_some() => {
-                        skipped.push(format!("{name}: pass {index} command unsupported"));
+                let Some(material) = def.get("material").and_then(Value::as_str) else {
+                    if def.get("command").and_then(Value::as_str) == Some("swap") {
+                        if let (Some(source), Some(target)) = (
+                            def.get("source").and_then(Value::as_str),
+                            def.get("target").and_then(Value::as_str),
+                        ) {
+                            swaps.push(Swap {
+                                after_pass: passes.len().checked_sub(1),
+                                source: source.to_string(),
+                                target: target.to_string(),
+                            });
+                        } else {
+                            skipped.push(format!("{name}: pass {index} swap incomplete"));
+                        }
+                        continue;
                     }
-                    None => {}
-                }
-                continue;
-            };
-            let slot_override = overrides
-                .and_then(Value::as_array)
-                .and_then(|arr| arr.get(index))
-                .map(|value| Value::Array(vec![value.clone()]));
-            if let Some(mut built) = build_pass(
-                pkg,
-                assets,
-                material,
-                slot_override.as_ref(),
-                own_id,
-                (effect_index, index),
-            ) {
-                let target = def.get("target").and_then(Value::as_str).map(str::to_string);
-                let binds: Vec<(usize, EffectBind)> = def
-                    .get("bind")
+                    match build_copy_pass(pkg, &effect_assets, def, own_id) {
+                        Some(built) => passes.extend(built),
+                        None if def.get("command").is_some() => {
+                            skipped.push(format!("{name}: pass {index} command unsupported"));
+                        }
+                        None => {}
+                    }
+                    continue;
+                };
+                let slot_override = overrides
                     .and_then(Value::as_array)
-                    .map(|entries| {
-                        entries
-                            .iter()
-                            .filter_map(|entry| {
-                                if !conditions_hold(entry.get("conditions"), &combos) {
-                                    return None;
-                                }
-                                let name = entry.get("name").and_then(Value::as_str)?;
-                                let index = entry.get("index").and_then(Value::as_u64)?;
-                                Some((
-                                    usize::try_from(index).ok()?,
-                                    EffectBind::parse(name, own_id),
-                                ))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if let Some(last) = built.last_mut() {
-                    last.target = target;
-                    last.binds.extend(binds);
-                    dedupe_binds(&mut last.binds);
+                    .and_then(|arr| arr.get(index))
+                    .map(|value| Value::Array(vec![value.clone()]));
+                if let Some(mut built) = build_pass(
+                    pkg,
+                    &effect_assets,
+                    material,
+                    slot_override.as_ref(),
+                    own_id,
+                    (effect_index, index),
+                ) {
+                    if let Some(first) = built.first_mut() {
+                        crate::model::hdr::configure_pass(file, entry, index, first);
+                    }
+                    let target = def.get("target").and_then(Value::as_str).map(str::to_string);
+                    let binds: Vec<(usize, EffectBind)> = def
+                        .get("bind")
+                        .and_then(Value::as_array)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter_map(|entry| {
+                                    if !conditions_hold(entry.get("conditions"), &combos) {
+                                        return None;
+                                    }
+                                    let name = entry.get("name").and_then(Value::as_str)?;
+                                    let index = entry.get("index").and_then(Value::as_u64)?;
+                                    Some((
+                                        usize::try_from(index).ok()?,
+                                        if crate::effect_lifetime::resolve_fbo_index(
+                                            fbos.iter().map(|fbo| fbo.name.as_str()),
+                                            name,
+                                        )
+                                        .is_some()
+                                        {
+                                            EffectBind::Named(name.to_string())
+                                        } else {
+                                            EffectBind::Previous
+                                        },
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(last) = built.last_mut() {
+                        last.target = target;
+                        last.binds.extend(binds);
+                        dedupe_binds(&mut last.binds);
+                    }
+                    passes.extend(built);
+                } else {
+                    failed = true;
+                    skipped.push(format!("{name}: pass {index} ({material}) unavailable"));
+                    break;
                 }
-                passes.extend(built);
-            } else {
-                failed = true;
-                skipped.push(format!("{name}: pass {index} ({material}) unavailable"));
-                break;
             }
-        }
-        if failed || passes.is_empty() {
-            continue;
-        }
-        let fbos: Vec<Fbo> = definition
-            .get("fbos")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|entry| conditions_hold(entry.get("conditions"), &combos))
-                    .filter_map(|entry| parse_fbo(entry, &mut skipped, &name))
-                    .collect()
+            if failed || passes.is_empty() {
+                break 'load_effect None;
+            }
+            Some(Effect {
+                state: EffectState { source: Some(effect_index), visible, available: true },
+                name: name.clone(),
+                passes,
+                fbos,
+                swaps,
+                clear_functions,
             })
-            .unwrap_or_default();
-        out.push(Effect { name, passes, fbos, swaps });
+        };
+        if !visible && loaded.is_none() && !assets.has_custom_shaders() {
+            let reasons = skipped.split_off(skipped_offset);
+            tracing::warn!(effect = effect_index, %name, ?reasons, "hidden effect unavailable");
+            out.push(Effect {
+                state: EffectState { source: Some(effect_index), visible, available: false },
+                name,
+                passes: Vec::new(),
+                fbos: Vec::new(),
+                swaps: Vec::new(),
+                clear_functions: BTreeMap::new(),
+            });
+        } else if let Some(effect) = loaded {
+            out.push(effect);
+        }
     }
     (out, skipped)
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod uniform_tests;
+
+#[cfg(test)]
+mod projection_tests;

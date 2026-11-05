@@ -1,5 +1,5 @@
 use crate::gated::wants_pipeline;
-use crate::mixer::{SceneMixer, Voice, VoiceOp};
+use crate::mixer::{SceneConfig, SceneMixer, Voice, VoiceOp};
 
 pub struct GatedScene {
     voices: Vec<Voice>,
@@ -8,11 +8,14 @@ pub struct GatedScene {
     paused: bool,
     ducked: bool,
     mixer: Option<SceneMixer>,
+    wake: Option<paper_runtime::wake::Pipe>,
+    tap: Option<crate::spectrum::PlaybackTap>,
 }
 
 impl GatedScene {
     #[must_use]
-    pub fn new(voices: Vec<Voice>, mute: bool, volume: u32) -> Self {
+    pub fn new(voices: Vec<Voice>, config: SceneConfig) -> Self {
+        let SceneConfig { mute, volume, wake, tap } = config;
         let mut gated = Self {
             voices,
             mute,
@@ -20,6 +23,8 @@ impl GatedScene {
             paused: false,
             ducked: false,
             mixer: None,
+            wake,
+            tap,
         };
         gated.sync();
         gated
@@ -32,10 +37,16 @@ impl GatedScene {
             mixer.set_volume(self.volume);
             return;
         }
-        if inaudible || self.voices.is_empty() {
+        if inaudible || self.paused || self.voices.is_empty() {
             return;
         }
-        match SceneMixer::new(&self.voices, self.mute, self.volume) {
+        let config = SceneConfig {
+            mute: self.mute,
+            volume: self.volume,
+            wake: self.wake.clone(),
+            tap: self.tap.clone(),
+        };
+        match SceneMixer::new(&self.voices, config) {
             Ok(Some(mixer)) => {
                 mixer.set_pause(self.paused);
                 tracing::info!(voices = mixer.voice_count(), "scene mixer started");
@@ -43,6 +54,12 @@ impl GatedScene {
             }
             Ok(None) => tracing::info!("scene declares no decodable audio"),
             Err(error) => tracing::info!("scene audio unavailable: {error:?}"),
+        }
+    }
+
+    pub fn poll(&self) {
+        if let Some(mixer) = &self.mixer {
+            mixer.poll();
         }
     }
 
@@ -71,6 +88,9 @@ impl GatedScene {
         if let Some(mixer) = &self.mixer {
             mixer.set_pause(paused);
         }
+        if !paused {
+            self.sync();
+        }
     }
 
     pub fn voice(&mut self, id: &str, op: VoiceOp) -> bool {
@@ -94,14 +114,23 @@ impl GatedScene {
     pub fn voice_playing(&self, id: &str) -> bool {
         match &self.mixer {
             Some(mixer) => mixer.voice_playing(id),
-            None => self.voices.iter().any(|voice| voice.id == id && voice.autostart),
+            None if self.ducked || !wants_pipeline(self.mute, self.volume) => {
+                self.voices.iter().any(|voice| voice.id == id && voice.autostart)
+            }
+            None => false,
         }
     }
 
-    pub fn swap(&mut self, voices: Vec<Voice>, mute: bool, volume: u32) {
+    pub fn voice_states(&self) -> Vec<(String, bool)> {
+        self.voices.iter().map(|voice| (voice.id.clone(), self.voice_playing(&voice.id))).collect()
+    }
+
+    pub fn swap(&mut self, voices: Vec<Voice>, config: SceneConfig) {
         self.voices = voices;
-        self.mute = mute;
-        self.volume = volume.min(100);
+        self.mute = config.mute;
+        self.volume = config.volume.min(100);
+        self.wake = config.wake;
+        self.tap = config.tap;
         self.mixer = None;
         self.sync();
     }

@@ -135,7 +135,7 @@ jobs:
         id: tests
         if: steps.release.outcome == 'success'
         continue-on-error: true
-        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.tests --out ci-artifacts/results/paper-tests.json -- cargo test --locked --release --workspace
+        run: python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.tests --out ci-artifacts/results/paper-tests.json -- cargo test --locked --release --workspace --no-fail-fast
 
       - name: Release executable contract
         if: steps.release.outcome == 'success'
@@ -144,7 +144,7 @@ jobs:
           python3 "$SKWD_VERIFY_ROOT/scripts/ci-report.py" wrap --suite paper.executables
           --out ci-artifacts/results/paper-executables.json --
           bash -euo pipefail -c
-          'test -x target/release/skwd-paper && test -x target/release/skwd-paper-tinier && test -x target/release/skwd-wall-vk && test -x target/release/skwd-wall-still'
+          'test -x target/release/skwd-paper && test -x target/release/skwd-wall-vk && test -x target/release/skwd-wall-still'
 
       - name: Real release package stage
         if: steps.release.outcome == 'success'

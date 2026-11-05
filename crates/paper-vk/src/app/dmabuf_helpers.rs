@@ -39,7 +39,16 @@ fn open_present_decoder(
     {
         return Ok(decode::AnyDecoder::Still(decoder));
     }
-    open_decoder(path, Some(hwdev), vulkan_decode, render_node, force_software)
+    open_decoder(
+        &decode::HardwareDecode {
+            path,
+            logical: path,
+            hwdev: Some(hwdev),
+            vulkan_decode,
+            render_node,
+        },
+        force_software,
+    )
 }
 
 pub(super) fn init_free_buffers(target: &mut wayland::Target, n_exports: usize) {
@@ -151,6 +160,7 @@ pub(super) fn begin_swap(
     });
     PendingSwap {
         req: ctl::SwapReq {
+            drawing: req.drawing.clone(),
             to: req.to.clone(),
             duration_ms: req.duration_ms,
             shader: req.shader.clone(),
@@ -353,6 +363,11 @@ pub(super) fn complete_swap(
     let done = fade.take().unwrap();
     *still = done.still_b;
     for rend in renderers.iter_mut() {
+        if done.drawing.is_some()
+            && let Some(effect) = done.effect
+        {
+            let _ = rend.retire_effect(effect);
+        }
         let _ = rend.retire_plane_views();
     }
     if let Some(sl) = sw_a.take() {
@@ -454,26 +469,31 @@ pub(super) fn create_buffers(
     exports: &[impl AsRef<[vk::ExportImage]>],
     ridx: &[usize],
 ) -> Result<Vec<Vec<wayland_client::protocol::wl_buffer::WlBuffer>>> {
-    let mut buffers = Vec::with_capacity(dims.len());
+    let mut buffers: Vec<Vec<wayland_client::protocol::wl_buffer::WlBuffer>> =
+        Vec::with_capacity(dims.len());
     for (si, &(w, h)) in dims.iter().enumerate() {
-        let ring = exports[ridx[si]]
-            .as_ref()
-            .iter()
-            .enumerate()
-            .map(|(bi, exp)| {
-                target.create_dmabuf_buffer(
-                    exp.fd,
-                    w,
-                    h,
-                    exp.offset,
-                    exp.stride,
-                    exp.modifier,
-                    si,
-                    bi,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        buffers.push(ring);
+        buffers.push(Vec::with_capacity(exports[ridx[si]].as_ref().len()));
+        for (bi, exp) in exports[ridx[si]].as_ref().iter().enumerate() {
+            let allocated = target.create_dmabuf_buffer(
+                exp.fd,
+                w,
+                h,
+                exp.offset,
+                exp.stride,
+                exp.modifier,
+                si,
+                bi,
+            );
+            match allocated {
+                Ok(buffer) => buffers[si].push(buffer),
+                Err(error) => {
+                    for buffer in buffers.iter().flatten() {
+                        target.retire_scene_buffer(buffer);
+                    }
+                    return Err(error);
+                }
+            }
+        }
     }
     Ok(buffers)
 }
@@ -510,7 +530,6 @@ pub(super) fn start_swap(
     force_software: bool,
     dims: &[(u32, u32)],
     target_dims: &[(u32, u32)],
-    ctl: &mut ctl::Ctl,
 ) -> Option<FadeState> {
     let pending = begin_swap(
         req,
@@ -529,13 +548,12 @@ pub(super) fn start_swap(
         pending.cancel();
         return None;
     };
-    Some(finish_swap(pending, frame, dims, ctl))
+    Some(finish_swap(pending, frame, dims))
 }
 
 pub(super) fn poll_pending_swap(
     pending: &mut Option<PendingSwap>,
     dims: &[(u32, u32)],
-    ctl: &mut ctl::Ctl,
 ) -> Option<FadeState> {
     let received = match pending.as_ref()?.rx.try_recv() {
         Ok(frame) => Some(Ok(frame)),
@@ -547,7 +565,7 @@ pub(super) fn poll_pending_swap(
         Err(error) => Some(Err(error)),
     };
     match received? {
-        Ok(frame) => Some(finish_swap(pending.take().unwrap(), frame, dims, ctl)),
+        Ok(frame) => Some(finish_swap(pending.take().unwrap(), frame, dims)),
         Err(error) => {
             let failed = pending.take().unwrap();
             tracing::info!("skwd-wall-vk: swap staging failed for {}: {error}", failed.req.to);
@@ -561,29 +579,17 @@ fn finish_swap(
     mut pending: PendingSwap,
     SendFrame(frame, pts): SendFrame,
     dims: &[(u32, u32)],
-    ctl: &mut ctl::Ctl,
 ) -> FadeState {
     let (bw, bh) = (frame.width(), frame.height());
     let uvs_b: Vec<[f32; 4]> = dims.iter().map(|&(w, h)| mode_uv(bw, bh, w, h)).collect();
     let still_b = pending.still.load(std::sync::atomic::Ordering::Relaxed);
-    ctl.swap_audio(&pending.req.to, !still_b);
-    let shader = pending.req.shader.as_deref().map(|name| {
-        if name == "random" {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let sand = paper_shaders::SAND_STYLES.len();
-            let pick = nanos as usize % (sand + paper_shaders::EFFECTS.len());
-            if pick < sand {
-                paper_shaders::SAND_STYLES[pick]
-            } else {
-                paper_shaders::EFFECTS[pick - sand].0
-            }
-        } else {
-            name
-        }
-    });
+    let shader = pending
+        .req
+        .drawing
+        .as_ref()
+        .map(|_| paper_shaders::DRAWING_SHADER)
+        .or(pending.req.shader.as_deref())
+        .map(paper_shaders::resolve_shader);
     let style = shader.and_then(paper_shaders::sand_style_index);
     let effect = if style.is_none() { shader.and_then(paper_shaders::effect_index) } else { None };
     tracing::info!(
@@ -594,6 +600,8 @@ fn finish_swap(
         effect.map(|fx| paper_shaders::EFFECTS[fx].0)
     );
     FadeState {
+        drawing: pending.req.drawing,
+        drawing_texture: None,
         rx: pending.rx,
         abort: pending.abort,
         worker: pending.worker.take(),
@@ -648,7 +656,9 @@ pub(super) fn prepare_transition_pipelines(
     for renderer in renderers {
         if let Some(effect) = fade.effect {
             renderer.effect_pipeline(effect)?;
+            renderer.prepare_transition(effect)?;
         } else {
+            renderer.clear_transition()?;
             renderer.ensure_transition_pipelines()?;
         }
         if rgba {
@@ -726,8 +736,14 @@ pub(super) fn render_video(
     let (Some(fade), Some(t)) = (fade, fade_mix) else {
         return renderer.render_to(rt, export, &src_a, uv_a);
     };
-    let src_b =
-        rgba_b.map_or_else(|| src_of(&fade.cur.0, sw_b), |still| vk::Src::Rgba(still.texture.view));
+    let src_b = rgba_b.map_or_else(
+        || src_of(&fade.cur.0, sw_b),
+        |still| {
+            fade.drawing_texture.as_ref().map_or(vk::Src::Rgba(still.texture.view), |drawing| {
+                drawing.source(still.texture.view)
+            })
+        },
+    );
     let uv_b = rgba_b.map_or(fade.uvs[si], |still| still.uvs[si]);
     if t <= 0.0 {
         return renderer.render_to(rt, export, &src_a, uv_a);
@@ -869,4 +885,35 @@ pub(super) fn report_flips(
     );
     flip_hist.clear();
     *report = Instant::now();
+}
+
+pub(super) fn read_rgba_export(
+    renderer: &mut vk::Renderer,
+    export: &vk::ExportImage,
+    size: (u32, u32),
+) -> Result<image::RgbaImage> {
+    const PIXEL_BYTES: usize = 4;
+    let (width, height) = size;
+    let bytes = u64::from(width) * u64::from(height) * PIXEL_BYTES as u64;
+    let readback = renderer.create_readback_buf(bytes)?;
+    renderer.read_export_to(export, &readback, width, height)?;
+    let mut pixels = unsafe { std::slice::from_raw_parts(readback.ptr, bytes as usize).to_vec() };
+    for pixel in pixels.chunks_exact_mut(PIXEL_BYTES) {
+        pixel.swap(0, 2);
+    }
+    image::RgbaImage::from_raw(width, height, pixels).context("snapshot dimensions")
+}
+
+pub(super) fn finish_snapshot(
+    ctl: &mut ctl::Ctl,
+    slot: &mut Option<FrameSlot>,
+    renderer: &vk::Renderer,
+    captured: Result<()>,
+) {
+    if let Some(slot) = slot.take() {
+        slot.destroy(renderer);
+    }
+    if let Err(error) = captured {
+        crate::freeze::fail_requested(ctl, &error);
+    }
 }

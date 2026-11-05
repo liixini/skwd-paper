@@ -1,6 +1,29 @@
 use std::process::Command;
 
+const LAYER_GEOMETRY: &str = "shaders/layer_geometry.glsl";
+const SHADERS: &[(&str, &str)] = &[
+    ("shaders/fullscreen.vert", "fullscreen.vert.spv"),
+    ("shaders/nv12.frag", "nv12.frag.spv"),
+    ("shaders/rgba.frag", "rgba.frag.spv"),
+    ("shaders/layer.vert", "layer.vert.spv"),
+    ("shaders/puppet.vert", "puppet.vert.spv"),
+    ("shaders/text.vert", "text.vert.spv"),
+    ("shaders/text.frag", "text.frag.spv"),
+    ("shaders/layer.frag", "layer.frag.spv"),
+    ("shaders/sand_base.vert", "sand_base.vert.spv"),
+    ("shaders/clip_mask.frag", "clip_mask.frag.spv"),
+    ("shaders/clip_fold.frag", "clip_fold.frag.spv"),
+    ("shaders/strokes.vert", "strokes.vert.spv"),
+    ("shaders/strokes.frag", "strokes.frag.spv"),
+];
+const CLIPPED_SHADERS: &[(&str, &str)] = &[
+    ("shaders/puppet.vert", "puppet_clip.vert.spv"),
+    ("shaders/layer.frag", "layer_clip.frag.spv"),
+];
+const CLIPPED_DEFINE: &str = "-DCLIPPED";
+
 fn main() {
+    println!("cargo:rerun-if-changed={LAYER_GEOMETRY}");
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
     if std::env::var_os("FFMPEG_DIR").is_some() {
         println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN/../lib/skwd-paper");
@@ -9,17 +32,12 @@ fn main() {
         compile_ffmpeg_vulkan();
     }
     let out = std::env::var("OUT_DIR").unwrap();
-    for (src, dst) in [
-        ("shaders/fullscreen.vert", "fullscreen.vert.spv"),
-        ("shaders/nv12.frag", "nv12.frag.spv"),
-        ("shaders/rgba.frag", "rgba.frag.spv"),
-        ("shaders/layer.vert", "layer.vert.spv"),
-        ("shaders/puppet.vert", "puppet.vert.spv"),
-        ("shaders/layer.frag", "layer.frag.spv"),
-        ("shaders/sand_base.vert", "sand_base.vert.spv"),
-    ] {
+    for &(src, dst) in SHADERS {
         println!("cargo:rerun-if-changed={src}");
-        compile(src, &format!("{out}/{dst}"));
+        compile(src, &format!("{out}/{dst}"), &[]);
+    }
+    for &(src, dst) in CLIPPED_SHADERS {
+        compile(src, &format!("{out}/{dst}"), &[CLIPPED_DEFINE]);
     }
     let sand_vert = format!("{out}/sand_grain.vert");
     let sand_frag = format!("{out}/sand_grain.frag");
@@ -33,18 +51,18 @@ fn main() {
         paper_shaders::sand_grain_point_frag(paper_shaders::Dialect::Vulkan450),
     )
     .expect("write composed sand frag");
-    compile(&sand_vert, &format!("{out}/sand_grain.vert.spv"));
-    compile(&sand_frag, &format!("{out}/sand_grain.frag.spv"));
+    compile(&sand_vert, &format!("{out}/sand_grain.vert.spv"), &[]);
+    compile(&sand_frag, &format!("{out}/sand_grain.frag.spv"), &[]);
     let base_frag = format!("{out}/sand_base.frag");
     std::fs::write(&base_frag, paper_shaders::SAND_BASE_FRAG_VK).expect("write sand base frag");
-    compile(&base_frag, &format!("{out}/sand_base.frag.spv"));
+    compile(&base_frag, &format!("{out}/sand_base.frag.spv"), &[]);
 
     let mut table = String::from("pub static EFFECT_SPV: &[&[u8]] = &[\n");
     for (idx, (name, gl_src)) in paper_shaders::EFFECTS.iter().enumerate() {
         let frag = format!("{out}/fx_{idx}.frag");
         std::fs::write(&frag, paper_shaders::effect_frag_vk(gl_src))
             .unwrap_or_else(|_| panic!("write fx {name}"));
-        compile(&frag, &format!("{out}/fx_{idx}.frag.spv"));
+        compile(&frag, &format!("{out}/fx_{idx}.frag.spv"), &[]);
         table.push_str(&format!(
             "    include_bytes!(concat!(env!(\"OUT_DIR\"), \"/fx_{idx}.frag.spv\")),\n"
         ));
@@ -86,8 +104,9 @@ fn compile_ffmpeg_vulkan() {
     build.compile("skwd-paper-ffmpeg-vulkan");
 }
 
-fn compile(src: &str, dst: &str) {
+fn compile(src: &str, dst: &str, defines: &[&str]) {
     let status = Command::new("glslc")
+        .args(defines)
         .arg(src)
         .arg("-o")
         .arg(dst)

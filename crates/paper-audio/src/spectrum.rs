@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
-use ringbuf::traits::{Consumer, Split};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use std::sync::{Arc, Mutex};
 
 pub const BAND_COUNTS: [usize; 3] = [16, 32, 64];
 const WINDOW: usize = 2048;
@@ -9,6 +10,30 @@ const ATTACK_TAU: f32 = 0.045;
 const RELEASE_TAU: f32 = 0.28;
 const GAIN: f32 = 30.0;
 const DEFAULT_MONITOR: &str = "@DEFAULT_MONITOR@";
+const SOURCE_ENV: &str = "SKWD_VK_AUDIO_SOURCE";
+const MODE_ENV: &str = "SKWD_VK_AUDIO_MODE";
+const SYSTEM_MODE: &str = "system";
+const PLAYBACK_MODE: &str = "wallpaper";
+const BUFFER_WINDOWS: usize = 8;
+
+#[derive(Clone, Default)]
+pub struct PlaybackTap {
+    producer: Arc<Mutex<Option<ringbuf::HeapProd<f32>>>>,
+}
+
+impl PlaybackTap {
+    pub(crate) fn write(&self, samples: &[f32]) {
+        let Ok(mut slot) = self.producer.try_lock() else {
+            return;
+        };
+        let Some(producer) = slot.as_mut() else {
+            return;
+        };
+        let channels = usize::from(crate::pulse::CHANNELS);
+        let count = samples.len().min(producer.vacant_len()) / channels * channels;
+        producer.push_slice(&samples[..count]);
+    }
+}
 
 #[derive(Clone)]
 pub struct Bands {
@@ -153,7 +178,8 @@ fn spectrum_levels(re: &[f32], im: &[f32], edges: &[(usize, usize)], gain: f32) 
 }
 
 pub struct Analyser {
-    _capture: crate::pulse::MonitorCapture,
+    _capture: Option<crate::pulse::MonitorCapture>,
+    tap: PlaybackTap,
     consumer: ringbuf::HeapCons<f32>,
     channels: usize,
     edges: Vec<(usize, usize)>,
@@ -171,8 +197,75 @@ pub struct Analyser {
 
 impl Analyser {
     pub fn start() -> Result<Self> {
-        let source = std::env::var_os("SKWD_VK_AUDIO_SOURCE");
-        Self::start_with_capture(source.as_deref(), crate::pulse::MonitorCapture::start)
+        let source = std::env::var_os(SOURCE_ENV);
+        let mode = std::env::var_os(MODE_ENV);
+        Self::select(source.as_deref(), mode.as_deref(), crate::pulse::MonitorCapture::start)
+    }
+
+    fn select(
+        source: Option<&std::ffi::OsStr>,
+        mode: Option<&std::ffi::OsStr>,
+        capture: impl FnOnce(&str, ringbuf::HeapProd<f32>) -> Result<crate::pulse::MonitorCapture>,
+    ) -> Result<Self> {
+        monitor_source(source)?;
+        match mode {
+            Some(mode) if mode == PLAYBACK_MODE => Ok(Self::playback()),
+            None => Ok(Self::monitor_or_playback(source, capture)),
+            Some(mode) if mode == SYSTEM_MODE => Ok(Self::monitor_or_playback(source, capture)),
+            Some(mode) => Err(anyhow!("invalid audio spectrum mode: {}", mode.display())),
+        }
+    }
+
+    fn monitor_or_playback(
+        source: Option<&std::ffi::OsStr>,
+        capture: impl FnOnce(&str, ringbuf::HeapProd<f32>) -> Result<crate::pulse::MonitorCapture>,
+    ) -> Self {
+        match Self::start_with_capture(source, capture) {
+            Ok(analyser) => analyser,
+            Err(error) => {
+                tracing::warn!(%error, "audio monitor unavailable; using wallpaper playback");
+                Self::playback()
+            }
+        }
+    }
+
+    fn playback() -> Self {
+        let (producer, consumer) = ringbuf::HeapRb::<f32>::new(
+            WINDOW * usize::from(crate::pulse::CHANNELS) * BUFFER_WINDOWS,
+        )
+        .split();
+        let mut analyser = Self::with_capture(
+            None,
+            consumer,
+            crate::pulse::RATE as f32,
+            usize::from(crate::pulse::CHANNELS),
+        );
+        analyser.tap = PlaybackTap { producer: Arc::new(Mutex::new(Some(producer))) };
+        analyser
+    }
+
+    pub fn playback_tap(&self) -> PlaybackTap {
+        self.tap.clone()
+    }
+
+    pub fn set_system_capture(&mut self, enabled: bool) -> Result<()> {
+        let mode = if enabled { SYSTEM_MODE } else { PLAYBACK_MODE };
+        let source = std::env::var_os(SOURCE_ENV);
+        let next = Self::select(
+            source.as_deref(),
+            Some(std::ffi::OsStr::new(mode)),
+            crate::pulse::MonitorCapture::start,
+        )?;
+        self.replace(next);
+        Ok(())
+    }
+
+    fn replace(&mut self, mut next: Self) {
+        let producer =
+            next.tap.producer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        *self.tap.producer.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = producer;
+        next.tap = self.tap.clone();
+        *self = next;
     }
 
     fn start_with_capture(
@@ -180,8 +273,10 @@ impl Analyser {
         capture: impl FnOnce(&str, ringbuf::HeapProd<f32>) -> Result<crate::pulse::MonitorCapture>,
     ) -> Result<Self> {
         let source = monitor_source(source)?;
-        let (producer, consumer) =
-            ringbuf::HeapRb::<f32>::new(WINDOW * usize::from(crate::pulse::CHANNELS) * 8).split();
+        let (producer, consumer) = ringbuf::HeapRb::<f32>::new(
+            WINDOW * usize::from(crate::pulse::CHANNELS) * BUFFER_WINDOWS,
+        )
+        .split();
         let capture = capture(source, producer)?;
         tracing::info!(
             "skwd-wall-vk: audio capture on pulse monitor source={source} rate={} channels={}",
@@ -189,7 +284,7 @@ impl Analyser {
             crate::pulse::CHANNELS
         );
         Ok(Self::with_capture(
-            capture,
+            Some(capture),
             consumer,
             crate::pulse::RATE as f32,
             usize::from(crate::pulse::CHANNELS),
@@ -197,7 +292,7 @@ impl Analyser {
     }
 
     fn with_capture(
-        capture: crate::pulse::MonitorCapture,
+        capture: Option<crate::pulse::MonitorCapture>,
         consumer: ringbuf::HeapCons<f32>,
         rate: f32,
         channels: usize,
@@ -208,6 +303,7 @@ impl Analyser {
             .unwrap_or(GAIN);
         Self {
             _capture: capture,
+            tap: PlaybackTap::default(),
             consumer,
             channels,
             edges: band_edges(64, rate),

@@ -10,5 +10,8 @@ pub use model::SurfaceUi;
 pub use model::Target;
 #[cfg(feature = "shared-device")]
 pub(crate) use model::compositor_drm_device;
+#[cfg(feature = "shared-device")]
 pub(crate) use target::is_kwin_session;
-pub use target::{GroupBufferWait, ReexecSource, setup};
+pub use target::setup;
+#[cfg(feature = "shared-device")]
+pub use target::{GroupBufferWait, ReexecSource};

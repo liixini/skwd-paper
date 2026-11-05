@@ -8,6 +8,10 @@ use anyhow::{Context, Result};
 
 use crate::vk::Src;
 
+const MIN_SIDE: u32 = 16;
+const MIN_DURATION_MS: u64 = 100;
+const LOOP_PAUSE_MS: u64 = 600;
+
 pub(crate) fn parse_size(value: Option<&str>) -> (u32, u32) {
     value
         .and_then(|text| text.split_once('x'))
@@ -47,55 +51,109 @@ fn load(path: &str) -> Result<(u32, u32, Vec<u8>)> {
     Ok((width, height, pixels))
 }
 
-fn selected_shader(name: &str) -> &str {
-    if name != "random" {
-        return name;
+pub(crate) struct Preview<'a> {
+    pub(crate) from: &'a str,
+    pub(crate) to: &'a str,
+    pub(crate) shader: &'a str,
+    pub(crate) size: (u32, u32),
+    pub(crate) duration_ms: u64,
+    pub(crate) frame_interval: std::time::Duration,
+    pub(crate) drawing: Option<paper_control::DrawingTransition>,
+}
+
+impl Preview<'_> {
+    fn extent(&self) -> (u32, u32) {
+        (self.size.0.max(MIN_SIDE), self.size.1.max(MIN_SIDE))
     }
-    let choices = paper_shaders::SAND_STYLES.len() + paper_shaders::EFFECTS.len();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.subsec_nanos() as usize)
-        .unwrap_or(0);
-    let index = nanos % choices.max(1);
-    if index < paper_shaders::SAND_STYLES.len() {
-        paper_shaders::SAND_STYLES[index]
-    } else {
-        paper_shaders::EFFECTS[index - paper_shaders::SAND_STYLES.len()].0
+
+    fn renderer(&self) -> Result<(crate::shared::SharedDevice, crate::vk::Renderer)> {
+        let (width, height) = self.extent();
+        let shared =
+            crate::shared::create(std::ptr::null_mut()).context("preview Vulkan device")?;
+        let renderer =
+            crate::shared::renderer(&shared, width, height).context("preview renderer")?;
+        Ok((shared, renderer))
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn stream(
-    from: &str,
-    to: &str,
-    shader: &str,
-    width: u32,
-    height: u32,
-    duration_ms: u64,
-    frame_interval: std::time::Duration,
-    write_header: bool,
-    once: bool,
-) -> Result<()> {
-    let (width, height) = (width.max(16), height.max(16));
-    let shared = crate::shared::create(std::ptr::null_mut()).context("preview Vulkan device")?;
-    let mut renderer = crate::vk::Renderer::new_shared_headless(
-        (
-            shared.entry.clone(),
-            shared.instance.clone(),
-            shared.phys,
-            shared.device.clone(),
-            shared.gfx_family,
-            shared.queue,
-        ),
-        width,
-        height,
-    )
-    .context("preview renderer")?;
-    renderer.ensure_scene_pool(2)?;
-    let (from_width, from_height, from_pixels) = load(from)?;
-    let (to_width, to_height, to_pixels) = load(to)?;
-    let from_texture = renderer.create_scene_texture(from_width, from_height, &from_pixels)?;
-    let to_texture = renderer.create_scene_texture(to_width, to_height, &to_pixels)?;
+struct Pair {
+    from: crate::vk::SceneTexture,
+    from_uv: [f32; 4],
+    to: crate::vk::SceneTexture,
+    to_uv: [f32; 4],
+    drawing: Option<crate::app::DrawingTexture>,
+    sand: Option<i32>,
+    effect: Option<usize>,
+}
+
+impl Pair {
+    fn load(renderer: &mut crate::vk::Renderer, preview: &Preview) -> Result<Self> {
+        let (width, height) = preview.extent();
+        renderer.ensure_scene_pool(2)?;
+        let (from_width, from_height, from_pixels) = load(preview.from)?;
+        let (to_width, to_height, to_pixels) = load(preview.to)?;
+        let drawing = preview
+            .drawing
+            .as_ref()
+            .map(|drawing| {
+                crate::app::load_drawing(
+                    renderer,
+                    drawing,
+                    std::path::Path::new(preview.to),
+                    std::time::Duration::from_millis(preview.duration_ms),
+                )
+            })
+            .transpose()?;
+        let shader = paper_shaders::resolve_shader(preview.shader);
+        let sand = paper_shaders::sand_style_index(shader);
+        Ok(Self {
+            from: renderer.create_scene_texture(from_width, from_height, &from_pixels)?,
+            from_uv: crate::fill::mode_uv(from_width, from_height, width, height),
+            to: renderer.create_scene_texture(to_width, to_height, &to_pixels)?,
+            to_uv: crate::fill::mode_uv(to_width, to_height, width, height),
+            drawing,
+            sand,
+            effect: sand.is_none().then(|| paper_shaders::effect_index(shader)).flatten(),
+        })
+    }
+
+    fn render(
+        &self,
+        renderer: &mut crate::vk::Renderer,
+        target: &crate::vk::RenderTarget,
+        export: &mut crate::vk::ExportImage,
+        progress: f32,
+        reverse: bool,
+    ) -> Result<()> {
+        let from = Src::Rgba(self.from.view);
+        let to = self
+            .drawing
+            .as_ref()
+            .map_or(Src::Rgba(self.to.view), |drawing| drawing.source(self.to.view));
+        let ((a, a_uv), (b, b_uv)) = if reverse && self.drawing.is_none() {
+            ((&to, self.to_uv), (&from, self.from_uv))
+        } else {
+            ((&from, self.from_uv), (&to, self.to_uv))
+        };
+        match (self.sand, self.effect) {
+            (Some(style), _) => {
+                renderer.render_sand_to(target, export, a, a_uv, b, b_uv, progress, style)
+            }
+            (None, Some(effect)) => {
+                renderer.render_effect_to(target, export, a, a_uv, b, b_uv, progress, effect)
+            }
+            (None, None) => {
+                let mix = progress * progress * (3.0 - 2.0 * progress);
+                renderer.render_fade_to(target, export, a, a_uv, b, b_uv, mix)
+            }
+        }
+    }
+}
+
+pub(crate) fn stream(preview: &Preview, write_header: bool, once: bool) -> Result<()> {
+    let (width, height) = preview.extent();
+    let (_shared, mut renderer) = preview.renderer()?;
+    let pair = Pair::load(&mut renderer, preview)?;
     let mut export = renderer.create_export_image_opts(width, height, false)?;
     let target = if renderer.direct_render() {
         renderer.create_export_rt(&export)?
@@ -103,11 +161,6 @@ pub(crate) fn stream(
         renderer.create_render_target(width, height)?
     };
     let readback = renderer.create_readback_buf(u64::from(width) * u64::from(height) * 4)?;
-    let from_uv = crate::fill::mode_uv(from_width, from_height, width, height);
-    let to_uv = crate::fill::mode_uv(to_width, to_height, width, height);
-    let shader = selected_shader(shader);
-    let sand = paper_shaders::sand_style_index(shader);
-    let effect = sand.is_none().then(|| paper_shaders::effect_index(shader)).flatten();
     unsafe {
         libc::fcntl(libc::STDOUT_FILENO, libc::F_SETPIPE_SZ, 1024 * 1024);
     }
@@ -119,48 +172,16 @@ pub(crate) fn stream(
         output.write_all(&height.to_le_bytes())?;
     }
     output.flush()?;
-    let duration_ms = duration_ms.max(100);
-    let span = duration_ms + 600;
+    let duration_ms = preview.duration_ms.max(MIN_DURATION_MS);
+    let span = duration_ms + LOOP_PAUSE_MS;
     let started = Instant::now();
     let mut frames = 0u64;
     loop {
-        let frame_deadline = Instant::now() + frame_interval;
+        let frame_deadline = Instant::now() + preview.frame_interval;
         let elapsed = started.elapsed().as_millis() as u64;
         let reverse = (elapsed / span) % 2 == 1;
         let progress = ((elapsed % span) as f32 / duration_ms as f32).clamp(0.0, 1.0);
-        let (a, a_uv, b, b_uv) = if reverse {
-            (&to_texture, to_uv, &from_texture, from_uv)
-        } else {
-            (&from_texture, from_uv, &to_texture, to_uv)
-        };
-        let a = Src::Rgba(a.view);
-        let b = Src::Rgba(b.view);
-        match (sand, effect) {
-            (Some(style), _) => renderer.render_sand_to(
-                &target,
-                &mut export,
-                &a,
-                a_uv,
-                &b,
-                b_uv,
-                progress,
-                style,
-            )?,
-            (None, Some(effect)) => renderer.render_effect_to(
-                &target,
-                &mut export,
-                &a,
-                a_uv,
-                &b,
-                b_uv,
-                progress,
-                effect,
-            )?,
-            (None, None) => {
-                let mix = progress * progress * (3.0 - 2.0 * progress);
-                renderer.render_fade_to(&target, &mut export, &a, a_uv, &b, b_uv, mix)?;
-            }
-        }
+        pair.render(&mut renderer, &target, &mut export, progress, reverse)?;
         renderer.read_export_to(&export, &readback, width, height)?;
         let bgra = unsafe {
             std::slice::from_raw_parts(readback.ptr, width as usize * height as usize * 4)
@@ -192,15 +213,10 @@ pub(crate) fn stream(
     }
 }
 
-pub(crate) fn video_stream(
-    path: &str,
-    width: u32,
-    height: u32,
-    fps: u32,
-    write_header: bool,
-) -> Result<()> {
-    let (width, height) = (width.max(16), height.max(16));
-    let fps = fps.clamp(1, 240);
+pub(crate) fn video_stream(path: &str, stream: &StreamTarget, write_header: bool) -> Result<()> {
+    let mut targets = [stream.clone()];
+    let (width, height) = (stream.width.max(16), stream.height.max(16));
+    let fps = pacing_fps(&targets);
     let frame_step = 1.0 / f64::from(fps);
     let shared = crate::shared::create(std::ptr::null_mut()).context("video Vulkan device")?;
     let mut renderer = crate::vk::Renderer::new_shared_headless(
@@ -216,15 +232,7 @@ pub(crate) fn video_stream(
         height,
     )
     .context("video renderer")?;
-    let force_software_decode =
-        crate::shared::software_decode_required(shared.software, shared.queue_sync);
-    let mut decoder = crate::decode::open_decoder(
-        path,
-        Some(shared.hwdev),
-        shared.video_decode,
-        shared.render_node.as_deref(),
-        force_software_decode,
-    )?;
+    let mut decoder = shared.open_decoder(path)?;
     let hardware = matches!(decoder, crate::decode::AnyDecoder::Vk(_));
     let (video_width, video_height) = decoder.dims();
     let upload =
@@ -250,7 +258,18 @@ pub(crate) fn video_stream(
     let mut last_pts = None;
     let mut next_emit = 0.0;
     let mut started = Instant::now();
+    let mut ctl = crate::ctl::Ctl::start(path, true, 0, false);
+    ctl.route_output_pauses();
+    ctl.set_paused(stream.paused);
     loop {
+        let _ = ctl.poll();
+        route_pauses(&mut ctl, &mut targets);
+        if ctl.paused && !first_frame {
+            let held = Instant::now();
+            wait_any_free(&[], &mut [], &[], ctl.wake_fd(), None)?;
+            started += held.elapsed();
+            continue;
+        }
         let (frame, pts) = decoder.next()?;
         if last_pts.is_some_and(|last| pts < last) {
             first_pts = None;
@@ -382,6 +401,8 @@ pub(crate) fn receive_ack(socket: RawFd, block: bool) -> std::io::Result<Option<
     }
 }
 
+pub(crate) const NO_SOCKET: RawFd = -1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamTarget {
     pub socket: RawFd,
@@ -420,6 +441,13 @@ pub(crate) fn apply_output_pauses(
         }
     }
     matched.then(|| targets.iter().all(|target| target.paused))
+}
+
+fn route_pauses(ctl: &mut crate::ctl::Ctl, targets: &mut [StreamTarget]) {
+    let pauses = ctl.take_output_pauses();
+    if let Some(all_paused) = apply_output_pauses(targets, pauses) {
+        ctl.set_paused(all_paused);
+    }
 }
 
 pub(crate) fn drain_acks(socket: RawFd, free: &mut [bool; 3]) -> std::io::Result<()> {
@@ -540,7 +568,7 @@ impl Sink {
     }
 
     fn publish(&mut self, slot: usize) -> Result<()> {
-        self.renderer.wait_frame_complete()?;
+        self.renderer.wait_render()?;
         self.renderer.complete_external_signal(&self.semaphores[slot])?;
         send_packet(self.target.socket, &packet(2, slot as u8, 0, 0, 0, 0, 0), None)
             .context("send dmabuf frame")?;
@@ -623,17 +651,12 @@ struct VideoStreamer {
 
 impl VideoStreamer {
     fn route_pauses(&mut self) {
-        let pauses = self.ctl.take_output_pauses();
-        if pauses.is_empty() {
-            return;
-        }
         let mut targets: Vec<StreamTarget> =
             self.sinks.iter().map(|sink| sink.target.clone()).collect();
-        let Some(all_paused) = apply_output_pauses(&mut targets, pauses) else { return };
+        route_pauses(&mut self.ctl, &mut targets);
         for (sink, target) in self.sinks.iter_mut().zip(targets) {
             sink.target.paused = target.paused;
         }
-        self.ctl.set_paused(all_paused);
     }
 
     fn shift_timeline(&mut self, by: std::time::Duration) {
@@ -806,6 +829,9 @@ impl VideoStreamer {
                 );
             }
             self.transition = None;
+            for sink in &mut self.sinks {
+                sink.renderer.clear_transition()?;
+            }
         }
         Ok(self.transition.is_some())
     }
@@ -834,15 +860,7 @@ pub(crate) fn dmabuf_video_stream(
     let fps = pacing_fps(&targets);
     let frame_step = 1.0 / f64::from(fps);
     let shared = crate::shared::create(std::ptr::null_mut()).context("video Vulkan device")?;
-    let force_software_decode =
-        crate::shared::software_decode_required(shared.software, shared.queue_sync);
-    let mut decoder = crate::decode::open_decoder(
-        path,
-        Some(shared.hwdev),
-        shared.video_decode,
-        shared.render_node.as_deref(),
-        force_software_decode,
-    )?;
+    let mut decoder = shared.open_decoder(path)?;
     let hardware = matches!(decoder, crate::decode::AnyDecoder::Vk(_));
     let (video_width, video_height) = decoder.dims();
     let mut old_decoder = transition_from
@@ -860,8 +878,7 @@ pub(crate) fn dmabuf_video_stream(
         Ok(sinks) => sinks,
         Err(error) if single => {
             tracing::warn!(%error, "skwd-wall-vk: external stream unavailable, using CPU frames");
-            let target = &targets[0];
-            return video_stream(path, target.width, target.height, target.fps, write_header);
+            return video_stream(path, &targets[0], write_header);
         }
         Err(error) => return Err(error),
     };
@@ -883,7 +900,7 @@ pub(crate) fn dmabuf_video_stream(
         }
         None => None,
     };
-    let shader = selected_shader(shader);
+    let shader = paper_shaders::resolve_shader(shader);
     let sand = paper_shaders::sand_style_index(shader);
     let effect = sand.is_none().then(|| paper_shaders::effect_index(shader)).flatten();
     let mut ctl = crate::ctl::Ctl::start(path, mute, volume, true);

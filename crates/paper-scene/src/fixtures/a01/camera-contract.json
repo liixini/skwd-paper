@@ -1,0 +1,223 @@
+{
+  "probe": "camera-contract",
+  "version": 1,
+  "methods": {
+    "get": "function",
+    "set": "function"
+  },
+  "initial": {
+    "type": "object",
+    "eye": {
+      "x": 2,
+      "y": 2,
+      "z": 2
+    },
+    "center": {
+      "x": 0,
+      "y": 0,
+      "z": 0
+    },
+    "up": {
+      "x": 0,
+      "y": 1,
+      "z": 0
+    },
+    "zoom": 1
+  },
+  "secondGetter": {
+    "type": "object",
+    "eye": {
+      "x": 2,
+      "y": 2,
+      "z": 2
+    },
+    "center": {
+      "x": 0,
+      "y": 0,
+      "z": 0
+    },
+    "up": {
+      "x": 0,
+      "y": 1,
+      "z": 0
+    },
+    "zoom": 1
+  },
+  "localMutation": {
+    "type": "object",
+    "eye": {
+      "x": 9,
+      "y": 2,
+      "z": 2
+    },
+    "center": {
+      "x": 0,
+      "y": 0,
+      "z": 0
+    },
+    "up": {
+      "x": 0,
+      "y": 1,
+      "z": 0
+    },
+    "zoom": 1
+  },
+  "getterAfterLocalMutation": {
+    "type": "object",
+    "eye": {
+      "x": 2,
+      "y": 2,
+      "z": 2
+    },
+    "center": {
+      "x": 0,
+      "y": 0,
+      "z": 0
+    },
+    "up": {
+      "x": 0,
+      "y": 1,
+      "z": 0
+    },
+    "zoom": 1
+  },
+  "setterInput": {
+    "type": "object",
+    "eye": {
+      "x": 32,
+      "y": 16,
+      "z": 0
+    },
+    "center": {
+      "x": 8,
+      "y": 4,
+      "z": -1
+    },
+    "up": {
+      "x": 0,
+      "y": 0.8,
+      "z": 0.6
+    },
+    "zoom": 1.25
+  },
+  "set": {
+    "ok": true,
+    "returnType": "boolean",
+    "returnValue": true
+  },
+  "getterAfterSet": {
+    "type": "object",
+    "eye": {
+      "x": 32,
+      "y": 16,
+      "z": 0
+    },
+    "center": {
+      "x": 8,
+      "y": 4,
+      "z": -1
+    },
+    "up": {
+      "x": 0,
+      "y": 0.800000011920929,
+      "z": 0.6000000238418579
+    },
+    "zoom": 1.25
+  },
+  "invalidNull": {
+    "ok": true,
+    "returnType": "boolean",
+    "returnValue": false
+  },
+  "afterNull": {
+    "type": "object",
+    "eye": {
+      "x": 32,
+      "y": 16,
+      "z": 0
+    },
+    "center": {
+      "x": 8,
+      "y": 4,
+      "z": -1
+    },
+    "up": {
+      "x": 0,
+      "y": 0.800000011920929,
+      "z": 0.6000000238418579
+    },
+    "zoom": 1.25
+  },
+  "invalidUndefined": {
+    "ok": true,
+    "returnType": "boolean",
+    "returnValue": false
+  },
+  "afterUndefined": {
+    "type": "object",
+    "eye": {
+      "x": 32,
+      "y": 16,
+      "z": 0
+    },
+    "center": {
+      "x": 8,
+      "y": 4,
+      "z": -1
+    },
+    "up": {
+      "x": 0,
+      "y": 0.800000011920929,
+      "z": 0.6000000238418579
+    },
+    "zoom": 1.25
+  },
+  "invalidEmpty": {
+    "ok": true,
+    "returnType": "boolean",
+    "returnValue": true
+  },
+  "afterEmpty": {
+    "type": "object",
+    "eye": {
+      "x": 32,
+      "y": 16,
+      "z": 0
+    },
+    "center": {
+      "x": 8,
+      "y": 4,
+      "z": -1
+    },
+    "up": {
+      "x": 0,
+      "y": 0.800000011920929,
+      "z": 0.6000000238418579
+    },
+    "zoom": 1.25
+  },
+  "restore": {
+    "ok": true,
+    "returnType": "boolean",
+    "returnValue": true
+  },
+  "getterAfterRestore": {
+    "type": "object",
+    "eye": {
+      "x": 2,
+      "y": 2,
+      "z": 2
+    },
+    "center": {
+      "x": 0,
+      "y": 0,
+      "z": 0
+    },
+    "up": {
+      "x": 0,
+      "y": 1,
+      "z": 0
+    },
+    "zoom": 1
+  }
+}

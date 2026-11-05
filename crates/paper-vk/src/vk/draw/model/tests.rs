@@ -1,4 +1,4 @@
-use super::remap_texture_uv;
+use super::{EFFECT_PUSH_BYTES, EffectPush, remap_texture_uv};
 
 #[test]
 fn h264_row_padding() {
@@ -16,4 +16,13 @@ fn visible_region_crop() {
     {
         assert!((actual - expected).abs() < 1e-6);
     }
+}
+
+#[test]
+fn push_matches_glsl() {
+    assert_eq!(std::mem::offset_of!(EffectPush, uv_a), 32);
+    assert_eq!(std::mem::offset_of!(EffectPush, colours), 64);
+    assert_eq!(std::mem::offset_of!(EffectPush, clock), 72);
+    assert_eq!(std::mem::offset_of!(EffectPush, ink_style), 76);
+    assert_eq!(EFFECT_PUSH_BYTES, 80);
 }

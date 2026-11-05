@@ -35,8 +35,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VK = ROOT / "target/release/skwd-wall-vk"
 STILL = ROOT / "target/release/skwd-wall-still"
-TINIER = ROOT / "target/release/skwd-paper-tinier"
-TINIER_CACHE = Path.home() / ".cache/skwd-paper-v2/engine-sweep"
 WALL = os.environ.get("SKWD_WALL_CLI") or shutil.which("skwd-wall")
 ZERO_COPY_MARKER = b"path = shared-device (zero-copy)"
 VIDEO_DIR = Path.home() / "wallpaper-videos"
@@ -247,17 +245,6 @@ def media_info(path):
         raise RuntimeError(f"ffprobe returned no usable video stream for {path}") from error
     MEDIA_INFO[path] = info
     return info
-
-
-def tinier_fixtures():
-    entries = {
-        "floor": (TINIER_CACHE / "matrix-floor-1366x768-tokyo-qp20.ivf", "30"),
-        "mid": (TINIER_CACHE / "matrix-mid-2560x1440-5mGuCdlCcNM-qp20.ivf", "60"),
-        "max": (TINIER_CACHE / "matrix-max-3840x2160-tokyo-qp20.ivf", "30"),
-    }
-    return {
-        key: (str(path), fps) for key, (path, fps) in entries.items() if path.exists()
-    }
 
 
 def choose_sources(paths):
@@ -736,11 +723,10 @@ def idle_floor(prof, compositor_pid=None):
 
 
 class Placement:
-    def __init__(self, output, src, scene=False, fps=None):
+    def __init__(self, output, src, scene=False):
         self.output = output
         self.src = src
         self.scene = scene
-        self.fps = fps
 
     def metadata(self):
         return {
@@ -772,8 +758,6 @@ class Scenario:
         start_scene=None,
         independent=False,
         reuse=None,
-        engine="vulkan",
-        fps=None,
     ):
         self.name = name
         self.tier = tier
@@ -788,8 +772,6 @@ class Scenario:
         self.start_scene = start_scene
         self.independent = independent
         self.reuse = reuse
-        self.engine = engine
-        self.fps = fps
 
     def topology(self):
         if self.placements:
@@ -814,9 +796,7 @@ class Scenario:
             "topology": self.topology(),
             "placements": [placement.metadata() for placement in self.placements],
             "renderer": (
-                "tinier"
-                if self.engine == "tinier"
-                else "mixed"
+                "mixed"
                 if self.placements
                 else "still"
                 if media_kind(self.src, self.scene) == "static"
@@ -843,22 +823,7 @@ def send_swap(proc, to, shader, swap_ms):
     proc.stdin.flush()
 
 
-def tinier_command(output, src, fps):
-    command = [str(TINIER)]
-    if output not in ("*", "mixed"):
-        command.extend(["--output", output])
-    command.extend([str(src), str(fps)])
-    return command
-
-
 def scenario_commands(sc, prof):
-    if sc.engine == "tinier":
-        if sc.placements:
-            return [
-                tinier_command(placement.output, placement.src, placement.fps)
-                for placement in sc.placements
-            ]
-        return [tinier_command(sc.output, sc.src, sc.fps)]
     suffix = ["--mute"]
     if sc.start_from:
         suffix.extend(
@@ -1044,7 +1009,6 @@ def build_matrix(
     scene=None,
     outputs=None,
     scenes=None,
-    tinier=None,
 ):
     scenes = list(scenes or ([scene] if scene else []))
     scene = scenes[0] if scenes else None
@@ -1160,28 +1124,6 @@ def build_matrix(
         Scenario("max video single", "max", max_video, single_output),
         ]
     )
-    if tinier and "max" in tinier:
-        max_ivf, max_fps = tinier["max"]
-        m.extend(
-            [
-                Scenario(
-                    "max tinier video single",
-                    "max",
-                    max_ivf,
-                    single_output,
-                    engine="tinier",
-                    fps=max_fps,
-                ),
-                Scenario(
-                    "max tinier same video all outputs",
-                    "max",
-                    max_ivf,
-                    max_output,
-                    engine="tinier",
-                    fps=max_fps,
-                ),
-            ]
-        )
     pairs = [
         ("vid<->vid", max_video, max_video2),
         ("still<->still", still, still2),
@@ -1286,11 +1228,6 @@ def build_matrix(
             mid_video,
             max_video,
         ]
-        tinier_mixed = (
-            [tinier["floor"], tinier["mid"], tinier["max"]]
-            if tinier and {"floor", "mid", "max"} <= set(tinier)
-            else []
-        )
         m.extend(
             [
                 Scenario(
@@ -1314,27 +1251,6 @@ def build_matrix(
                         for i, output in enumerate(placement_outputs)
                     ],
                     reuse="device",
-                ),
-                *(
-                    [
-                        Scenario(
-                            "max tinier mixed distinct videos",
-                            "max",
-                            tinier["max"][0],
-                            "mixed",
-                            placements=[
-                                Placement(
-                                    output,
-                                    tinier_mixed[i % len(tinier_mixed)][0],
-                                    fps=tinier_mixed[i % len(tinier_mixed)][1],
-                                )
-                                for i, output in enumerate(placement_outputs)
-                            ],
-                            engine="tinier",
-                        )
-                    ]
-                    if tinier_mixed
-                    else []
                 ),
                 Scenario(
                     "max mixed distinct statics",
@@ -1727,7 +1643,6 @@ def main():
         scenes[0] if scenes else None,
         outputs,
         scenes,
-        tinier_fixtures(),
     )
     validate_matrix(
         matrix,

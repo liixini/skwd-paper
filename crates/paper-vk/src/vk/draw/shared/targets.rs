@@ -1,9 +1,13 @@
-use super::super::model::Src;
+use super::super::model::{EFFECT_PUSH_BYTES, EffectPush, Src};
 use super::model::{AvvkFrame, WaitSems, avvk_frame};
 use crate::vk::{ExportImage, FrameImages, ReadbackBuf, RenderTarget, Renderer};
 use anyhow::{Context, Result, anyhow};
 use ash::vk;
 use ash::vk::Handle;
+use paper_control::DrawingInk;
+
+const PLAIN_INK: i32 = 0;
+const RAINBOW_INK: i32 = 1;
 
 impl Renderer {
     #[cfg(feature = "shared-device")]
@@ -15,7 +19,8 @@ impl Renderer {
         if target.extent != self.extent || target.format != self.format {
             return Err(anyhow!("scene video target does not match its renderer"));
         }
-        self.wait_frame_complete()?;
+        self.wait_render()?;
+        let pipeline = self.scene_video_pipeline()?;
         let avf = Self::resolve_src(src)?;
         let mut waits = WaitSems::new();
         if let Some(avf) = &avf {
@@ -43,7 +48,7 @@ impl Renderer {
                 vk::SubpassContents::INLINE,
             );
         }
-        self.draw_fullscreen(self.pipeline, self.desc_set, &src.texture_uv([1.0, 1.0, 0.0, 0.0]));
+        self.draw_fullscreen(pipeline, self.desc_set, &src.texture_uv([1.0, 1.0, 0.0, 0.0]));
         unsafe { self.device.cmd_end_render_pass(self.cmd) };
         self.release_imports(&[src]);
         self.end_and_submit(&waits)?;
@@ -51,11 +56,6 @@ impl Renderer {
         if let Some(avf) = avf {
             avf.commit_sampled();
         }
-        Ok(())
-    }
-
-    pub fn wait_frame_complete(&self) -> Result<()> {
-        unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
         Ok(())
     }
 
@@ -109,16 +109,8 @@ impl Renderer {
             }
             self.device.end_command_buffer(self.cmd)?;
             let cmds = [self.cmd];
-            self.device.reset_fences(&[self.fence])?;
-            {
-                let _qg = self.queue_guard();
-                self.device.queue_submit(
-                    self.queue,
-                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                    self.fence,
-                )?;
-            }
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.submit_fenced(&[vk::SubmitInfo::default().command_buffers(&cmds)])?;
+            self.wait_render()?;
         }
         export.ready = true;
         Ok(())
@@ -128,7 +120,7 @@ impl Renderer {
     fn resolve_src<'a>(src: &Src<'a>) -> Result<Option<AvvkFrame<'a>>> {
         match src {
             Src::Avvk(frame) => Ok(Some(avvk_frame(frame)?)),
-            Src::Imported(_) | Src::Views(_, _) | Src::Rgba(_) => Ok(None),
+            Src::Imported(_) | Src::Views(_, _) | Src::Rgba(_) | Src::Drawing { .. } => Ok(None),
         }
     }
 
@@ -235,7 +227,7 @@ impl Renderer {
     #[cfg(feature = "shared-device")]
     fn present_pipeline(&self, src: &Src) -> vk::Pipeline {
         match src {
-            Src::Rgba(_) => self.pipeline_rgba,
+            Src::Rgba(_) | Src::Drawing { .. } => self.pipeline_rgba,
             _ => self.pipeline,
         }
     }
@@ -243,14 +235,14 @@ impl Renderer {
     #[cfg(feature = "shared-device")]
     fn fade_pipeline(&self, src: &Src) -> vk::Pipeline {
         match src {
-            Src::Rgba(_) => self.pipeline_rgba_fade,
+            Src::Rgba(_) | Src::Drawing { .. } => self.pipeline_rgba_fade,
             _ => self.pipeline_fade,
         }
     }
 
     #[cfg(feature = "shared-device")]
     fn ensure_src_pipelines(&mut self, srcs: &[&Src]) -> Result<()> {
-        if srcs.iter().any(|src| matches!(src, Src::Rgba(_))) {
+        if srcs.iter().any(|src| src.is_rgba()) {
             self.ensure_rgba_pipelines()?;
         }
         Ok(())
@@ -272,6 +264,10 @@ impl Renderer {
                 self.write_view_set(set, *lv, *cv);
                 Ok(())
             }
+            (Src::Drawing { photo: view, ink: drawing, .. }, _) => {
+                self.write_view_set(set, *view, *drawing);
+                Ok(())
+            }
             (Src::Rgba(view), _) => {
                 self.write_view_set(set, *view, *view);
                 Ok(())
@@ -291,9 +287,7 @@ impl Renderer {
     ) -> Result<()> {
         let uv = src.texture_uv(uv);
         self.ensure_src_pipelines(&[src])?;
-        unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
+        self.wait_render()?;
         let avf = Self::resolve_src(src)?;
         let mut waits = WaitSems::new();
         if let Some(avf) = &avf {
@@ -327,6 +321,29 @@ impl Renderer {
     }
 
     #[cfg(feature = "shared-device")]
+    fn begin_pair<'a>(
+        &mut self,
+        export: &ExportImage,
+        src_a: &Src<'a>,
+        src_b: &Src<'a>,
+    ) -> Result<(Option<AvvkFrame<'a>>, Option<AvvkFrame<'a>>, WaitSems)> {
+        self.wait_render()?;
+        let (avf_a, avf_b) = (Self::resolve_src(src_a)?, Self::resolve_src(src_b)?);
+        let mut waits = WaitSems::new();
+        for avf in avf_a.iter().chain(&avf_b) {
+            avf.push_wait_sems(&mut waits);
+        }
+        self.begin_frame_cmd()?;
+        if export.direct_render {
+            self.acquire_direct_export(export);
+        }
+        self.acquire_imports(&[src_a, src_b]);
+        self.bind_src(self.desc_set, src_a, &avf_a)?;
+        self.bind_src(self.desc_set_b, src_b, &avf_b)?;
+        Ok((avf_a, avf_b, waits))
+    }
+
+    #[cfg(feature = "shared-device")]
     pub fn render_fade_to(
         &mut self,
         rt: &RenderTarget,
@@ -341,21 +358,7 @@ impl Renderer {
         let uv_b = src_b.texture_uv(uv_b);
         self.ensure_transition_pipelines()?;
         self.ensure_src_pipelines(&[src_a, src_b])?;
-        unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        let (avf_a, avf_b) = (Self::resolve_src(src_a)?, Self::resolve_src(src_b)?);
-        let mut waits = WaitSems::new();
-        for avf in avf_a.iter().chain(&avf_b) {
-            avf.push_wait_sems(&mut waits);
-        }
-        self.begin_frame_cmd()?;
-        if export.direct_render {
-            self.acquire_direct_export(export);
-        }
-        self.acquire_imports(&[src_a, src_b]);
-        self.bind_src(self.desc_set, src_a, &avf_a)?;
-        self.bind_src(self.desc_set_b, src_b, &avf_b)?;
+        let (avf_a, avf_b, waits) = self.begin_pair(export, src_a, src_b)?;
         let barriers: Vec<_> = avf_a.iter().chain(&avf_b).map(AvvkFrame::read_barrier).collect();
         if !barriers.is_empty() {
             self.sample_barrier(&barriers, vk::PipelineStageFlags::FRAGMENT_SHADER);
@@ -396,64 +399,76 @@ impl Renderer {
         let uv_a = src_a.texture_uv(uv_a);
         let uv_b = src_b.texture_uv(uv_b);
         let pipe = self.effect_pipeline(fx)?;
-        unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        self.prepare_transition(fx)?;
+        let (layout, environment) = self.transition_bindings(fx)?;
+        let (avf_a, avf_b, waits) = self.begin_pair(export, src_a, src_b)?;
+        let mut drawn = None;
+        if let Src::Drawing { strokes, .. } = src_b {
+            let Src::Rgba(photo) = src_a else {
+                return Err(anyhow!("drawing requires a still source"));
+            };
+            drawn = self.record_strokes(strokes, progress);
+            self.write_view_set(self.desc_set, *photo, strokes.view);
         }
-        let (avf_a, avf_b) = (Self::resolve_src(src_a)?, Self::resolve_src(src_b)?);
-        let mut waits = WaitSems::new();
-        for avf in avf_a.iter().chain(&avf_b) {
-            avf.push_wait_sems(&mut waits);
-        }
-        self.begin_frame_cmd()?;
-        if export.direct_render {
-            self.acquire_direct_export(export);
-        }
-        self.acquire_imports(&[src_a, src_b]);
-        self.bind_src(self.desc_set, src_a, &avf_a)?;
-        self.bind_src(self.desc_set_b, src_b, &avf_b)?;
         let barriers: Vec<_> = avf_a.iter().chain(&avf_b).map(AvvkFrame::read_barrier).collect();
         if !barriers.is_empty() {
             self.sample_barrier(&barriers, vk::PipelineStageFlags::FRAGMENT_SHADER);
         }
         self.begin_clear_pass(rt.framebuffer);
-        #[repr(C)]
-        struct FxPush {
-            res: [f32; 2],
-            progress: f32,
-            style: i32,
-            pid_base: i32,
-            fill: i32,
-            rgba_a: i32,
-            rgba_b: i32,
-            uv_a: [f32; 4],
-            uv_b: [f32; 4],
-        }
-        let push = FxPush {
+        let push = EffectPush {
             res: [self.extent.width as f32, self.extent.height as f32],
             progress: progress.clamp(0.0, 1.0),
             style: fx as i32,
-            pid_base: 0,
+            pid_base: match src_b {
+                Src::Drawing { focus, .. } => {
+                    let [x, y] = focus.map(|value| (value * f32::from(u16::MAX)).round() as u16);
+                    i32::from_ne_bytes((u32::from(x) | (u32::from(y) << u16::BITS)).to_ne_bytes())
+                }
+                _ => 0,
+            },
             fill: crate::fill_flag(),
-            rgba_a: i32::from(matches!(src_a, Src::Rgba(_))),
-            rgba_b: i32::from(matches!(src_b, Src::Rgba(_))),
+            rgba_a: i32::from(src_a.is_rgba()),
+            rgba_b: i32::from(src_b.is_rgba()),
             uv_a,
             uv_b,
+            colours: match src_b {
+                Src::Drawing { colours, .. } => [packed(colours.paper), packed(colours.ink)],
+                _ => [0; 2],
+            },
+            clock: match src_b {
+                Src::Drawing { strokes, .. } => progress.clamp(0.0, 1.0) * strokes.seconds,
+                _ => 0.0,
+            },
+            ink_style: match src_b {
+                Src::Drawing { strokes, .. } if strokes.ink == DrawingInk::Rainbow => RAINBOW_INK,
+                _ => PLAIN_INK,
+            },
         };
         unsafe {
             self.device.cmd_bind_descriptor_sets(
                 self.cmd,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout_sand,
+                layout,
                 0,
                 &[self.desc_set, self.desc_set_b],
                 &[],
             );
+            if let Some(environment) = environment {
+                self.device.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    layout,
+                    crate::vk::transition::ENVIRONMENT_SET,
+                    &[environment],
+                    &[],
+                );
+            }
             self.device.cmd_push_constants(
                 self.cmd,
-                self.pipeline_layout_sand,
+                layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
-                std::slice::from_raw_parts((&raw const push).cast(), 64),
+                std::slice::from_raw_parts((&raw const push).cast(), EFFECT_PUSH_BYTES as usize),
             );
             self.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipe);
             self.device.cmd_draw(self.cmd, 3, 1, 0, 0);
@@ -466,6 +481,9 @@ impl Renderer {
             self.copy_rt_to_export(rt, export);
         }
         self.end_and_submit(&waits)?;
+        if let (Some(t), Src::Drawing { strokes, .. }) = (drawn, src_b) {
+            strokes.drawn.set(Some(t));
+        }
         Self::note_imports(&[src_a, src_b]);
         export.ready = true;
         for avf in avf_a.into_iter().chain(avf_b) {
@@ -489,21 +507,7 @@ impl Renderer {
         let uv_a = src_a.texture_uv(uv_a);
         let uv_b = src_b.texture_uv(uv_b);
         self.ensure_transition_pipelines()?;
-        unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        let (avf_a, avf_b) = (Self::resolve_src(src_a)?, Self::resolve_src(src_b)?);
-        let mut waits = WaitSems::new();
-        for avf in avf_a.iter().chain(&avf_b) {
-            avf.push_wait_sems(&mut waits);
-        }
-        self.begin_frame_cmd()?;
-        if export.direct_render {
-            self.acquire_direct_export(export);
-        }
-        self.acquire_imports(&[src_a, src_b]);
-        self.bind_src(self.desc_set, src_a, &avf_a)?;
-        self.bind_src(self.desc_set_b, src_b, &avf_b)?;
+        let (avf_a, avf_b, waits) = self.begin_pair(export, src_a, src_b)?;
         let barriers: Vec<_> = avf_a.iter().chain(&avf_b).map(AvvkFrame::read_barrier).collect();
         if !barriers.is_empty() {
             self.sample_barrier(
@@ -512,29 +516,20 @@ impl Renderer {
             );
         }
         self.begin_clear_pass(rt.framebuffer);
-        #[repr(C)]
-        struct SandPush {
-            res: [f32; 2],
-            progress: f32,
-            style: i32,
-            pid_base: i32,
-            fill: i32,
-            rgba_a: i32,
-            rgba_b: i32,
-            uv_a: [f32; 4],
-            uv_b: [f32; 4],
-        }
         let (base, count) = paper_shaders::sand_window(style, progress);
-        let push = SandPush {
+        let push = EffectPush {
             res: [self.extent.width as f32, self.extent.height as f32],
             progress,
             style,
             pid_base: base,
             fill: crate::fill_flag(),
-            rgba_a: i32::from(matches!(src_a, Src::Rgba(_))),
-            rgba_b: i32::from(matches!(src_b, Src::Rgba(_))),
+            rgba_a: i32::from(src_a.is_rgba()),
+            rgba_b: i32::from(src_b.is_rgba()),
             uv_a,
             uv_b,
+            colours: [0; 2],
+            clock: 0.0,
+            ink_style: PLAIN_INK,
         };
         unsafe {
             self.device.cmd_bind_descriptor_sets(
@@ -550,7 +545,7 @@ impl Renderer {
                 self.pipeline_layout_sand,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
-                std::slice::from_raw_parts((&raw const push).cast(), 64),
+                std::slice::from_raw_parts((&raw const push).cast(), EFFECT_PUSH_BYTES as usize),
             );
         }
         unsafe {
@@ -594,7 +589,7 @@ impl Renderer {
         height: u32,
     ) -> Result<()> {
         unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.wait_render()?;
             self.device.begin_command_buffer(
                 self.cmd,
                 &vk::CommandBufferBeginInfo::default()
@@ -664,15 +659,8 @@ impl Renderer {
             );
             self.device.end_command_buffer(self.cmd)?;
             let cmds = [self.cmd];
-            self.device.reset_fences(&[self.fence])?;
-            let guard = self.queue_guard();
-            self.device.queue_submit(
-                self.queue,
-                &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                self.fence,
-            )?;
-            drop(guard);
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.submit_fenced(&[vk::SubmitInfo::default().command_buffers(&cmds)])?;
+            self.wait_render()?;
             Ok(())
         }
     }
@@ -680,19 +668,11 @@ impl Renderer {
     #[cfg(feature = "shared-device")]
     pub fn retire_plane_views(&mut self) -> Result<()> {
         unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.wait_render()?;
             for (_, (lv, cv)) in self.plane_views.drain() {
                 self.device.destroy_image_view(lv, None);
                 self.device.destroy_image_view(cv, None);
             }
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "shared-device")]
-    pub fn wait_render(&self) -> Result<()> {
-        unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
         Ok(())
     }
@@ -730,4 +710,9 @@ impl Renderer {
         self.plane_views.insert(image.as_raw(), (lv, cv));
         Ok((lv, cv))
     }
+}
+
+fn packed(rgb: [u8; 3]) -> u32 {
+    let [r, g, b] = rgb;
+    u32::from_le_bytes([r, g, b, u8::MAX])
 }

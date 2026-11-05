@@ -1,5 +1,24 @@
 use super::*;
 
+#[test]
+fn snapshot_legacy_freeze() {
+    let mut command = PaperCommand::snapshot("/cache/frame.ppm", "DP-1");
+    command.pause = Some(true);
+    command.freeze = Some("/cache/frame.ppm".into());
+    assert_eq!(round_trip(&command), command);
+    assert!(
+        matches!(classify_command(command), CommandClass::Freeze(path) if path == "/cache/frame.ppm")
+    );
+}
+
+#[test]
+fn drawing_photo_shape() {
+    let command = PaperCommand::drawing_photo("/cache/styled.ppm");
+    assert_eq!(command.line(), "{\"drawing_photo\":\"/cache/styled.ppm\",\"to\":\"\"}\n");
+    assert_eq!(round_trip(&command), command);
+    assert!(serde_json::from_str::<PaperCommand>("{}").unwrap().drawing_photo.is_none());
+}
+
 fn round_trip(command: &PaperCommand) -> PaperCommand {
     let line = command.line();
     assert!(line.ends_with('\n'));
@@ -125,4 +144,25 @@ fn mirror_command_precedence() {
     assert!(
         matches!(classify_command(stop), CommandClass::Mirror(target) if target.socket.is_empty())
     );
+}
+
+#[test]
+fn spectrum_source_roundtrip() {
+    let command: PaperCommand =
+        serde_json::from_str(r#"{"system_audio":false,"volume":35}"#).unwrap();
+    assert_eq!(command.system_audio, Some(false));
+    assert_eq!(command.volume, Some(35));
+    let restored: PaperCommand = serde_json::from_str(&command.line()).unwrap();
+    assert_eq!(restored, command);
+}
+
+#[test]
+fn snapshot_wire_shape() {
+    let command = PaperCommand::snapshot("/cache/current.ppm", "DP-1");
+    let value = serde_json::to_value(&command).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"to":"", "snapshot":{"path":"/cache/current.ppm", "output":"DP-1"}})
+    );
+    assert_eq!(serde_json::from_value::<PaperCommand>(value).unwrap(), command);
 }

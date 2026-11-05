@@ -1,16 +1,37 @@
 use super::super::{FrameImages, FrameViews, Renderer};
-use super::model::QueueGuard;
 use anyhow::{Context, Result};
 use ash::vk;
 
 impl Renderer {
-    pub(in crate::vk) fn queue_guard(&self) -> QueueGuard {
-        #[cfg(feature = "shared-device")]
-        crate::shared::lock_queue_family(self.queue_family);
-        QueueGuard {
-            #[cfg(feature = "shared-device")]
-            family: self.queue_family,
+    pub(in crate::vk) fn submit_fenced(&self, submits: &[vk::SubmitInfo]) -> Result<()> {
+        self.wait_render()?;
+        unsafe { self.device.reset_fences(&[self.fence])? };
+        crate::shared::submit(&self.device, self.queue, self.queue_family, submits, self.fence)?;
+        self.fence_pending.set(true);
+        Ok(())
+    }
+
+    pub fn wait_render(&self) -> Result<()> {
+        if self.fence_pending.get() {
+            unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
+            self.fence_pending.set(false);
         }
+        Ok(())
+    }
+
+    pub(in crate::vk) fn present_image(&self, index: u32) -> ash::prelude::VkResult<bool> {
+        let swapchains = [self.swapchain];
+        let indices = [index];
+        let render_done = [self.render_sems[index as usize]];
+        crate::shared::present(
+            &self.swapchain_fns,
+            self.queue,
+            self.queue_family,
+            &vk::PresentInfoKHR::default()
+                .wait_semaphores(&render_done)
+                .swapchains(&swapchains)
+                .image_indices(&indices),
+        )
     }
 
     pub fn draw(&mut self, frame: &FrameImages, uv: [f32; 4]) -> Result<()> {
@@ -34,7 +55,7 @@ impl Renderer {
         uv: [f32; 4],
     ) -> Result<()> {
         unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.wait_render()?;
 
             let (idx, _) = match self.swapchain_fns.acquire_next_image(
                 self.swapchain,
@@ -142,35 +163,14 @@ impl Renderer {
             let waits = [self.acquire_sem];
             let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let cmds = [self.cmd];
-            let signals = [self.render_sem];
-            self.device.reset_fences(&[self.fence])?;
-            {
-                let _qg = self.queue_guard();
-                self.device.queue_submit(
-                    self.queue,
-                    &[vk::SubmitInfo::default()
-                        .wait_semaphores(&waits)
-                        .wait_dst_stage_mask(&stages)
-                        .command_buffers(&cmds)
-                        .signal_semaphores(&signals)],
-                    self.fence,
-                )?;
-            }
-
-            let swapchains = [self.swapchain];
-            let indices = [idx];
-            let render_done = [self.render_sem];
-            let present = {
-                let _qg = self.queue_guard();
-                self.swapchain_fns.queue_present(
-                    self.queue,
-                    &vk::PresentInfoKHR::default()
-                        .wait_semaphores(&render_done)
-                        .swapchains(&swapchains)
-                        .image_indices(&indices),
-                )
-            };
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            let signals = [self.render_sems[idx as usize]];
+            self.submit_fenced(&[vk::SubmitInfo::default()
+                .wait_semaphores(&waits)
+                .wait_dst_stage_mask(&stages)
+                .command_buffers(&cmds)
+                .signal_semaphores(&signals)])?;
+            let present = self.present_image(idx);
+            self.wait_render()?;
             match present {
                 Ok(_) | Err(vk::Result::SUBOPTIMAL_KHR | vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     if matches!(present, Err(vk::Result::ERROR_OUT_OF_DATE_KHR)) {
@@ -183,10 +183,9 @@ impl Renderer {
         }
     }
 
-    #[cfg(feature = "shared-device")]
     pub(in crate::vk) fn begin_frame_cmd(&self) -> Result<()> {
         unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.wait_render()?;
             self.device.begin_command_buffer(
                 self.cmd,
                 &vk::CommandBufferBeginInfo::default()
@@ -315,7 +314,7 @@ impl Renderer {
             background: [f32; 4],
         }
         let (blur, dim) = crate::surface::effects();
-        let background = paper_control::Background::worker();
+        let background = paper_control::worker_background();
         let push = BlitPush {
             uv,
             fill: crate::fill_flag(),

@@ -5,23 +5,56 @@ WORKSHOP = os.path.expanduser('~/.local/share/Steam/steamapps/workshop/content/4
 ASSETS = os.path.expanduser('~/.local/share/Steam/steamapps/common/wallpaper_engine/assets')
 
 
+MAX_PACKAGE_ENTRIES = 32768
+MAX_PACKAGE_PATH_BYTES = 4096
+MAX_PACKAGE_VERSION_BYTES = 32
+
+
+def index(path):
+    with open(path, 'rb') as stream:
+        file_size = os.fstat(stream.fileno()).st_size
+
+        def read_exact(size):
+            if size > file_size - stream.tell():
+                raise ValueError('truncated package index')
+            value = stream.read(size)
+            if len(value) != size:
+                raise ValueError('package changed while reading index')
+            return value
+
+        def number():
+            return struct.unpack('<I', read_exact(4))[0]
+
+        length = number()
+        if length > MAX_PACKAGE_VERSION_BYTES:
+            raise ValueError('package version is too long')
+        version = read_exact(length)
+        if not version.startswith(b'PKGV'):
+            raise ValueError('invalid package version')
+        count = number()
+        if count > MAX_PACKAGE_ENTRIES or count > (file_size - stream.tell()) // 12:
+            raise ValueError('invalid package entry count')
+        table = []
+        for _ in range(count):
+            length = number()
+            if length > MAX_PACKAGE_PATH_BYTES or length > file_size - stream.tell() - 8:
+                raise ValueError('invalid package path length')
+            name = read_exact(length).decode('utf-8')
+            offset, size = struct.unpack('<II', read_exact(8))
+            table.append((name, offset, size))
+        base = stream.tell()
+        if any(offset + size > file_size - base for _, offset, size in table):
+            raise ValueError('package entry is outside the file')
+        return base, table, version
+
+
 def entries(path):
-    raw = open(path, 'rb').read()
-    n = struct.unpack_from('<I', raw, 0)[0]
-    version = raw[4:4 + n]
-    p = 4 + n
-    count = struct.unpack_from('<I', raw, p)[0]
-    p += 4
-    table = []
-    for _ in range(count):
-        ln = struct.unpack_from('<I', raw, p)[0]
-        p += 4
-        name = raw[p:p + ln].decode('utf-8')
-        p += ln
-        off, size = struct.unpack_from('<II', raw, p)
-        p += 8
-        table.append((name, off, size))
-    return raw, p, table, version
+    base, table, version = index(path)
+    with open(path, 'rb') as stream:
+        raw = stream.read()
+    if any(base + offset + size > len(raw) for _, offset, size in table):
+        raise ValueError('package changed after reading index')
+    return raw, base, table, version
 
 
 def read_all(path):

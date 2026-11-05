@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use paper_control::{Layer as PaperLayer, OutputTarget, StillCommand};
 use smithay_client_toolkit::{
     compositor::CompositorState, output::OutputState, registry::RegistryState, shm::Shm,
+    subcompositor::SubcompositorState,
 };
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd};
@@ -22,6 +23,12 @@ use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::{
     Layer as WaylandLayer, ZwlrLayerShellV1,
 };
+
+const WAYLAND_SLOT: usize = 0;
+const WAKE_SLOT: usize = 1;
+const TIMER_SLOT: usize = 2;
+const FIRST_MIRROR_SLOT: usize = 3;
+const IDLE_FD: i32 = -1;
 
 pub fn run(
     target: OutputTarget,
@@ -45,13 +52,15 @@ pub fn run(
     let output_state = OutputState::new(&globals, &qh);
     let compositor_state =
         CompositorState::bind(&globals, &qh).context("compositor not available")?;
+    let subcompositor =
+        SubcompositorState::bind(compositor_state.wl_compositor().clone(), &globals, &qh).ok();
     let layer_shell: ZwlrLayerShellV1 =
         globals.bind(&qh, 1..=4, ()).context("zwlr_layer_shell_v1 not available")?;
     let viewporter: WpViewporter =
         globals.bind(&qh, 1..=1, ()).context("wp_viewporter not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
 
-    let transparent = if std::env::var("SKWD_PAPER_PREPARE_HIDDEN").as_deref() == Ok("1") {
+    let transparent = if std::env::var(paper_control::PREPARE_HIDDEN_ENV).as_deref() == Ok("1") {
         anyhow::ensure!(persist, "hidden preparation requires persistent control");
         Some(BufferSet::new(&shm, &qh, 1, 1, 0, |canvas, _| canvas.fill(0))?)
     } else {
@@ -64,6 +73,8 @@ pub fn run(
         registry_state,
         output_state,
         compositor_state,
+        subcompositor,
+        widgets: None,
         shm,
         layer_shell,
         viewporter,
@@ -120,6 +131,7 @@ fn run_event_loop(
         event_queue.dispatch_pending(app)?;
         app.try_consume_pending_cmd();
         app.try_release_pool();
+        app.follow_widgets();
 
         if app.startup_readiness.begin_sync()? {
             conn.display().sync(&app.qh, StartupSync);
@@ -131,9 +143,11 @@ fn run_event_loop(
         let _ = conn.flush();
 
         let mirrors = app.mirror_fds();
+        let timer_fd = app.widgets.as_ref().map_or(IDLE_FD, super::widgets::Widgets::timer_fd);
         let mut fds = vec![
             libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: timer_fd, events: libc::POLLIN, revents: 0 },
         ];
         fds.extend(mirrors.iter().map(|&(_, fd)| libc::pollfd {
             fd,
@@ -150,7 +164,7 @@ fn run_event_loop(
             return Err(anyhow!("poll failed: {err}"));
         }
 
-        if (fds[0].revents & libc::POLLIN) != 0 {
+        if (fds[WAYLAND_SLOT].revents & libc::POLLIN) != 0 {
             match read_guard.read() {
                 Ok(_) => {}
                 Err(wayland_client::backend::WaylandError::Io(err))
@@ -160,11 +174,14 @@ fn run_event_loop(
         } else {
             drop(read_guard);
         }
-        if (fds[1].revents & libc::POLLIN) != 0 {
+        if (fds[WAKE_SLOT].revents & libc::POLLIN) != 0 {
             wake.drain();
         }
+        if (fds[TIMER_SLOT].revents & libc::POLLIN) != 0 {
+            app.widget_tick();
+        }
         for (slot, &(index, _)) in mirrors.iter().enumerate() {
-            if fds[2 + slot].revents != 0 {
+            if fds[FIRST_MIRROR_SLOT + slot].revents != 0 {
                 app.service_mirror(index);
             }
         }
@@ -275,6 +292,7 @@ impl App {
             span_pool: None,
             span_keepalive: None,
             shown: None,
+            shown_at: 0,
             mirror: None,
         });
     }
@@ -299,6 +317,7 @@ impl App {
         } else {
             (self.raw_w, self.raw_h, std::mem::take(&mut self.raw_pixels))
         };
+        (self.raw_w, self.raw_h) = (raw_w, raw_h);
         let (bw, bh, pixels) = apply_fill_mode(raw_w, raw_h, &raw, surf_w, surf_h, self.fill_mode);
         drop(raw);
         let buffer =

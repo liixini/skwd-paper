@@ -1,9 +1,9 @@
-use crate::cli::{Command, EngineArg, FillModeArg, KindArg, LayerArg};
+use crate::cli::{Command, FillModeArg, KindArg, LayerArg};
 use anyhow::{Context, Result, anyhow};
 use paper_control::{
     ApplyRequest, Assignment, AudioSetRequest, CapabilitiesRequest, FillMode, Layer, PauseRequest,
     RendererPolicy, Request, RequestParams, Source, SourceKind, StatusRequest, StopRequest,
-    TransitionPolicy, VideoEngine, is_video_path,
+    TransitionPolicy, is_video_path,
 };
 use std::io::Read;
 use std::path::Path;
@@ -18,16 +18,33 @@ pub(crate) fn run() -> Result<()> {
         Command::Stop(args) => {
             send(RequestParams::Stop(StopRequest { outputs: normalize_outputs(args.outputs) }))
         }
-        Command::Pause => send(RequestParams::Pause(PauseRequest { paused: true })),
-        Command::Resume => send(RequestParams::Pause(PauseRequest { paused: false })),
+        Command::Pause => send(RequestParams::Pause(PauseRequest {
+            overrides: std::collections::BTreeMap::new(),
+            paused: true,
+            outputs: Vec::new(),
+        })),
+        Command::Resume => send(RequestParams::Pause(PauseRequest {
+            overrides: std::collections::BTreeMap::new(),
+            paused: false,
+            outputs: Vec::new(),
+        })),
         Command::Audio(args) => send(RequestParams::AudioSet(AudioSetRequest {
+            duck: None,
             outputs: normalize_outputs(args.outputs),
             mute: args.mute,
             volume: args.volume,
+            system_audio: args.spectrum_source.map(crate::cli::SpectrumSourceArg::system),
         })),
         Command::Status => send(RequestParams::Status(StatusRequest {})),
         Command::Outputs => {
             println!("{}", serde_json::to_string_pretty(&crate::outputs::query()?)?);
+            Ok(())
+        }
+        Command::Transitions => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&paper_control::transitions::STUDIO_TRANSITIONS)?
+            );
             Ok(())
         }
         Command::Capabilities(args) => send(RequestParams::Capabilities(CapabilitiesRequest {
@@ -66,9 +83,8 @@ fn apply_request(args: crate::cli::ApplyArgs) -> Result<ApplyRequest> {
     let output = args.output.ok_or_else(|| anyhow!("apply requires OUTPUT"))?;
     let path = args.path.ok_or_else(|| anyhow!("apply requires PATH"))?;
     let kind = args.kind.map_or_else(|| infer_kind(&path), source_kind);
-    let engine = args.engine.map(video_engine);
     let properties = args.properties.as_deref().map(parse_properties).transpose()?;
-    let source = Source { kind, path, engine, frame_rate: args.frame_rate, properties };
+    let source = Source { kind, path, properties };
     let outputs = normalize_outputs(output.split(',').map(str::to_string).collect());
     let mut assignment = Assignment::new(outputs, source);
     if let Some(fill_mode) = args.fill_mode {
@@ -89,6 +105,8 @@ fn apply_request(args: crate::cli::ApplyArgs) -> Result<ApplyRequest> {
         || args.duration_ms.is_some()
     {
         assignment.transition = Some(TransitionPolicy {
+            drawing_source: None,
+            drawing: None,
             fps: None,
             from: args.transition_from,
             effect: args.effect,
@@ -177,13 +195,6 @@ const fn source_kind(kind: KindArg) -> SourceKind {
         KindArg::Static => SourceKind::Static,
         KindArg::Video => SourceKind::Video,
         KindArg::We => SourceKind::WallpaperEngine,
-    }
-}
-
-const fn video_engine(engine: EngineArg) -> VideoEngine {
-    match engine {
-        EngineArg::Default => VideoEngine::Default,
-        EngineArg::Tinier => VideoEngine::Tinier,
     }
 }
 

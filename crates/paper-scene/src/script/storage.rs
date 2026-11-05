@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 const LIMIT: u64 = 100 * 1024;
 
+#[derive(Clone)]
 pub struct Storage {
     paths: [PathBuf; 2],
     pub(super) data: Value,

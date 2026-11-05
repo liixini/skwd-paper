@@ -3,14 +3,16 @@ use super::*;
 fn mouse() -> SceneMouse {
     SceneMouse {
         enabled: true,
+        reads_pointer: true,
         config: Parallax::default(),
         base: Parallax::default(),
         shake: Shake::default(),
         shake_on: false,
-        shake_time: 0.0,
+        authored_camera: false,
         shake_offset: [0.0; 2],
         layers: Vec::new(),
         position: [0.5; 2],
+        inside: true,
         previous: [0.5; 2],
         buttons: [false; 3],
         displacement: [0.0; 2],
@@ -22,6 +24,18 @@ fn mouse() -> SceneMouse {
         fov: 50.0,
         shadows: Vec::new(),
     }
+}
+
+#[test]
+fn pointer_leave_preserves_position() {
+    let mut mouse = mouse();
+    mouse.update(1, [0.25; 2], [true, false, false], (1920, 1080), paper_geom::FillMode::Fill);
+    mouse.update(2, [-1.0; 2], [false; 3], (1920, 1080), paper_geom::FillMode::Tile);
+    assert_eq!(mouse.position, [0.25; 2]);
+    assert!(!mouse.inside);
+    assert_eq!(mouse.buttons, [false; 3]);
+    mouse.update(3, [0.25; 2], [false; 3], (1920, 1080), paper_geom::FillMode::Fill);
+    assert!(mouse.inside);
 }
 
 #[test]
@@ -40,12 +54,41 @@ fn pointer_mapping_accounts_for_crop_bars_and_buttons() {
 }
 
 #[test]
+fn controller_revision_collision() {
+    let mut mouse = mouse();
+    let mode = paper_geom::FillMode::Stretch;
+    mouse.update(1, [0.25, 0.25], [false; 3], (1920, 1080), mode);
+    mouse.dirty = false;
+    mouse.update(1, [0.75, 0.25], [true, false, false], (1920, 1080), mode);
+    assert_eq!(mouse.position, [0.75, 0.25]);
+    assert_eq!(mouse.buttons, [true, false, false]);
+    assert!(mouse.pending());
+    mouse.dirty = false;
+    mouse.update(1, [0.75, 0.25], [true, false, false], (1920, 1080), mode);
+    assert!(!mouse.pending());
+}
+
+#[test]
 fn neutral_projection_preserves_rect_and_tilt_has_perspective() {
     let clock = Clock3d { origin: [500.0, 400.0] };
     let rect = [500.0, 400.0, 200.0, 100.0];
-    let base = projection(clock, rect, [1000.0, 800.0], [0.5; 2], false, 50.0);
+    let base = projection(
+        clock,
+        MouseLayer { mouse: LayerMouse::default(), rect, projection: None, pose: None },
+        [1000.0, 800.0],
+        [0.5; 2],
+        false,
+        50.0,
+    );
     assert_eq!(base, [[0.4, 0.0, 0.0, 0.0], [0.0, 0.25, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]);
-    let tilted = projection(clock, rect, [1000.0, 800.0], [0.1, 0.2], false, 50.0);
+    let tilted = projection(
+        clock,
+        MouseLayer { mouse: LayerMouse::default(), rect, projection: None, pose: None },
+        [1000.0, 800.0],
+        [0.1, 0.2],
+        false,
+        50.0,
+    );
     assert_ne!(tilted[2][0], 0.0);
     assert_ne!(tilted[2][1], 0.0);
     assert!(tilted.iter().flatten().all(|value| value.is_finite()));
@@ -62,7 +105,7 @@ fn rendered_clock_and_shadow_follow_pointer_and_stop_when_it_stops() {
     model.particles.clear();
     model.clear = [0.5; 3];
     assert!(model.layers[0].mouse.clock.is_some());
-    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let sd = crate::shared::test_device();
     let mut group = super::super::build_group(
         &sd,
         &mut model,
@@ -81,6 +124,7 @@ fn rendered_clock_and_shadow_follow_pointer_and_stop_when_it_stops() {
             month: 9,
             year: 2026,
             weekday: 5,
+            millisecond: 0,
         })
         .unwrap();
     assert!(!group.frozen);
@@ -92,7 +136,7 @@ fn rendered_clock_and_shadow_follow_pointer_and_stop_when_it_stops() {
     assert_eq!(ordered[0].tint[..3], [0.0; 3]);
     assert_eq!(ordered[1].tint[..3], [1.0; 3]);
     if let Ok(evidence) = std::env::var("SKWD_WE_CLOCK_EVIDENCE") {
-        let clock = group.mouse.layers[0].0.clock.unwrap();
+        let clock = group.mouse.layers[0].mouse.clock.unwrap();
         group.mouse.position = [
             clock.origin[0] / group.mouse.canvas[0],
             1.0 - clock.origin[1] / group.mouse.canvas[1],
@@ -107,7 +151,7 @@ fn rendered_clock_and_shadow_follow_pointer_and_stop_when_it_stops() {
             image::ColorType::Rgba8,
         )
         .unwrap();
-        std::fs::write(std::path::Path::new(&evidence).join("mouse-clock-geometry.json"), serde_json::json!({"rect":group.mouse.layers[0].1,"origin":clock.origin,"canvas":group.mouse.canvas,"fov":group.mouse.fov}).to_string()).unwrap();
+        std::fs::write(std::path::Path::new(&evidence).join("mouse-clock-geometry.json"), serde_json::json!({"rect":group.mouse.layers[0].rect,"origin":clock.origin,"canvas":group.mouse.canvas,"fov":group.mouse.fov}).to_string()).unwrap();
     }
     let mut frames = Vec::new();
     for (index, pointer) in [[0.1, 0.2], [0.9, 0.8], [0.1, 0.2]].into_iter().enumerate() {
@@ -157,22 +201,28 @@ fn pointer_shader_survives_baking_and_receives_position_and_button() {
     let layer = &mut model.layers[0];
     layer.mouse = LayerMouse::default();
     layer.live_text = None;
-    layer.is_text = false;
+    layer.kind = paper_scene::model::LayerKind::Image;
+    layer.geometry = None;
     layer.center = (32.0, 32.0);
     layer.size = (64.0, 64.0);
     layer.texture = paper_scene::model::solid_texture();
     layer.effects = vec![Effect {
+        state: paper_scene::effects::EffectState::default(),
         name: "Pointer probe".into(),
         fbos: Vec::new(),
         swaps: Vec::new(),
+        clear_functions: std::collections::BTreeMap::new(),
         passes: vec![EffectPass {
+            blend: paper_scene::effects::PassBlend::Copy,
             property_source: None,
+            user_uniforms: std::collections::BTreeSet::new(),
             name: "Pointer probe".into(),
             vertex: translate(
                 "attribute vec3 a_Position;\nvoid main() { gl_Position = vec4(a_Position, 1.0); }",
                 Stage::Vertex,
                 &Default::default(),
             ),
+            geometry: None,
             fragment: translate(
                 "uniform vec2 g_PointerPosition;\nuniform vec4 g_PointerState;\nvoid main() { gl_FragColor = vec4(g_PointerPosition, g_PointerState.x, 1.0); }",
                 Stage::Fragment,
@@ -185,7 +235,7 @@ fn pointer_shader_survives_baking_and_receives_position_and_button() {
             binds: Vec::new(),
         }],
     }];
-    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let sd = crate::shared::test_device();
     let mut group =
         super::super::build_group(&sd, &mut model, true, &[(64, 64)], paper_geom::FillMode::Fit)
             .unwrap();
@@ -222,10 +272,12 @@ fn cherry_blossom_particles_follow_pointer_in_a_particle_only_scene() {
     let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
     let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
     model.layers.clear();
+    model.scripts = None;
     model.particles.retain(|layer| layer.system.follows_mouse());
     assert_eq!(model.particles.len(), 1);
     model.clear = [0.0; 3];
-    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    assert!(SceneMouse::new(&model).enabled);
+    let sd = crate::shared::test_device();
     let mut group =
         super::super::build_group(&sd, &mut model, true, &[(320, 180)], paper_geom::FillMode::Fit)
             .unwrap();
@@ -282,7 +334,7 @@ fn depth_parallax_moves_with_zero_camera_amount_and_settles() {
         .effects
         .retain(|effect| effect.passes.iter().any(|pass| pass.name.contains("depthparallax")));
     assert_eq!(model.layers[0].effects.len(), 1);
-    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let sd = crate::shared::test_device();
     let mut group =
         super::super::build_group(&sd, &mut model, true, &[(640, 360)], paper_geom::FillMode::Fit)
             .unwrap();
@@ -349,7 +401,7 @@ fn parallax_layer_translation_matches_proton_and_zero_depth_pixels_stay_fixed() 
     let dir = std::path::PathBuf::from(std::env::var("SKWD_WE_CLOCK_LIBRARY").unwrap())
         .join("3016047975");
     let pkg = paper_scene::pkg::Package::open(&dir.join("scene.pkg")).unwrap();
-    let sd = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let sd = crate::shared::test_device();
     for (width, height) in [(1366, 768), (1920, 1080), (2560, 1440)] {
         for depth in [0.0, 1.0] {
             let mut model = paper_scene::model::load_from_dir(&pkg, &dir).unwrap();
@@ -363,6 +415,7 @@ fn parallax_layer_translation_matches_proton_and_zero_depth_pixels_stay_fixed() 
             let layer = &mut model.layers[0];
             layer.effects.clear();
             layer.texture = paper_scene::model::solid_texture();
+            layer.geometry = None;
             layer.center = (width as f32 * 0.5, height as f32 * 0.5);
             layer.size = (width as f32, height as f32);
             layer.mouse = LayerMouse { parallax: [depth; 2], clock: None };
@@ -425,4 +478,50 @@ fn particle_parallax_moves_in_world_axes_and_preserves_pointer_attachment() {
     assert_eq!(pointer, [360.0, 202.5]);
     assert_eq!([pointer[0] + offset[0], pointer[1] + offset[1]], [480.0, 270.0]);
     assert_eq!(mouse.particle_offset([0.0; 2]), [0.0; 2]);
+}
+
+#[test]
+fn pointer_material_passes() {
+    for name in ["g_PointerPosition", "g_ParallaxPosition"] {
+        let mut model = super::super::tests::mesh_sampler_model(
+                br#"{"general":{"orthogonalprojection":{"width":16,"height":16}},"objects":[{"id":1,"image":"models/sample.json","origin":"8 8 0","size":"16 16"}]}"#,
+                br#"{"passes":[{"shader":"sample","textures":["_rt_MipMappedFrameBuffer"],"blending":"normal"},{"shader":"sample","textures":["_rt_MipMappedFrameBuffer"],"blending":"normal"}]}"#,
+                b"uniform sampler2D g_Texture0;\nvoid main(){gl_FragColor=vec4(texSample2D(g_Texture0,vec2(0.5)).rgb,1.0);}",
+            );
+        assert!(!SceneMouse::new(&model).enabled);
+        let material = model.layers[0].material.as_mut().unwrap();
+        let pass = &mut material.pass;
+        pass.fragment.uniforms.push(paper_scene::shader::Uniform {
+            name: name.into(),
+            kind: paper_scene::shader::UniformKind::Vec2,
+            default: None,
+            material: None,
+            offset: 0,
+            count: 1,
+        });
+        let mouse = SceneMouse::new(&model);
+        assert!(mouse.enabled);
+        assert_eq!(mouse.parallax_position.is_some(), name == "g_ParallaxPosition");
+    }
+}
+
+#[test]
+fn shake_ignores_pointer() {
+    let scene = |general: &str| {
+        format!(
+            r#"{{"general":{{"orthogonalprojection":{{"width":64,"height":64}},{general}}},"objects":[{{"id":1,"image":"models/flat.json","origin":"32 32 0","size":"16 16","parallaxDepth":"1 1"}}]}}"#
+        )
+    };
+    let mouse = |general: &str| {
+        let scene = scene(general);
+        let model = super::super::effect_lifetime_tests::model_files(&[
+            ("scene.json", scene.as_bytes()),
+            ("models/flat.json", br#"{"material":"materials/flat.json"}"#),
+            ("materials/flat.json", br#"{"passes":[{"shader":"flat"}]}"#),
+        ]);
+        let mouse = SceneMouse::new(&model);
+        (mouse.enabled, mouse.reads_pointer)
+    };
+    assert_eq!(mouse(r#""camerashake":true"#), (true, false));
+    assert_eq!(mouse(r#""cameraparallax":true,"cameraparallaxamount":1"#), (true, true));
 }

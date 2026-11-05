@@ -4,7 +4,7 @@ use crate::fill::mode_uv;
 use crate::shared;
 use crate::timing::Pacer;
 use crate::{ctl, decode, vk, wayland};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::time::{Duration, Instant};
 
 pub(super) fn run_shared(
@@ -13,6 +13,7 @@ pub(super) fn run_shared(
     mute: bool,
     volume: u32,
 ) -> Result<()> {
+    ensure!(!target.hidden, "hidden preparation requires shared presentation");
     let sd = shared::create(target.display_ptr()).context("shared device")?;
     if !sd.queue_sync {
         tracing::info!(
@@ -21,14 +22,7 @@ pub(super) fn run_shared(
         return super::upload::run_upload(target, video, mute, volume);
     }
     tracing::info!("skwd-wall-vk: shared VkDevice accepted by ffmpeg");
-    let mut dec = decode::open_decoder(
-        video,
-        Some(sd.hwdev),
-        sd.video_decode,
-        sd.render_node.as_deref(),
-        shared::software_decode_required(sd.software, sd.queue_sync),
-    )
-    .context("decoder on shared device")?;
+    let mut dec = sd.open_decoder(video).context("decoder on shared device")?;
     if dec.still() {
         return Err(anyhow::anyhow!("still sources are rendered by skwd-wall-still"));
     }
@@ -69,7 +63,7 @@ pub(super) fn run_shared(
         }
         poll_ignoring_swap(&mut ctl);
         crate::freeze::write_last_requested(&mut ctl, last_presented.as_ref())?;
-        if ctl.paused && !ctl.freeze_pending() {
+        if frames > 0 && ctl.paused && !ctl.freeze_pending() {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }

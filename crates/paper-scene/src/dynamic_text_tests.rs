@@ -2,7 +2,16 @@ use super::{LocalTime, media_bound, media_scripted, resolve, substitute, weekday
 use serde_json::json;
 
 fn now() -> LocalTime {
-    LocalTime { hour: 14, minute: 7, second: 9, day: 8, month: 9, year: 2026, weekday: 2 }
+    LocalTime {
+        hour: 14,
+        minute: 7,
+        second: 9,
+        day: 8,
+        month: 9,
+        year: 2026,
+        weekday: 2,
+        millisecond: 0,
+    }
 }
 
 #[test]

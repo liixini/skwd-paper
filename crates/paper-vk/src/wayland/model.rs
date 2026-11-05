@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use wayland_client::protocol::{
     wl_compositor, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface,
 };
@@ -40,7 +41,7 @@ pub struct SurfaceUi {
     pub position: Option<(i32, i32)>,
     pub surface: wl_surface::WlSurface,
     pub(super) _input_region: Option<wl_region::WlRegion>,
-    pub(super) _layer: ZwlrLayerSurfaceV1,
+    pub(super) layer: ZwlrLayerSurfaceV1,
     pub width: u32,
     pub height: u32,
     pub scale: i32,
@@ -57,7 +58,7 @@ pub struct SurfaceUi {
     pub feedbacks: Vec<u64>,
     pub viewport: Option<WpViewport>,
     pub(super) _content_type: Option<WpContentTypeV1>,
-    pub(super) source: Option<[u32; 4]>,
+    pub(crate) source: Option<[u32; 4]>,
     pub(super) attached: Option<wayland_client::protocol::wl_buffer::WlBuffer>,
     pub(super) mirror: Option<super::mirror::SurfaceMirror>,
 }
@@ -113,6 +114,55 @@ pub struct App {
     pub probe_result: Option<bool>,
     pub resized: bool,
     pub(super) mirror_buffers: super::mirror::Buffers,
+    pub(super) buffer_generations: BufferGenerations,
+    pub(super) pointer_surfaces: Vec<super::pointer::PointerSurface>,
+}
+
+#[derive(Default)]
+pub(super) struct BufferGenerations {
+    current: u64,
+    staging: bool,
+    pending: HashMap<u64, usize>,
+}
+
+impl BufferGenerations {
+    pub(super) fn current(&self) -> u64 {
+        self.current
+    }
+
+    pub(super) fn allocation(&self) -> u64 {
+        self.current.checked_add(u64::from(self.staging)).expect("buffer generation exhausted")
+    }
+
+    pub(super) fn stage(&mut self, staging: bool) {
+        self.staging = staging;
+    }
+
+    pub(super) fn rotate(&mut self, outstanding: usize) -> u64 {
+        let old = self.current;
+        if outstanding > 0 {
+            self.pending.insert(old, outstanding);
+        }
+        self.current = self.current.checked_add(1).expect("buffer generation exhausted");
+        old
+    }
+
+    pub(super) fn release(&mut self, generation: u64) -> bool {
+        if generation == self.current {
+            return true;
+        }
+        if let Some(count) = self.pending.get_mut(&generation) {
+            *count -= 1;
+            if *count == 0 {
+                self.pending.remove(&generation);
+            }
+        }
+        false
+    }
+
+    pub(super) fn retired(&self, generation: u64) -> bool {
+        !self.pending.contains_key(&generation)
+    }
 }
 
 impl App {
@@ -145,6 +195,7 @@ impl App {
 }
 
 pub struct Target {
+    pub hidden: bool,
     pub layer: wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer,
     pub conn: Connection,
     pub queue: EventQueue<App>,

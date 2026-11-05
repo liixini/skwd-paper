@@ -11,7 +11,7 @@ impl Renderer {
         uv: [f32; 4],
     ) -> Result<()> {
         unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.wait_render()?;
             let (idx, _) = match self.swapchain_fns.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
@@ -122,40 +122,20 @@ impl Renderer {
             }
             let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
             let cmds = [self.cmd];
-            let signals = [self.render_sem, vkf.frame.semaphore(0)];
+            let signals = [self.render_sems[idx as usize], vkf.frame.semaphore(0)];
             let signal_values = [0u64, vkf.signal];
             let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
                 .wait_semaphore_values(&wait_values)
                 .signal_semaphore_values(&signal_values);
-            self.device.reset_fences(&[self.fence])?;
-            {
-                let _qg = self.queue_guard();
-                self.device.queue_submit(
-                    self.queue,
-                    &[vk::SubmitInfo::default()
-                        .push_next(&mut timeline)
-                        .wait_semaphores(&waits)
-                        .wait_dst_stage_mask(&stages)
-                        .command_buffers(&cmds)
-                        .signal_semaphores(&signals)],
-                    self.fence,
-                )?;
-            }
+            self.submit_fenced(&[vk::SubmitInfo::default()
+                .push_next(&mut timeline)
+                .wait_semaphores(&waits)
+                .wait_dst_stage_mask(&stages)
+                .command_buffers(&cmds)
+                .signal_semaphores(&signals)])?;
             vkf.commit_sampled();
-            let swapchains = [self.swapchain];
-            let indices = [idx];
-            let render_done = [self.render_sem];
-            let present = {
-                let _qg = self.queue_guard();
-                self.swapchain_fns.queue_present(
-                    self.queue,
-                    &vk::PresentInfoKHR::default()
-                        .wait_semaphores(&render_done)
-                        .swapchains(&swapchains)
-                        .image_indices(&indices),
-                )
-            };
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            let present = self.present_image(idx);
+            self.wait_render()?;
             match present {
                 Ok(_) | Err(vk::Result::SUBOPTIMAL_KHR) => {}
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swapchain()?,

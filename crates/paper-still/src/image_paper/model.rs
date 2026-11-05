@@ -7,6 +7,7 @@ use smithay_client_toolkit::{
     output::OutputState,
     registry::RegistryState,
     shm::{Shm, slot::SlotPool},
+    subcompositor::SubcompositorState,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 pub(super) struct ReadyBuffer {
     pub(super) buffer: BufferSet,
+    pub(super) image: (u32, u32),
     pub(super) for_w: u32,
     pub(super) for_h: u32,
 }
@@ -53,6 +55,8 @@ pub(super) struct App {
     pub(super) registry_state: RegistryState,
     pub(super) output_state: OutputState,
     pub(super) compositor_state: CompositorState,
+    pub(super) subcompositor: Option<SubcompositorState>,
+    pub(super) widgets: Option<super::widgets::Widgets>,
     pub(super) shm: Shm,
     pub(super) layer_shell: ZwlrLayerShellV1,
     pub(super) viewporter: WpViewporter,
@@ -93,5 +97,6 @@ pub(super) struct SurfaceState {
     pub(super) span_pool: Option<SlotPool>,
     pub(super) span_keepalive: Option<smithay_client_toolkit::shm::slot::Buffer>,
     pub(super) shown: Option<super::mirror::Shown>,
+    pub(super) shown_at: u64,
     pub(super) mirror: Option<super::mirror::Mirror>,
 }

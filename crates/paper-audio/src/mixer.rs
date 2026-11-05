@@ -12,8 +12,10 @@ use ringbuf::traits::{Consumer, Observer, Split};
 use crate::decoder::{Repeat, decode_loop, signal_stop, wake_parked};
 
 const TARGET_SAMPLE_RATE: u32 = 48_000;
+const OUTPUT_CHANNELS: u16 = 2;
 const RING_FRAMES: usize = TARGET_SAMPLE_RATE as usize / 5;
 const MAX_VOICES: usize = 32;
+const MAX_VOLUME: u32 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VoiceMode {
@@ -42,11 +44,165 @@ pub enum VoiceOp {
     Gain(f32),
 }
 
+pub struct SceneConfig {
+    pub mute: bool,
+    pub volume: u32,
+    pub wake: Option<paper_runtime::wake::Pipe>,
+    pub tap: Option<crate::spectrum::PlaybackTap>,
+}
+
+impl Default for SceneConfig {
+    fn default() -> Self {
+        Self { mute: false, volume: MAX_VOLUME, wake: None, tap: None }
+    }
+}
+
+struct SceneEvents {
+    pending: AtomicBool,
+    wake: Option<paper_runtime::wake::Pipe>,
+}
+
+impl SceneEvents {
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        if let Some(wake) = &self.wake {
+            wake.poke();
+        }
+    }
+
+    fn take(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Playback {
+    timestamp: cpal::OutputStreamTimestamp,
+    duration: Duration,
+}
+
+impl Playback {
+    fn new(info: &cpal::OutputCallbackInfo, samples: usize) -> Self {
+        let frames = samples / usize::from(OUTPUT_CHANNELS);
+        let nanos = (frames as u128 * Duration::from_secs(1).as_nanos())
+            .div_ceil(u128::from(TARGET_SAMPLE_RATE));
+        Self {
+            timestamp: info.timestamp(),
+            duration: Duration::from_nanos(u64::try_from(nanos).expect("audio buffer duration")),
+        }
+    }
+}
+
+#[derive(Default)]
+struct VoiceState {
+    generation: u64,
+    decoding: bool,
+    drain: Option<Playback>,
+}
+
 struct VoiceOutput {
     consumer: ringbuf::HeapCons<f32>,
     gain: Arc<AtomicU32>,
     hold: Arc<AtomicBool>,
     flush: Arc<AtomicBool>,
+    eof_pending: Arc<AtomicBool>,
+    state: Arc<Mutex<VoiceState>>,
+    decoder_thread: std::thread::Thread,
+    events: Arc<SceneEvents>,
+}
+
+impl VoiceOutput {
+    fn mix(
+        &mut self,
+        data: &mut [f32],
+        scratch: &mut [f32],
+        muted: bool,
+        playback: Option<Playback>,
+    ) {
+        let flush = self.flush.load(Ordering::Relaxed);
+        if self.hold.load(Ordering::Relaxed) && !flush {
+            return;
+        }
+        if muted {
+            let _ = self.consumer.skip(data.len());
+            if flush {
+                self.finish_flush();
+            } else {
+                self.finish_eof(playback);
+            }
+            return;
+        }
+        let popped = self.consumer.pop_slice(&mut scratch[..data.len()]);
+        if flush {
+            self.finish_flush();
+            return;
+        }
+        let gain = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        if gain != 0.0 {
+            for (sample, voice) in data.iter_mut().zip(&scratch[..popped]) {
+                *sample += voice * gain;
+            }
+        }
+        self.finish_eof(playback);
+    }
+
+    fn finish_flush(&self) {
+        let Ok(state) = self.state.try_lock() else {
+            return;
+        };
+        if !state.decoding && self.consumer.occupied_len() == 0 {
+            self.flush.store(false, Ordering::Relaxed);
+            drop(state);
+            self.decoder_thread.unpark();
+            self.events.notify();
+        }
+    }
+
+    fn finish_eof(&self, playback: Option<Playback>) {
+        let Ok(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if self.eof_pending.load(Ordering::Acquire) && self.consumer.occupied_len() == 0 {
+            if let Some(playback) = playback {
+                let drain = state.drain.get_or_insert(playback);
+                if playback
+                    .timestamp
+                    .callback
+                    .checked_duration_since(drain.timestamp.playback)
+                    .is_none_or(|elapsed| elapsed < drain.duration)
+                {
+                    return;
+                }
+            }
+            state.drain = None;
+            self.hold.store(true, Ordering::Release);
+            self.eof_pending.store(false, Ordering::Release);
+            drop(state);
+            self.decoder_thread.unpark();
+            self.events.notify();
+        }
+    }
+}
+
+fn mix_outputs(
+    outputs: &mut [VoiceOutput],
+    data: &mut [f32],
+    scratch: &mut Vec<f32>,
+    muted: bool,
+    volume: u32,
+    playback: Option<Playback>,
+) {
+    data.fill(0.0);
+    if scratch.len() < data.len() {
+        scratch.resize(data.len(), 0.0);
+    }
+    for output in outputs {
+        output.mix(data, scratch, muted, playback);
+    }
+    let master = volume as f32 / MAX_VOLUME as f32;
+    for sample in data {
+        *sample = (*sample * master).clamp(-1.0, 1.0);
+    }
 }
 
 struct VoiceControl {
@@ -56,13 +212,58 @@ struct VoiceControl {
     hold: Arc<AtomicBool>,
     restart: Arc<AtomicBool>,
     flush: Arc<AtomicBool>,
+    eof_pending: Arc<AtomicBool>,
+    state: Arc<Mutex<VoiceState>>,
     wake: Arc<(Mutex<()>, Condvar)>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl VoiceControl {
+    fn is_playing(&self) -> bool {
+        !self.hold.load(Ordering::Relaxed)
+    }
+
+    fn needs_output(&self) -> bool {
+        self.is_playing() || self.flush.load(Ordering::Relaxed)
+    }
+
+    fn apply(&self, op: VoiceOp) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match op {
+            VoiceOp::Play => {
+                if self.hold.swap(false, Ordering::Relaxed) {
+                    state.drain = None;
+                }
+            }
+            VoiceOp::Stop => {
+                state.drain = None;
+                state.generation = state.generation.wrapping_add(1);
+                self.eof_pending.store(false, Ordering::Release);
+                self.hold.store(true, Ordering::Relaxed);
+                self.restart.store(true, Ordering::Relaxed);
+                self.flush.store(true, Ordering::Relaxed);
+            }
+            VoiceOp::Pause => {
+                if !self.hold.swap(true, Ordering::Relaxed) {
+                    state.drain = None;
+                }
+            }
+            VoiceOp::Gain(gain) => self.gain.store(gain_bits(gain), Ordering::Relaxed),
+        }
+    }
+
+    fn wake(&self) {
+        wake_parked(&self.wake);
+        if let Some(thread) = &self.thread {
+            thread.thread().unpark();
+        }
+    }
+
     fn signal(&self) {
         signal_stop(&self.stop, &self.wake);
+        if let Some(thread) = &self.thread {
+            thread.thread().unpark();
+        }
     }
 
     fn join(&mut self) {
@@ -82,11 +283,22 @@ impl Drop for VoiceControl {
     }
 }
 
+fn set_transport(flag: &AtomicBool, value: bool, voices: &[VoiceControl]) -> bool {
+    if flag.swap(value, Ordering::Relaxed) == value {
+        return false;
+    }
+    for voice in voices {
+        voice.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain = None;
+    }
+    true
+}
+
 pub struct SceneMixer {
     mute: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     volume_x100: Arc<AtomicU32>,
     voices: Vec<VoiceControl>,
+    events: Arc<SceneEvents>,
     stream: cpal::Stream,
 }
 
@@ -131,7 +343,9 @@ fn park(wake: &(Mutex<()>, Condvar), stop: &AtomicBool, mut remaining: Duration)
 }
 
 impl SceneMixer {
-    pub fn new(voices: &[Voice], mute: bool, volume: u32) -> Result<Option<Self>> {
+    pub fn new(voices: &[Voice], config: SceneConfig) -> Result<Option<Self>> {
+        let SceneConfig { mute, volume, wake, tap } = config;
+        let events = Arc::new(SceneEvents { pending: AtomicBool::new(false), wake });
         let playable_voices: Vec<Voice> = voices
             .iter()
             .take(MAX_VOICES)
@@ -147,7 +361,7 @@ impl SceneMixer {
 
         let mute_flag = Arc::new(AtomicBool::new(mute));
         let paused_flag = Arc::new(AtomicBool::new(false));
-        let volume_flag = Arc::new(AtomicU32::new(volume.min(100)));
+        let volume_flag = Arc::new(AtomicU32::new(volume.min(MAX_VOLUME)));
 
         let mut outputs = Vec::with_capacity(playable_voices.len());
         let mut controls = Vec::with_capacity(playable_voices.len());
@@ -159,14 +373,9 @@ impl SceneMixer {
             let hold = Arc::new(AtomicBool::new(!voice.autostart));
             let restart = Arc::new(AtomicBool::new(false));
             let flush = Arc::new(AtomicBool::new(false));
+            let eof_pending = Arc::new(AtomicBool::new(false));
+            let state = Arc::new(Mutex::new(VoiceState::default()));
             let wake = Arc::new((Mutex::new(()), Condvar::new()));
-            outputs.push(VoiceOutput {
-                consumer,
-                gain: gain.clone(),
-                hold: hold.clone(),
-                flush: flush.clone(),
-            });
-
             let thread_stop = stop.clone();
             let thread_wake = wake.clone();
             let thread_mute = mute_flag.clone();
@@ -174,6 +383,9 @@ impl SceneMixer {
             let thread_hold = hold.clone();
             let thread_restart = restart.clone();
             let thread_flush = flush.clone();
+            let thread_eof_pending = eof_pending.clone();
+            let thread_state = state.clone();
+            let thread_events = events.clone();
             let id = voice.id.clone();
             let thread = std::thread::Builder::new()
                 .name("skwd-scene-voice".into())
@@ -190,11 +402,26 @@ impl SceneMixer {
                             hold: &thread_hold,
                             restart: &thread_restart,
                             flush: &thread_flush,
+                            eof_pending: &thread_eof_pending,
+                            state: &thread_state,
+                            events: &thread_events,
+                            #[cfg(test)]
+                            decode_hook: None,
                         },
                         &thread_wake,
                     );
                 })
                 .map_err(|error| anyhow!("spawn scene voice thread: {error:?}"))?;
+            outputs.push(VoiceOutput {
+                consumer,
+                gain: gain.clone(),
+                hold: hold.clone(),
+                flush: flush.clone(),
+                eof_pending: eof_pending.clone(),
+                state: state.clone(),
+                decoder_thread: thread.thread().clone(),
+                events: events.clone(),
+            });
             controls.push(VoiceControl {
                 id,
                 gain,
@@ -202,6 +429,8 @@ impl SceneMixer {
                 hold,
                 restart,
                 flush,
+                eof_pending,
+                state,
                 wake,
                 thread: Some(thread),
             });
@@ -212,8 +441,8 @@ impl SceneMixer {
             .default_output_device()
             .ok_or_else(|| anyhow!("no default audio output device"))?;
         let config = cpal::StreamConfig {
-            channels: 2,
-            sample_rate: cpal::SampleRate(TARGET_SAMPLE_RATE),
+            channels: OUTPUT_CHANNELS,
+            sample_rate: TARGET_SAMPLE_RATE,
             buffer_size: cpal::BufferSize::Default,
         };
         let callback_mute = mute_flag.clone();
@@ -221,49 +450,26 @@ impl SceneMixer {
         let mut scratch: Vec<f32> = Vec::new();
         let stream = device
             .build_output_stream(
-                &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if callback_mute.load(Ordering::Relaxed) {
-                        for output in &mut outputs {
-                            let _ = output.consumer.skip(data.len());
-                        }
-                        data.fill(0.0);
-                        return;
-                    }
-                    data.fill(0.0);
-                    if scratch.len() < data.len() {
-                        scratch.resize(data.len(), 0.0);
-                    }
-                    for output in &mut outputs {
-                        let flush = output.flush.load(Ordering::Relaxed);
-                        if output.hold.load(Ordering::Relaxed) && !flush {
-                            continue;
-                        }
-                        let gain = f32::from_bits(output.gain.load(Ordering::Relaxed));
-                        let popped = output.consumer.pop_slice(&mut scratch[..data.len()]);
-                        if flush {
-                            if output.consumer.occupied_len() == 0 {
-                                output.flush.store(false, Ordering::Relaxed);
-                            }
-                            continue;
-                        }
-                        if gain == 0.0 {
-                            continue;
-                        }
-                        for (sample, voice) in data.iter_mut().zip(&scratch[..popped]) {
-                            *sample += voice * gain;
-                        }
-                    }
-                    let master = callback_volume.load(Ordering::Relaxed) as f32 / 100.0;
-                    for sample in data.iter_mut() {
-                        *sample = (*sample * master).clamp(-1.0, 1.0);
+                config,
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    let playback = Playback::new(info, data.len());
+                    mix_outputs(
+                        &mut outputs,
+                        data,
+                        &mut scratch,
+                        callback_mute.load(Ordering::Relaxed),
+                        callback_volume.load(Ordering::Relaxed),
+                        Some(playback),
+                    );
+                    if let Some(tap) = &tap {
+                        tap.write(data);
                     }
                 },
                 |error| tracing::warn!("cpal scene mixer stream: {error:?}"),
                 None,
             )
             .map_err(|error| anyhow!("cpal build_output_stream: {error:?}"))?;
-        if !mute {
+        if !mute && controls.iter().any(VoiceControl::needs_output) {
             stream.play().map_err(|error| anyhow!("cpal play: {error:?}"))?;
         }
 
@@ -272,21 +478,26 @@ impl SceneMixer {
             paused: paused_flag,
             volume_x100: volume_flag,
             voices: controls,
+            events,
             stream,
         }))
     }
 
     fn refresh_stream(&self) {
-        let all_held = self.voices.iter().all(|voice| {
-            voice.hold.load(Ordering::Relaxed) && !voice.flush.load(Ordering::Relaxed)
-        });
+        let all_held = !self.voices.iter().any(VoiceControl::needs_output);
         if self.mute.load(Ordering::Relaxed) || self.paused.load(Ordering::Relaxed) || all_held {
             let _ = self.stream.pause();
         } else {
             let _ = self.stream.play();
         }
         for voice in &self.voices {
-            wake_parked(&voice.wake);
+            voice.wake();
+        }
+    }
+
+    pub fn poll(&self) {
+        if self.events.take() {
+            self.refresh_stream();
         }
     }
 
@@ -294,39 +505,29 @@ impl SceneMixer {
         let Some(voice) = self.voices.iter().find(|voice| voice.id == id) else {
             return false;
         };
-        match op {
-            VoiceOp::Play => voice.hold.store(false, Ordering::Relaxed),
-            VoiceOp::Stop => {
-                voice.hold.store(true, Ordering::Relaxed);
-                voice.restart.store(true, Ordering::Relaxed);
-                voice.flush.store(true, Ordering::Relaxed);
-            }
-            VoiceOp::Pause => voice.hold.store(true, Ordering::Relaxed),
-            VoiceOp::Gain(gain) => voice.gain.store(gain_bits(gain), Ordering::Relaxed),
-        }
+        voice.apply(op);
         self.refresh_stream();
         true
     }
 
     pub fn voice_playing(&self, id: &str) -> bool {
-        self.voices
-            .iter()
-            .find(|voice| voice.id == id)
-            .is_some_and(|voice| !voice.hold.load(Ordering::Relaxed))
+        self.voices.iter().find(|voice| voice.id == id).is_some_and(VoiceControl::is_playing)
     }
 
     pub fn set_mute(&self, mute: bool) {
-        self.mute.store(mute, Ordering::Relaxed);
-        self.refresh_stream();
+        if set_transport(&self.mute, mute, &self.voices) {
+            self.refresh_stream();
+        }
     }
 
     pub fn set_pause(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Relaxed);
-        self.refresh_stream();
+        if set_transport(&self.paused, paused, &self.voices) {
+            self.refresh_stream();
+        }
     }
 
     pub fn set_volume(&self, volume: u32) {
-        self.volume_x100.store(volume.min(100), Ordering::Relaxed);
+        self.volume_x100.store(volume.min(MAX_VOLUME), Ordering::Relaxed);
     }
 
     pub fn voice_count(&self) -> usize {
@@ -346,6 +547,13 @@ impl Drop for SceneMixer {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeStage {
+    Started,
+    Finished,
+}
+
 struct VoiceFlags<'a> {
     stop: &'a AtomicBool,
     mute: &'a AtomicBool,
@@ -353,6 +561,11 @@ struct VoiceFlags<'a> {
     hold: &'a AtomicBool,
     restart: &'a AtomicBool,
     flush: &'a AtomicBool,
+    eof_pending: &'a AtomicBool,
+    state: &'a Mutex<VoiceState>,
+    events: &'a SceneEvents,
+    #[cfg(test)]
+    decode_hook: Option<&'a (dyn Fn(DecodeStage) + Sync)>,
 }
 
 fn wait_while_held(flags: &VoiceFlags<'_>, wake: &(Mutex<()>, Condvar)) {
@@ -366,7 +579,7 @@ fn wait_while_held(flags: &VoiceFlags<'_>, wake: &(Mutex<()>, Condvar)) {
 
 fn wait_while_flushing(flags: &VoiceFlags<'_>) {
     while flags.flush.load(Ordering::Relaxed) && !flags.stop.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::park();
     }
 }
 
@@ -387,8 +600,19 @@ fn run_voice(
         if flags.stop.load(Ordering::Relaxed) {
             return;
         }
-        flags.restart.store(false, Ordering::Relaxed);
         wait_while_flushing(flags);
+        if flags.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let generation = {
+            let mut state = flags.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if flags.hold.load(Ordering::Relaxed) || flags.flush.load(Ordering::Relaxed) {
+                continue;
+            }
+            flags.restart.store(false, Ordering::Relaxed);
+            state.decoding = true;
+            state.generation
+        };
         let clip = match voice.mode {
             VoiceMode::Random if voice.clips.len() > 1 => {
                 &voice.clips[(next_random(&mut random) as usize) % voice.clips.len()]
@@ -396,7 +620,11 @@ fn run_voice(
             _ => &voice.clips[0],
         };
         let repeat = if voice.mode == VoiceMode::Loop { Repeat::Forever } else { Repeat::Once };
-        match decode_loop(
+        #[cfg(test)]
+        if let Some(hook) = flags.decode_hook {
+            hook(DecodeStage::Started);
+        }
+        let decoded = decode_loop(
             clip,
             producer,
             flags.stop,
@@ -406,20 +634,46 @@ fn run_voice(
             flags.restart,
             wake,
             repeat,
-        ) {
+        );
+        #[cfg(test)]
+        if let Some(hook) = flags.decode_hook {
+            hook(DecodeStage::Finished);
+        }
+        let mut state = flags.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.decoding = false;
+        if state.generation != generation {
+            continue;
+        }
+        match decoded {
             Err(error) => {
+                flags.eof_pending.store(false, Ordering::Release);
+                flags.hold.store(true, Ordering::Relaxed);
+                flags.flush.store(true, Ordering::Relaxed);
+                flags.restart.store(true, Ordering::Relaxed);
+                drop(state);
+                flags.events.notify();
                 tracing::warn!("scene voice {} decode exited: {error:?}", voice.name);
-                return;
+                continue;
             }
             Ok(true) => continue,
             Ok(false) => {}
         }
         match voice.mode {
             VoiceMode::Loop | VoiceMode::Once => {
-                flags.hold.store(true, Ordering::Relaxed);
-                flags.restart.store(true, Ordering::Relaxed);
+                flags.eof_pending.store(true, Ordering::Release);
+                drop(state);
+                while flags.eof_pending.load(Ordering::Acquire)
+                    && !flags.stop.load(Ordering::Relaxed)
+                    && !flags.restart.load(Ordering::Relaxed)
+                {
+                    std::thread::park();
+                }
+                if flags.stop.load(Ordering::Relaxed) {
+                    return;
+                }
             }
             VoiceMode::Random => {
+                drop(state);
                 let span = f64::from(max_gap - min_gap);
                 let jitter = if span > 0.0 {
                     (next_random(&mut random) % 1_000_000) as f64 / 1_000_000.0 * span

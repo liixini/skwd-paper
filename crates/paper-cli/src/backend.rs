@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use paper_control::{
     Assignment, Layer, PaperCommand, RendererCapability, RendererDiscovery, RendererPolicy,
-    RuntimeDependencyStatus, SandQuality, SandScope, Source, SourceKind, StillCommand, VideoEngine,
+    RuntimeDependencyStatus, SandQuality, SandScope, Source, SourceKind, StillCommand,
 };
 use std::ffi::OsString;
 use std::io::Write;
@@ -14,6 +14,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
+
+const SPECTRUM_MODE_ENV: &str = "SKWD_VK_AUDIO_MODE";
+const SYSTEM_SPECTRUM: &str = "system";
+const WALLPAPER_SPECTRUM: &str = "wallpaper";
+
+fn spectrum_mode(assignment: &Assignment) -> &'static str {
+    if assignment.system_audio.unwrap_or(true) { SYSTEM_SPECTRUM } else { WALLPAPER_SPECTRUM }
+}
 
 const EXIT_GRACE: Duration = Duration::from_millis(500);
 
@@ -37,6 +45,11 @@ impl std::fmt::Display for RendererUnavailable {
 
 impl std::error::Error for RendererUnavailable {}
 
+pub(crate) struct OverlaySpec {
+    pub(crate) assignment: Assignment,
+    pub(crate) snapshot: Option<PathBuf>,
+}
+
 pub(crate) struct Worker {
     pub(crate) assignment: Assignment,
     pub(crate) output: String,
@@ -44,13 +57,25 @@ pub(crate) struct Worker {
     pub(crate) child: Child,
     pid: u32,
     physical_dynamic: bool,
+    pub(crate) drawing_hold: Option<Arc<tempfile::TempDir>>,
+    pub(crate) pending_photos: Vec<Arc<tempfile::TempDir>>,
     freeze_capable: bool,
-    retain_capable: bool,
+    surface_policy: bool,
     stdin: Option<ChildStdin>,
-    _freeze_directory: Option<Arc<tempfile::TempDir>>,
+    freeze_directories: Vec<Arc<tempfile::TempDir>>,
 }
 
 impl Worker {
+    pub(crate) fn control_file(&self) -> Result<std::fs::File> {
+        use std::os::fd::AsFd;
+        let stdin = self.stdin.as_ref().ok_or_else(|| anyhow!("Paper worker stdin unavailable"))?;
+        Ok(std::fs::File::from(stdin.as_fd().try_clone_to_owned()?))
+    }
+
+    pub(crate) fn retain_snapshot(&mut self, directory: Arc<tempfile::TempDir>) {
+        self.freeze_directories.push(directory);
+    }
+
     pub(crate) fn pid(&self) -> u32 {
         self.pid
     }
@@ -63,12 +88,48 @@ impl Worker {
         self.physical_dynamic
     }
 
+    pub(crate) async fn snapshot(&mut self, path: &Path, output: &str, hold: bool) -> Result<()> {
+        let path = path.display().to_string();
+        let mut command = PaperCommand::snapshot(&path, output);
+        if hold && self.dynamic() {
+            command.pause = Some(true);
+        }
+        self.send(&command).await
+    }
+
+    pub(crate) fn drawing_overlay(&self) -> bool {
+        self.drawing_hold.is_none()
+            && self
+                .assignment
+                .transition
+                .as_ref()
+                .is_some_and(|transition| transition.drawing.is_some())
+    }
+
     pub(crate) fn freeze_capable(&self) -> bool {
         self.freeze_capable
     }
 
-    pub(crate) fn retain_capable(&self) -> bool {
-        self.retain_capable
+    pub(crate) fn pause_freeze_capable(&self) -> bool {
+        self.freeze_capable && !self.surface_policy
+    }
+
+    pub(crate) async fn send_audio(
+        &mut self,
+        request: &paper_control::AudioSetRequest,
+    ) -> Result<()> {
+        if request.duck == Some(true) {
+            self.send(&PaperCommand::duck(true)).await?;
+        }
+        if request.mute.is_some() || request.volume.is_some() || request.system_audio.is_some() {
+            let mut command = PaperCommand::audio(request.mute, request.volume);
+            command.system_audio = request.system_audio;
+            self.send(&command).await?;
+        }
+        if request.duck == Some(false) {
+            self.send(&PaperCommand::duck(false)).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn send(&mut self, command: &PaperCommand) -> Result<()> {
@@ -98,15 +159,33 @@ impl Worker {
         }
     }
 
+    pub(crate) async fn set_widgets(&mut self, scene: &paper_control::WidgetScene) -> Result<()> {
+        if self.dynamic() {
+            return Ok(());
+        }
+        let mut command = StillCommand::new("");
+        command.widgets = Some(scene.clone());
+        self.send_line(&command.line()).await
+    }
+
     pub(crate) async fn reveal_still(&mut self) -> Result<bool> {
         if !static_transition(&self.assignment) {
             return Ok(false);
         }
-        self.send_line(&StillCommand::reveal().line()).await?;
+        if self.dynamic() {
+            let mut command = PaperCommand::audio(None, None);
+            command.reveal = Some(true);
+            self.send(&command).await?;
+        } else {
+            self.send_line(&StillCommand::reveal().line()).await?;
+        }
         Ok(true)
     }
 
     async fn send_line(&mut self, line: &str) -> Result<()> {
+        if self.exited()?.is_some() {
+            return Err(anyhow!("Paper worker exited"));
+        }
         let stdin = self.stdin.as_mut().ok_or_else(|| anyhow!("Paper worker stdin unavailable"))?;
         stdin.write_all(line.as_bytes()).await.context("write Paper worker command")?;
         stdin.flush().await.context("flush Paper worker command")
@@ -168,37 +247,30 @@ struct BackendExecutable {
 
 #[derive(Clone)]
 pub(crate) struct BackendPaths {
+    pub(crate) pause: crate::manager::playback::Control,
+    pub(crate) duck: crate::manager::playback::Control,
+    pub(crate) surface_overrides: paper_control::SurfaceOverridesRequest,
     vk: BackendExecutable,
     still: BackendExecutable,
-    tinier: BackendExecutable,
 }
 
 impl BackendPaths {
     pub(crate) fn discover() -> Self {
         let wayland = wayland_dependencies();
         Self {
+            pause: crate::manager::playback::Control::default(),
+            duck: crate::manager::playback::Control::default(),
+            surface_overrides: paper_control::SurfaceOverridesRequest::default(),
             vk: discover_backend(
                 "SKWD_PAPER_VK_BIN",
                 "skwd-wall-vk",
                 &[SourceKind::Video, SourceKind::WallpaperEngine],
-                &[VideoEngine::Default],
-                false,
                 vk_dependencies(wayland.clone()),
             ),
             still: discover_backend(
                 "SKWD_PAPER_STILL_BIN",
                 "skwd-wall-still",
                 &[SourceKind::Static],
-                &[],
-                false,
-                wayland.clone(),
-            ),
-            tinier: discover_backend(
-                "SKWD_PAPER_TINIER_BIN",
-                "skwd-paper-tinier",
-                &[SourceKind::Video],
-                &[VideoEngine::Tinier],
-                true,
                 wayland,
             ),
         }
@@ -207,43 +279,20 @@ impl BackendPaths {
     #[cfg(test)]
     pub(crate) fn from_executables(vk: PathBuf, still: PathBuf) -> Self {
         Self {
+            pause: crate::manager::playback::Control::default(),
+            duck: crate::manager::playback::Control::default(),
+            surface_overrides: paper_control::SurfaceOverridesRequest::default(),
             vk: injected_backend(
                 "skwd-wall-vk",
                 vk,
                 &[SourceKind::Video, SourceKind::WallpaperEngine],
-                &[VideoEngine::Default],
             ),
-            still: injected_backend("skwd-wall-still", still, &[SourceKind::Static], &[]),
-            tinier: unresolved_backend(
-                "skwd-paper-tinier",
-                &[SourceKind::Video],
-                &[VideoEngine::Tinier],
-                "skwd-paper-tinier was not injected for this Paper instance".into(),
-            ),
+            still: injected_backend("skwd-wall-still", still, &[SourceKind::Static]),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_executables_with_tinier(
-        vk: PathBuf,
-        still: PathBuf,
-        tinier: PathBuf,
-    ) -> Self {
-        let mut backends = Self::from_executables(vk, still);
-        backends.tinier = injected_backend(
-            "skwd-paper-tinier",
-            tinier,
-            &[SourceKind::Video],
-            &[VideoEngine::Tinier],
-        );
-        backends
-    }
-
     pub(crate) fn capabilities(&self) -> Vec<RendererCapability> {
-        [&self.vk, &self.still, &self.tinier]
-            .into_iter()
-            .map(|backend| backend.capability.clone())
-            .collect()
+        [&self.vk, &self.still].into_iter().map(|backend| backend.capability.clone()).collect()
     }
 
     pub(crate) fn spawn(
@@ -254,22 +303,47 @@ impl BackendPaths {
         generation: u64,
         policy: Option<&RendererPolicy>,
     ) -> Result<Worker> {
-        let physical = assignment.clone();
+        let mut physical = assignment.clone();
+        if assignment.source.kind != SourceKind::Static && static_transition(&assignment) {
+            physical.transition = None;
+            physical.mute = true;
+        }
         self.spawn_as(&physical, assignment, output, socket, generation, policy, None, false)
     }
 
     pub(crate) fn spawn_overlay(
         &self,
-        assignment: Assignment,
+        spec: OverlaySpec,
         output: String,
         socket: &Path,
         generation: u64,
         policy: Option<&RendererPolicy>,
     ) -> Result<Worker> {
+        let assignment = spec.assignment;
         let mut physical = assignment.clone();
-        physical.source = Source::video(transition_source(&assignment.source)?, None);
+        let source = spec.snapshot.map_or_else(
+            || transition_source(&assignment.source),
+            |path| Ok(path.display().to_string()),
+        )?;
+        physical.source = Source::video(source);
         physical.mute = true;
-        self.spawn_as(&physical, assignment, output, socket, generation, policy, None, true)
+        let drawing_policy =
+            assignment.transition.as_ref().filter(|transition| transition.drawing.is_some()).map(
+                |_| RendererPolicy {
+                    transitions_enabled: Some(true),
+                    ..policy.cloned().unwrap_or_default()
+                },
+            );
+        self.spawn_as(
+            &physical,
+            assignment,
+            output,
+            socket,
+            generation,
+            drawing_policy.as_ref().or(policy),
+            None,
+            true,
+        )
     }
 
     pub(crate) fn spawn_frozen(
@@ -310,8 +384,6 @@ impl BackendPaths {
     ) -> Result<Worker> {
         let source = &assignment.source;
         let physical_dynamic = source.kind != SourceKind::Static;
-        let retain_capable = source.kind == SourceKind::Video
-            && source.effective_video_engine() == Some(VideoEngine::Tinier);
         let (mut command, freeze_capable) = match source.kind {
             SourceKind::Static => {
                 let executable = self.still.require("static image")?;
@@ -327,25 +399,11 @@ impl BackendPaths {
                 (command, false)
             }
             SourceKind::Video => {
-                if source.effective_video_engine() == Some(VideoEngine::Tinier) {
-                    let executable = self.tinier.require("tinier video")?;
-                    let frame_rate = source
-                        .frame_rate
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("tinier video source has no frame rate"))?;
-                    let mut command = Command::new(executable);
-                    if output != "*" {
-                        command.arg("--output").arg(&output);
-                    }
-                    command.arg(&source.path).arg(frame_rate).arg("bt709");
-                    (command, true)
-                } else {
-                    let executable = self.vk.require("video")?;
-                    let mut command = Command::new(executable);
-                    command.arg(&output).arg(&source.path);
-                    command.env_remove("SKWD_VK_PATH");
-                    (command, true)
-                }
+                let executable = self.vk.require("video")?;
+                let mut command = Command::new(executable);
+                command.arg(&output).arg(&source.path);
+                command.env_remove("SKWD_VK_PATH");
+                (command, true)
             }
             SourceKind::WallpaperEngine => match crate::we_source::resolve(&source.path)? {
                 crate::we_source::WeTarget::Scene(path) => {
@@ -367,9 +425,7 @@ impl BackendPaths {
                 }
             },
         };
-        if source.kind != SourceKind::Static
-            && source.effective_video_engine() != Some(VideoEngine::Tinier)
-        {
+        if source.kind != SourceKind::Static {
             command
                 .arg(if overlay { "--transition-hold" } else { "--persist" })
                 .arg("--fill-mode")
@@ -392,13 +448,43 @@ impl BackendPaths {
                     .arg(transition.duration_ms().to_string());
             }
         }
-        command.env("SKWD_PAPER_BACKGROUND", serde_json::to_string(&assignment.background)?);
-        command.env_remove("SKWD_PAPER_PREPARE_HIDDEN");
-        if static_transition(assignment) {
-            command.env("SKWD_PAPER_PREPARE_HIDDEN", "1");
+        let playback = paper_control::PlaybackState {
+            paused: self.pause.outputs(&logical.outputs),
+            ducked: self.duck.outputs(&logical.outputs),
+        };
+        command.env(paper_control::PLAYBACK_ENV, serde_json::to_string(&playback)?);
+        command.env_remove(paper_control::DRAWING_SOURCE_ENV);
+        if let Some(transition) =
+            assignment.transition.as_ref().filter(|transition| transition.drawing.is_some())
+        {
+            command.env(paper_control::DRAWING_SOURCE_ENV, drawing_source(transition, &logical));
         }
+        command.env_remove(paper_control::DRAWING_ENV);
+        if let Some(drawing) =
+            assignment.transition.as_ref().and_then(|transition| transition.drawing.as_ref())
+        {
+            command.env(paper_control::DRAWING_ENV, serde_json::to_string(drawing)?);
+        }
+        command.env("SKWD_PAPER_BACKGROUND", serde_json::to_string(&assignment.background)?);
+        command.env_remove(paper_control::PREPARE_HIDDEN_ENV);
+        if !overlay && static_transition(&logical) {
+            command.env(paper_control::PREPARE_HIDDEN_ENV, "1");
+        }
+        command.env(SPECTRUM_MODE_ENV, spectrum_mode(assignment));
         clear_policy_env(&mut command);
-        if let Some(policy) = policy {
+        let mut launch_policy = policy.cloned();
+        if let Some(surface) = self.surface_overrides.surfaces.get(&logical.source.kind) {
+            launch_policy.get_or_insert_with(RendererPolicy::default).surface =
+                Some(Box::new(surface.clone()));
+        }
+        if overlay
+            && logical.transition.as_ref().is_some_and(|transition| transition.drawing.is_some())
+            && let Some(surface) = launch_policy.as_mut().and_then(|policy| policy.surface.as_mut())
+        {
+            surface.blur = 0;
+            surface.dim = 0;
+        }
+        if let Some(policy) = &launch_policy {
             apply_policy(&mut command, policy);
         }
         if let Some(fps) = assignment.transition.as_ref().and_then(|transition| transition.fps) {
@@ -420,18 +506,18 @@ impl BackendPaths {
         let pid = child.id().ok_or_else(|| anyhow!("Paper worker PID unavailable"))?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("Paper worker stdin unavailable"))?;
         Ok(Worker {
+            drawing_hold: None,
+            pending_photos: Vec::new(),
             assignment: logical,
             output,
             generation,
             child,
             pid,
             physical_dynamic,
-            freeze_capable: freeze_capable
-                && !overlay
-                && policy.is_none_or(|policy| policy.surface.is_none()),
-            retain_capable,
+            freeze_capable: freeze_capable && !overlay,
+            surface_policy: policy.is_some_and(|policy| policy.surface.is_some()),
             stdin: Some(stdin),
-            _freeze_directory: freeze_directory,
+            freeze_directories: freeze_directory.into_iter().collect(),
         })
     }
 }
@@ -547,17 +633,17 @@ pub(crate) fn present_plasma(assignment: &Assignment, streams: &[PlasmaStream]) 
             );
         } else {
             anyhow::ensure!(gpu_stream, "a shared Plasma presenter needs the GPU frame stream");
-            anyhow::ensure!(
-                assignment.source.effective_video_engine() != Some(VideoEngine::Tinier),
-                "tinier videos present one Plasma stream per process"
-            );
         }
     }
     let mut preludes = Vec::new();
+    let mut prefaced = false;
+    let drawing =
+        assignment.transition.as_ref().is_some_and(|transition| transition.drawing.is_some());
     for stream in streams {
         if route.prelude_gpu && stream.paused {
             continue;
         }
+        let hidden = drawing && stream.paused;
         let transition = plasma_transition_command(&backends, assignment, &stream.size, stream.fps)
             .inspect_err(|error| tracing::warn!(%error, "Plasma transition prelude unavailable"))
             .ok()
@@ -576,12 +662,18 @@ pub(crate) fn present_plasma(assignment: &Assignment, streams: &[PlasmaStream]) 
         } else {
             write_stream_header(&stream.size)?;
         }
+        if hidden {
+            prefaced = true;
+            continue;
+        }
         match transition.spawn() {
-            Ok(child) => preludes.push(child),
+            Ok(child) => {
+                prefaced = true;
+                preludes.push(child);
+            }
             Err(error) => tracing::warn!(%error, "Plasma transition prelude failed to start"),
         }
     }
-    let prefaced = !preludes.is_empty();
     for mut child in preludes {
         match child.wait() {
             Ok(status) if status.success() => {}
@@ -613,14 +705,13 @@ fn plasma_command(
     write_header: bool,
 ) -> Result<StdCommand> {
     let source = &assignment.source;
-    let first = streams.first().ok_or_else(|| anyhow!("Plasma presenter needs a stream"))?;
+    if streams.is_empty() {
+        return Err(anyhow!("Plasma presenter needs a stream"));
+    }
     let all_paused = streams.iter().all(|stream| stream.paused);
     let (executable, uses_vk) = match source.kind {
         SourceKind::Static => {
             (backends.still.require_headless("Plasma static image presentation")?, false)
-        }
-        SourceKind::Video if source.effective_video_engine() == Some(VideoEngine::Tinier) => {
-            (backends.tinier.require_headless("Plasma tinier video presentation")?, false)
         }
         SourceKind::Video => (backends.vk.require_headless("Plasma video presentation")?, true),
         SourceKind::WallpaperEngine => {
@@ -642,24 +733,6 @@ fn plasma_command(
             if !write_header {
                 command.arg("--stream-no-header");
             }
-        }
-        SourceKind::Video if source.effective_video_engine() == Some(VideoEngine::Tinier) => {
-            let frame_rate = source
-                .frame_rate
-                .as_deref()
-                .ok_or_else(|| anyhow!("tinier video source has no frame rate"))?;
-            command
-                .arg("--frame-stream")
-                .arg(&first.size)
-                .arg("--fill-mode")
-                .arg(assignment.fill_mode.as_str());
-            if all_paused {
-                command.arg("--paused");
-            }
-            if !write_header {
-                command.arg("--stream-no-header");
-            }
-            command.arg(&source.path).arg(frame_rate).arg("bt709");
         }
         SourceKind::Video => {
             command.arg("--video-stream").arg(&source.path);
@@ -711,6 +784,7 @@ fn plasma_command(
             command.arg("--stream-no-header");
         }
     }
+    command.env(SPECTRUM_MODE_ENV, spectrum_mode(assignment));
     Ok(command)
 }
 
@@ -723,13 +797,22 @@ fn plasma_transition_command(
     let Some(transition) = assignment.transition.as_ref() else { return Ok(None) };
     let Some(from) = transition.from.as_deref() else { return Ok(None) };
     let from = transition_media(from)?;
-    let to = transition_source(&assignment.source)?;
-    if from == to {
+    let to = match &transition.drawing {
+        Some(_) => drawing_source(transition, assignment).display().to_string(),
+        None => transition_source(&assignment.source)?,
+    };
+    if from == to && transition.drawing.is_none() {
         return Ok(None);
     }
     let executable = backends.vk.require_headless("Plasma transition presentation")?;
     let mut command = StdCommand::new(executable);
     command.env("SKWD_PAPER_BACKGROUND", serde_json::to_string(&assignment.background)?);
+    command.env_remove(paper_control::DRAWING_ENV).env_remove(paper_control::DRAWING_SOURCE_ENV);
+    if let Some(drawing) = &transition.drawing {
+        command
+            .env(paper_control::DRAWING_ENV, serde_json::to_string(drawing)?)
+            .env(paper_control::DRAWING_SOURCE_ENV, &to);
+    }
     command
         .arg("--preview-stream")
         .arg(to)
@@ -952,25 +1035,15 @@ fn discover_backend(
     env_key: &str,
     name: &'static str,
     source_kinds: &[SourceKind],
-    video_engines: &[VideoEngine],
-    private_sibling: bool,
     dependencies: Vec<RuntimeDependencyStatus>,
 ) -> BackendExecutable {
     let configured = std::env::var_os(env_key).map(|path| (env_key.to_string(), path.into()));
-    select_backend(
-        name,
-        source_kinds,
-        video_engines,
-        configured,
-        discovery_candidates(name, private_sibling),
-        dependencies,
-    )
+    select_backend(name, source_kinds, configured, discovery_candidates(name), dependencies)
 }
 
 fn select_backend(
     name: &'static str,
     source_kinds: &[SourceKind],
-    video_engines: &[VideoEngine],
     configured: Option<(String, PathBuf)>,
     candidates: Vec<(PathBuf, RendererDiscovery)>,
     dependencies: Vec<RuntimeDependencyStatus>,
@@ -981,22 +1054,14 @@ fn select_backend(
             path,
             RendererDiscovery::Configured,
             source_kinds,
-            video_engines,
             dependencies,
             Some(&key),
         );
     }
     let mut invalid = None;
     for (path, discovery) in candidates {
-        let backend = inspect_backend(
-            name,
-            path,
-            discovery,
-            source_kinds,
-            video_engines,
-            dependencies.clone(),
-            None,
-        );
+        let backend =
+            inspect_backend(name, path, discovery, source_kinds, dependencies.clone(), None);
         if backend.capability.executable_file {
             return backend;
         }
@@ -1008,25 +1073,18 @@ fn select_backend(
         unresolved_backend(
             name,
             source_kinds,
-            video_engines,
             format!("{name} was not found next to skwd-paper or on PATH"),
         )
         .with_dependencies(dependencies)
     })
 }
 
-fn discovery_candidates(name: &str, private_sibling: bool) -> Vec<(PathBuf, RendererDiscovery)> {
+fn discovery_candidates(name: &str) -> Vec<(PathBuf, RendererDiscovery)> {
     let mut candidates = Vec::new();
     if let Ok(executable) = std::env::current_exe()
         && let Some(parent) = executable.parent()
     {
         candidates.push((parent.join(name), RendererDiscovery::Sibling));
-        if private_sibling && let Some(prefix) = parent.parent() {
-            candidates.push((
-                prefix.join("lib/skwd-paper").join(name),
-                RendererDiscovery::PrivateSibling,
-            ));
-        }
     }
     if let Some(path) = std::env::var_os("PATH") {
         candidates.extend(
@@ -1042,17 +1100,8 @@ fn injected_backend(
     name: &'static str,
     path: PathBuf,
     source_kinds: &[SourceKind],
-    video_engines: &[VideoEngine],
 ) -> BackendExecutable {
-    inspect_backend(
-        name,
-        path,
-        RendererDiscovery::Injected,
-        source_kinds,
-        video_engines,
-        Vec::new(),
-        None,
-    )
+    inspect_backend(name, path, RendererDiscovery::Injected, source_kinds, Vec::new(), None)
 }
 
 fn inspect_backend(
@@ -1060,7 +1109,6 @@ fn inspect_backend(
     path: PathBuf,
     discovery: RendererDiscovery,
     source_kinds: &[SourceKind],
-    video_engines: &[VideoEngine],
     dependencies: Vec<RuntimeDependencyStatus>,
     configured_by: Option<&str>,
 ) -> BackendExecutable {
@@ -1078,7 +1126,6 @@ fn inspect_backend(
         capability: RendererCapability {
             executable: name.into(),
             source_kinds: source_kinds.to_vec(),
-            video_engines: video_engines.to_vec(),
             path: Some(selected.display().to_string()),
             discovery,
             present,
@@ -1108,7 +1155,6 @@ fn backend_diagnostic(
 fn unresolved_backend(
     name: &'static str,
     source_kinds: &[SourceKind],
-    video_engines: &[VideoEngine],
     diagnostic: String,
 ) -> BackendExecutable {
     BackendExecutable {
@@ -1116,7 +1162,6 @@ fn unresolved_backend(
         capability: RendererCapability {
             executable: name.into(),
             source_kinds: source_kinds.to_vec(),
-            video_engines: video_engines.to_vec(),
             path: None,
             discovery: RendererDiscovery::Unresolved,
             present: false,
@@ -1270,11 +1315,20 @@ const fn sand_scope(scope: SandScope) -> &'static str {
 #[path = "backend_tests.rs"]
 mod tests;
 
+pub(crate) fn drawing_source<'a>(
+    transition: &'a paper_control::TransitionPolicy,
+    logical: &'a Assignment,
+) -> &'a Path {
+    transition.drawing_source.as_deref().unwrap_or(Path::new(&logical.source.path))
+}
+
 pub(crate) fn static_transition(assignment: &Assignment) -> bool {
-    assignment.source.kind == SourceKind::Static
-        && assignment
-            .transition
-            .as_ref()
-            .and_then(|transition| transition.from.as_ref())
-            .is_some_and(|from| from != &assignment.source.path)
+    (assignment.source.kind == SourceKind::Static
+        || assignment.transition.as_ref().is_some_and(|transition| transition.drawing.is_some()))
+        && assignment.transition.as_ref().is_some_and(|transition| {
+            transition
+                .from
+                .as_ref()
+                .is_some_and(|from| from != &assignment.source.path || transition.drawing.is_some())
+        })
 }

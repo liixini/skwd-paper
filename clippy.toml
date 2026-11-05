@@ -1,0 +1,7 @@
+allowed-idents-below-min-chars = ["x", "y", "z", "w", "h", "u", "v", "r", "g", "b", "a", "t", "p", "X", "Y", "Z"]
+disallowed-methods = [
+    { path = "ash::Device::device_wait_idle", reason = "use shared::wait_idle, vkDeviceWaitIdle needs every queue locked" },
+    { path = "ash::Device::queue_submit", reason = "use shared::submit, submits must hold the queue lock" },
+    { path = "ash::Device::queue_submit2", reason = "use shared::submit, submits must hold the queue lock" },
+    { path = "ash::khr::swapchain::Device::queue_present", reason = "use shared::present, presents must hold the queue lock" },
+]

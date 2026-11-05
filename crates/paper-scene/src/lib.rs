@@ -1,3 +1,4 @@
+pub mod affine;
 pub mod audit;
 pub mod capability;
 pub mod dynamic_text;
@@ -6,6 +7,7 @@ pub mod effects;
 pub mod hlsl;
 pub mod json;
 pub mod keyframe;
+pub mod matrix;
 pub mod model;
 pub mod mouse;
 pub mod particles;
@@ -25,3 +27,5 @@ mod corpus_tests;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+pub mod source;

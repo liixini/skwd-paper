@@ -53,32 +53,21 @@ fn renderer_packages_keep_stable_compatibility_names() {
 }
 
 #[test]
-fn tinier_worker_stays_private_and_paper_owned() {
-    let root = root();
-    let manifest = fs::read_to_string(root.join("crates/paper-tinier/Cargo.toml"))
-        .expect("read paper-tinier manifest");
-    assert!(manifest.contains("name = \"paper-tinier\""));
-    assert!(manifest.contains("name = \"skwd-paper-tinier\""));
-    assert!(manifest.contains("paper-control = { path = \"../paper-control\" }"));
-    let package_manifest =
-        fs::read_to_string(root.join("packaging/manifest.txt")).expect("read package manifest");
-    assert!(package_manifest.contains("usr/lib/skwd-paper/skwd-paper-tinier"));
-    assert!(!package_manifest.contains("usr/bin/skwd-paper-tinier"));
-}
-
-#[test]
 fn plasma_vk_stream_falls_back_when_external_export_is_unavailable() {
     let source = fs::read_to_string(root().join("crates/paper-vk/src/preview.rs"))
         .expect("read Vulkan preview stream");
     let fallback = source
         .find("external stream unavailable, using CPU frames")
         .expect("external stream fallback warning");
-    assert!(source[fallback..].contains(
-        "return video_stream(path, target.width, target.height, target.fps, write_header);"
-    ));
+    let fallback_arm = source[fallback..].split("Err(error) => return Err(error)").next().unwrap();
+    assert!(fallback_arm.contains("return video_stream("));
     assert!(source[..fallback].contains("Err(error) if single =>"));
-    let control = source[fallback..].find("Ctl::start").expect("stream control after fallback");
-    assert!(control > 0);
+    let stream = source.find("pub(crate) fn video_stream(").expect("CPU video stream");
+    let dmabuf = source.find("pub(crate) fn dmabuf_video_stream(").expect("dmabuf video stream");
+    assert!(stream < dmabuf, "CPU stream first");
+    let cpu = &source[stream..dmabuf];
+    assert!(cpu.contains("Ctl::start"), "CPU stream control");
+    assert!(cpu.contains("route_pauses("), "CPU output pauses");
 }
 
 #[test]
@@ -159,12 +148,9 @@ fn ffmpeg_bindings_are_stock_current_and_not_vendored() {
     assert_eq!(dmabuf.matches("pending_swap = Some(begin_swap(").count(), 1);
     let preview = fs::read_to_string(root.join("crates/paper-vk/src/preview.rs"))
         .expect("read preview decoder policy");
+    assert!(shared.contains("software_decode_required(self.software, self.queue_sync)"));
     assert_eq!(
-        preview.matches("software_decode_required(shared.software, shared.queue_sync)").count(),
-        2
-    );
-    assert_eq!(
-        preview.matches("crate::decode::open_decoder(").count(),
+        preview.matches("shared.open_decoder(path)").count(),
         2,
         "both preview streams must reach VAAPI through the decode cascade"
     );
@@ -199,13 +185,14 @@ fn presentation_paths_open_decoders_through_the_fallback_cascade() {
 }
 
 #[test]
-fn scene_capture_readback_uses_drop_owned_vulkan_resources() {
+fn scene_readback_owns_resources() {
     let source = fs::read_to_string(root().join("crates/paper-vk/src/vk/scene.rs"))
         .expect("read native scene renderer");
     let readback = source
-        .split_once("pub fn read_scene_target")
-        .map(|(_, body)| body)
-        .expect("native scene readback function");
+        .split_once("fn read_scene_pixels(")
+        .and_then(|(_, body)| body.split_once("\n    }\n"))
+        .map(|(body, _)| body)
+        .expect("native readback body");
 
     assert!(
         readback.contains("let readback = self.create_readback_buf(size)?;"),

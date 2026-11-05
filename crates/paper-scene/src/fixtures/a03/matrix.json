@@ -1,0 +1,374 @@
+[
+  {
+    "probe": "matrix",
+    "version": 1,
+    "cell": 1,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix 1",
+    "fields": [
+      {
+        "mat3": "function",
+        "mat4": "function",
+        "vec2": "function",
+        "vec3": "function",
+        "vec4": "function"
+      }
+    ]
+  },
+  {
+    "probe": "matrix",
+    "version": 1,
+    "cell": 2,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix 2",
+    "fields": [
+      {
+        "type": "object",
+        "ctor": "Mat3",
+        "keys": [
+          "m"
+        ],
+        "values": {
+          "m": {
+            "type": "object"
+          }
+        },
+        "methods": [
+          "constructor",
+          "right",
+          "up",
+          "forward",
+          "translation",
+          "angle",
+          "add",
+          "subtract",
+          "multiply",
+          "translate",
+          "rotate",
+          "scale",
+          "transformPoint",
+          "transformDirection",
+          "transpose",
+          "determinant",
+          "inverse",
+          "decompose",
+          "copy",
+          "equals",
+          "toString",
+          "toConfigString"
+        ],
+        "index0": {
+          "type": "undefined"
+        },
+        "index1": {
+          "type": "undefined"
+        },
+        "text": "1 0 0 0 1 0 0 0 1"
+      }
+    ]
+  },
+  {
+    "probe": "matrix",
+    "version": 1,
+    "cell": 3,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix 3",
+    "fields": [
+      {
+        "type": "object",
+        "ctor": "Mat4",
+        "keys": [
+          "m"
+        ],
+        "values": {
+          "m": {
+            "type": "object"
+          }
+        },
+        "methods": [
+          "constructor",
+          "translation",
+          "right",
+          "up",
+          "forward",
+          "add",
+          "subtract",
+          "multiply",
+          "translate",
+          "rotate",
+          "scale",
+          "transformPoint",
+          "transformDirection",
+          "transpose",
+          "inverse",
+          "determinant",
+          "extractEuler",
+          "normalMatrix",
+          "decompose",
+          "copy",
+          "equals",
+          "toString",
+          "toConfigString"
+        ],
+        "index0": {
+          "type": "undefined"
+        },
+        "index1": {
+          "type": "undefined"
+        },
+        "text": "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
+      }
+    ]
+  },
+  {
+    "probe": "matrix",
+    "version": 1,
+    "cell": 4,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix 4",
+    "fields": [
+      {
+        "type": "object",
+        "ctor": "Mat3",
+        "keys": [
+          "m"
+        ],
+        "values": {
+          "m": {
+            "type": "object"
+          }
+        },
+        "methods": [
+          "constructor",
+          "right",
+          "up",
+          "forward",
+          "translation",
+          "angle",
+          "add",
+          "subtract",
+          "multiply",
+          "translate",
+          "rotate",
+          "scale",
+          "transformPoint",
+          "transformDirection",
+          "transpose",
+          "determinant",
+          "inverse",
+          "decompose",
+          "copy",
+          "equals",
+          "toString",
+          "toConfigString"
+        ],
+        "index0": {
+          "type": "undefined"
+        },
+        "index1": {
+          "type": "undefined"
+        },
+        "text": "1 0 0 0 1 0 0 0 1"
+      }
+    ]
+  },
+  {
+    "probe": "matrix",
+    "version": 1,
+    "cell": 5,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix 5",
+    "fields": [
+      {
+        "type": "object",
+        "ctor": "Mat4",
+        "keys": [
+          "m"
+        ],
+        "values": {
+          "m": {
+            "type": "object"
+          }
+        },
+        "methods": [
+          "constructor",
+          "translation",
+          "right",
+          "up",
+          "forward",
+          "add",
+          "subtract",
+          "multiply",
+          "translate",
+          "rotate",
+          "scale",
+          "transformPoint",
+          "transformDirection",
+          "transpose",
+          "inverse",
+          "determinant",
+          "extractEuler",
+          "normalMatrix",
+          "decompose",
+          "copy",
+          "equals",
+          "toString",
+          "toConfigString"
+        ],
+        "index0": {
+          "type": "undefined"
+        },
+        "index1": {
+          "type": "undefined"
+        },
+        "text": "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"
+      }
+    ]
+  },
+  {
+    "probe": "matrix",
+    "version": 1,
+    "cell": 6,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "matrix 6",
+    "fields": [
+      {
+        "mat3Vector": {
+          "type": "object",
+          "ctor": "Vec3",
+          "keys": [
+            "x",
+            "y",
+            "z"
+          ],
+          "values": {
+            "x": {
+              "type": "number",
+              "value": "2"
+            },
+            "y": {
+              "type": "number",
+              "value": "3"
+            },
+            "z": {
+              "type": "number",
+              "value": "1"
+            }
+          },
+          "methods": [
+            "constructor",
+            "length",
+            "lengthSqr",
+            "distance",
+            "distanceSqr",
+            "normalize",
+            "copy",
+            "equals",
+            "isFinite",
+            "negate",
+            "add",
+            "subtract",
+            "multiply",
+            "divide",
+            "cross",
+            "dot",
+            "reflect",
+            "refract",
+            "project",
+            "angleBetween",
+            "toSpherical",
+            "mix",
+            "min",
+            "max",
+            "clamp",
+            "abs",
+            "sign",
+            "round",
+            "floor",
+            "ceil"
+          ],
+          "index0": {
+            "type": "undefined"
+          },
+          "index1": {
+            "type": "undefined"
+          },
+          "text": "2 3 1"
+        },
+        "mat4Vector": {
+          "type": "object",
+          "ctor": "Vec4",
+          "keys": [
+            "x",
+            "y",
+            "z",
+            "w"
+          ],
+          "values": {
+            "x": {
+              "type": "number",
+              "value": "2"
+            },
+            "y": {
+              "type": "number",
+              "value": "3"
+            },
+            "z": {
+              "type": "number",
+              "value": "5"
+            },
+            "w": {
+              "type": "number",
+              "value": "1"
+            }
+          },
+          "methods": [
+            "constructor",
+            "length",
+            "lengthSqr",
+            "distance",
+            "distanceSqr",
+            "normalize",
+            "copy",
+            "equals",
+            "isFinite",
+            "negate",
+            "add",
+            "subtract",
+            "multiply",
+            "divide",
+            "dot",
+            "reflect",
+            "project",
+            "mix",
+            "min",
+            "max",
+            "clamp",
+            "abs",
+            "sign",
+            "round",
+            "floor",
+            "ceil",
+            "fract",
+            "mod",
+            "step",
+            "smoothStep"
+          ],
+          "index0": {
+            "type": "undefined"
+          },
+          "index1": {
+            "type": "undefined"
+          },
+          "text": "2 3 5 1"
+        }
+      }
+    ]
+  }
+]

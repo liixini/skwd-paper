@@ -3,8 +3,16 @@ use paper_scene::pkg::Package;
 use serde_json::Value;
 
 fn main() {
-    let now =
-        LocalTime { hour: 14, minute: 7, second: 9, day: 8, month: 9, year: 2026, weekday: 2 };
+    let now = LocalTime {
+        hour: 14,
+        minute: 7,
+        second: 9,
+        day: 8,
+        month: 9,
+        year: 2026,
+        weekday: 2,
+        millisecond: 0,
+    };
     let (mut total, mut live, mut blank) = (0usize, 0usize, 0usize);
     let mut misses: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for dir in std::env::args().skip(1) {

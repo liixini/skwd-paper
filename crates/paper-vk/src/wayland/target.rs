@@ -1,5 +1,5 @@
 use super::mirror::{dmabuf_layout, shm_fourcc};
-use super::model::{App, SurfaceUi, Target};
+use super::model::{App, BufferGenerations, SurfaceUi, Target};
 use anyhow::{Result, anyhow};
 use paper_geom::FillMode;
 use paper_runtime::mirror::{Layout, Memory, Plane};
@@ -8,6 +8,11 @@ use wayland_client::{Connection, Proxy};
 use wayland_protocols::wp::content_type::v1::client::wp_content_type_v1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1;
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+
+const MULTI_JSON_ARG: &str = "--multi-json";
+const SCENE_ARG: &str = "--scene";
+const OUTPUT_SEPARATOR: &str = ",";
+static RETAINED_OUTPUTS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
 fn fps_limit(name: &str) -> u32 {
     std::env::var("SKWD_PAPER_OUTPUT_FPS")
@@ -117,6 +122,8 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
         probe_result: None,
         resized: false,
         mirror_buffers: super::mirror::Buffers::default(),
+        buffer_generations: BufferGenerations::default(),
+        pointer_surfaces: Vec::new(),
     };
     queue.roundtrip(&mut app)?;
     if let Some(manager) = &app.xdg_output_manager {
@@ -150,22 +157,9 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
     }
     for (si, info) in picked.iter().enumerate() {
         let surface = compositor.create_surface(&qh, ());
-        let layer = shell.get_layer_surface(
-            &surface,
-            Some(&info.output),
-            vk_layer,
-            std::env::var("SKWD_PAPER_NAMESPACE").unwrap_or_else(|_| "skwd-wall-vk".into()),
-            &qh,
-            si,
-        );
-        layer.set_anchor(
-            zwlr_layer_surface_v1::Anchor::Top
-                | zwlr_layer_surface_v1::Anchor::Bottom
-                | zwlr_layer_surface_v1::Anchor::Left
-                | zwlr_layer_surface_v1::Anchor::Right,
-        );
-        layer.set_exclusive_zone(-1);
-        layer.set_size(0, 0);
+        let layer =
+            shell.get_layer_surface(&surface, Some(&info.output), vk_layer, namespace(), &qh, si);
+        fill_output(&layer);
         surface.set_buffer_scale(info.scale);
         let input_region = if input_passthrough {
             let region = compositor.create_region(&qh, ());
@@ -181,7 +175,7 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
             position: info.position(),
             surface,
             _input_region: input_region,
-            _layer: layer,
+            layer,
             width: 0,
             height: 0,
             scale: info.scale,
@@ -210,7 +204,14 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
     if app.closed || app.surfaces.iter().all(|surf| surf.closed || surf.width == 0) {
         return Err(anyhow!("layer surface closed or zero size"));
     }
-    Ok(Target { conn, queue, app, layer: vk_layer, ctl_fd: None })
+    Ok(Target {
+        conn,
+        queue,
+        app,
+        layer: vk_layer,
+        ctl_fd: None,
+        hidden: std::env::var_os(paper_control::PREPARE_HIDDEN_ENV).is_some(),
+    })
 }
 
 fn parse_layer(value: Option<&str>) -> Result<zwlr_layer_shell_v1::Layer> {
@@ -224,6 +225,21 @@ fn parse_layer(value: Option<&str>) -> Result<zwlr_layer_shell_v1::Layer> {
             Err(anyhow!("unknown layer {other:?}; expected background, bottom, top, or overlay"))
         }
     }
+}
+
+pub(super) fn fill_output(layer: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1) {
+    layer.set_anchor(
+        zwlr_layer_surface_v1::Anchor::Top
+            | zwlr_layer_surface_v1::Anchor::Bottom
+            | zwlr_layer_surface_v1::Anchor::Left
+            | zwlr_layer_surface_v1::Anchor::Right,
+    );
+    layer.set_exclusive_zone(-1);
+    layer.set_size(0, 0);
+}
+
+pub(super) fn namespace() -> String {
+    std::env::var("SKWD_PAPER_NAMESPACE").unwrap_or_else(|_| "skwd-wall-vk".into())
 }
 
 fn input_passthrough() -> bool {
@@ -393,7 +409,7 @@ impl Target {
             0x34325258,
             zwp_linux_buffer_params_v1::Flags::empty(),
             &qh,
-            (si, bi),
+            (si, bi, self.app.buffer_generations.allocation()),
         );
         params.destroy();
         let plane = Plane { stride, offset };
@@ -402,7 +418,10 @@ impl Target {
             &[fd],
             dmabuf_layout(width, height, crate::dmabuf::FOURCC_XR24, modifier, &[plane]),
         );
-        self.conn.flush()?;
+        if let Err(error) = self.conn.flush() {
+            self.retire_scene_buffer(&buffer);
+            return Err(error.into());
+        }
         Ok(buffer)
     }
 
@@ -419,10 +438,45 @@ impl Target {
         }
     }
 
+    pub fn stage_scene_buffers(&mut self, staging: bool) {
+        self.app.buffer_generations.stage(staging);
+    }
+
+    pub fn rotate_scene_buffers(&mut self, buffers: &[Vec<wl_buffer::WlBuffer>]) -> u64 {
+        self.app.end_mirrors_for_resize();
+        let outstanding = buffers
+            .iter()
+            .zip(&self.app.surfaces)
+            .map(|(ring, surface)| {
+                if surface.closed {
+                    0
+                } else {
+                    ring.len().saturating_sub(surface.free_buffers.len())
+                }
+            })
+            .sum();
+        self.app.buffer_generations.rotate(outstanding)
+    }
+
+    pub fn scene_buffers_released(&self, generation: u64) -> bool {
+        self.app.buffer_generations.retired(generation)
+    }
+
+    pub fn retire_scene_buffer(&mut self, buffer: &wl_buffer::WlBuffer) {
+        self.app.mirror_buffers.retire(buffer);
+        buffer.destroy();
+    }
+
     pub fn reexec(source: &ReexecSource) -> Result<()> {
         tracing::info!("skwd-wall-vk: output resized, restarting renderer");
         let argv: Vec<String> = std::env::args().collect();
-        let args: Vec<std::ffi::CString> = rebuild_argv(&argv, source)
+        let mut rebuilt = rebuild_argv(&argv, source);
+        let retained = RETAINED_OUTPUTS.lock().expect("retained outputs lock");
+        if let Some(outputs) = retained.as_ref() {
+            retain_output_args(&mut rebuilt, outputs)?;
+        }
+        drop(retained);
+        let args: Vec<std::ffi::CString> = rebuilt
             .into_iter()
             .map(std::ffi::CString::new)
             .collect::<std::result::Result<_, _>>()
@@ -564,7 +618,7 @@ impl Target {
                 stride as i32,
                 format,
                 &qh,
-                (si, slot),
+                (si, slot, self.app.buffer_generations.allocation()),
             );
             self.app.mirror_buffers.record(
                 &buffer,
@@ -587,7 +641,13 @@ impl Target {
         }
         pool.destroy();
         unsafe { libc::close(fd) };
-        self.conn.flush()?;
+        if let Err(error) = self.conn.flush() {
+            for buffer in &buffers {
+                self.retire_scene_buffer(buffer);
+            }
+            unsafe { libc::munmap(base, total) };
+            return Err(error.into());
+        }
         Ok((buffers, ptrs, stride))
     }
 
@@ -648,7 +708,7 @@ impl Target {
             0x3231_564e,
             zwp_linux_buffer_params_v1::Flags::empty(),
             &qh,
-            (si, bi),
+            (si, bi, self.app.buffer_generations.current()),
         );
         params.destroy();
         let planes = [
@@ -695,7 +755,7 @@ impl Target {
             0x3231_564e,
             zwp_linux_buffer_params_v1::Flags::empty(),
             &qh,
-            (si, bi),
+            (si, bi, self.app.buffer_generations.current()),
         );
         params.destroy();
         if plane0_modifier == plane1_modifier {
@@ -760,7 +820,9 @@ impl Target {
 
     pub fn attach_at(&mut self, si: usize, buffer: &wl_buffer::WlBuffer) {
         let surf = &mut self.app.surfaces[si];
-        surf.surface.attach(Some(buffer), 0, 0);
+        if !self.hidden {
+            surf.surface.attach(Some(buffer), 0, 0);
+        }
         surf.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
         surf.attached = Some(buffer.clone());
         if surf.mirror.is_some() {
@@ -769,6 +831,9 @@ impl Target {
     }
 
     pub fn request_presentation_feedback_at(&mut self, si: usize) {
+        if self.hidden {
+            return;
+        }
         if let Some(pres) = self.app.presentation.as_ref() {
             let qh = self.queue.handle();
             pres.feedback(&self.app.surfaces[si].surface, &qh, si);
@@ -780,7 +845,25 @@ impl Target {
     }
 
     pub fn commit_at(&mut self, si: usize) {
-        self.app.surfaces[si].surface.commit();
+        if !self.hidden {
+            self.app.surfaces[si].surface.commit();
+        }
+    }
+
+    pub fn reveal_prepared(&mut self) -> Result<bool> {
+        if !std::mem::take(&mut self.hidden) {
+            return Ok(false);
+        }
+        for index in 0..self.app.surfaces.len() {
+            if let Some(buffer) = self.app.surfaces[index].attached.clone() {
+                self.attach_at(index, &buffer);
+                self.request_presentation_feedback_at(index);
+                self.commit_at(index);
+            }
+        }
+        self.flush()?;
+        self.queue.roundtrip(&mut self.app)?;
+        Ok(true)
     }
 
     pub fn set_transition_fps(&mut self, transition: Option<u32>, playback: &[u32]) {
@@ -813,6 +896,32 @@ impl Target {
         if !surface.closed {
             return_free_buffer(&mut surface.free_buffers, bi);
         }
+    }
+
+    pub fn retain_reexec_outputs(outputs: &[String]) {
+        let mut retained = RETAINED_OUTPUTS.lock().expect("retained outputs lock");
+        if let Some(previous) = retained.as_mut() {
+            previous.retain(|output| outputs.contains(output));
+        } else {
+            *retained = Some(outputs.to_vec());
+        }
+    }
+
+    pub fn retain_outputs(&mut self, outputs: &[String]) -> Result<()> {
+        for surface in &mut self.app.surfaces {
+            if surface.closed || outputs.contains(&surface.name) {
+                continue;
+            }
+            surface.surface.attach(None, 0, 0);
+            surface.surface.commit();
+            surface.layer.destroy();
+            surface.closed = true;
+            surface.attached = None;
+        }
+        self.app.closed = self.app.surfaces.iter().all(|surface| surface.closed);
+        self.conn.flush()?;
+        self.queue.roundtrip(&mut self.app)?;
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -1131,9 +1240,24 @@ pub enum ReexecSource<'a> {
     Scene { dir: &'a str, properties: Option<&'a str> },
 }
 
+fn retain_output_args(args: &mut [String], outputs: &[String]) -> Result<()> {
+    if args.get(1).is_some_and(|arg| arg == MULTI_JSON_ARG)
+        && let Some(manifest) = args.get_mut(2)
+    {
+        let mut entries: Vec<paper_control::MultiVideoEntry> = serde_json::from_str(manifest)?;
+        entries.retain(|entry| outputs.contains(&entry.output));
+        *manifest = serde_json::to_string(&entries)?;
+    } else if args.iter().any(|arg| arg == SCENE_ARG)
+        && let Some(target) = args.get_mut(1)
+    {
+        *target = outputs.join(OUTPUT_SEPARATOR);
+    }
+    Ok(())
+}
+
 pub(crate) fn rebuild_argv(args: &[String], source: &ReexecSource) -> Vec<String> {
     let mut args = args.to_vec();
-    if args.get(1).is_some_and(|arg| arg == "--multi-json") {
+    if args.get(1).is_some_and(|arg| arg == MULTI_JSON_ARG) {
         return args;
     }
     match source {

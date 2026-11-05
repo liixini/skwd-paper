@@ -7,7 +7,7 @@ function __storageClone(v) {
     return v;
 }
 function __storageEncode(v) {
-    if (v instanceof Vec2) return {__vector:v.constructor.name,values:['x','y','z','w'].filter(k=>k in v).map(k=>v[k])};
+    if (v instanceof __Vector) return {__vector:v.constructor.name,values:__vectorComponents.filter(k=>k in v).map(k=>v[k])};
     if (Array.isArray(v)) return v.map(__storageEncode);
     if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k,x])=>[k,__storageEncode(x)]));
     return v;

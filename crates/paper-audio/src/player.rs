@@ -48,7 +48,7 @@ impl AudioPlayer {
             .ok_or_else(|| anyhow!("no default audio output device"))?;
         let config = cpal::StreamConfig {
             channels: 2,
-            sample_rate: cpal::SampleRate(TARGET_SAMPLE_RATE),
+            sample_rate: TARGET_SAMPLE_RATE,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -59,7 +59,7 @@ impl AudioPlayer {
         }
         let stream = device
             .build_output_stream(
-                &config,
+                config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     if callback_mute.load(Ordering::Relaxed) {
                         let _ = consumer.skip(data.len());

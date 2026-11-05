@@ -5,6 +5,8 @@ pub struct SceneThumbnailRequest {
     pub source: String,
     pub destination: String,
     #[serde(default)]
+    pub reference: bool,
+    #[serde(default)]
     pub properties: serde_json::Map<String, serde_json::Value>,
 }
 

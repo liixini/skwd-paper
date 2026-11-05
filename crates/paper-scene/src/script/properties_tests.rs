@@ -113,3 +113,52 @@ fn package_assets_can_disable_an_otherwise_safe_property() {
             .is_none()
     );
 }
+
+#[test]
+fn shader_mapping_requires_reload() {
+    let scene = json!({"objects":[{"alpha":{"user":"opacity","value":1}}]});
+    let mut bindings = bindings(&scene, &Value::Null);
+    let package = crate::pkg::Package::parse(crate::tests::build_pkg(&[(
+        "materials/custom.json",
+        br#"{"passes":[{"usershadervalues":{"Opacity":"g_Alpha"}}]}"#,
+    )]))
+    .unwrap();
+    bindings.restrict_package(&package);
+    assert!(
+        bindings
+            .update(&Properties::new(), &Properties::from([("opacity".into(), vec![0.5])]))
+            .is_none()
+    );
+}
+
+#[test]
+fn folded_scene_not_restricted() {
+    let scene = json!({"objects":[{"alpha":{"user":"opacity","value":1}}]});
+    let mut bindings = bindings(&scene, &Value::Null);
+    let package = crate::pkg::Package::parse(crate::tests::build_pkg(&[(
+        "Scene.json",
+        scene.to_string().as_bytes(),
+    )]))
+    .unwrap();
+    bindings.restrict_package(&package);
+    assert!(
+        bindings
+            .update(&Properties::new(), &Properties::from([("opacity".into(), vec![0.5])]))
+            .is_some()
+    );
+}
+
+#[test]
+fn instance_bindings_require_reload() {
+    let scene = json!({"objects":[
+        {"alpha":{"user":"strength","value":1.0},"effects":[{"passes":[{
+            "usershadervalues":{"Strength":"amount"}
+        }]}]},
+        {"alpha":{"user":"opacity","value":1.0}}
+    ]});
+    let bindings = bindings(&scene, &Value::Null);
+    for (name, accepted) in [("strength", false), ("opacity", true)] {
+        let update = Properties::from([(name.into(), vec![0.5])]);
+        assert_eq!(bindings.update(&Properties::new(), &update).is_some(), accepted);
+    }
+}

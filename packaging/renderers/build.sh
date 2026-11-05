@@ -11,14 +11,11 @@ case "$component" in
     still)
         packages="skwd-wall-still"
         ;;
-    tinier)
-        packages="paper-tinier"
-        ;;
     all)
-        packages="skwd-wall-vk skwd-wall-still paper-tinier"
+        packages="skwd-wall-vk skwd-wall-still"
         ;;
     *)
-        echo "usage: $0 {vk|still|tinier|all}" >&2
+        echo "usage: $0 {vk|still|all}" >&2
         exit 2
         ;;
 esac

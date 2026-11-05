@@ -1,4 +1,6 @@
 mod bootstrap;
+#[cfg(feature = "shared-device")]
+mod drawing;
 mod model;
 mod readiness;
 mod upload;
@@ -17,4 +19,6 @@ mod shared_support;
 mod shared_upload;
 
 pub(crate) use bootstrap::run;
+#[cfg(feature = "shared-device")]
+pub(crate) use drawing::{DrawingTexture, load as load_drawing};
 pub(crate) use readiness::signal_startup_failure;

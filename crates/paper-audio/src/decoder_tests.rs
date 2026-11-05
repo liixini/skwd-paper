@@ -6,6 +6,7 @@ use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Split};
 
 use super::*;
+use crate::test_pcm::pcm_wav;
 
 fn ring(capacity: usize) -> (RingProducer, ringbuf::HeapCons<f32>) {
     HeapRb::<f32>::new(capacity).split()
@@ -54,42 +55,16 @@ fn planar_stereo(left: &[f32], right: &[f32]) -> ff::frame::Audio {
     frame
 }
 
-fn pcm_wav(channels: u16, channel_mask: Option<u32>) -> Vec<u8> {
-    let frames = 4_800;
-    let format_size = if channel_mask.is_some() { 40_u32 } else { 16 };
-    let data_size = frames * u32::from(channels) * 2;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(20 + format_size + data_size).to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&format_size.to_le_bytes());
-    bytes.extend_from_slice(&if channel_mask.is_some() { 0xfffe_u16 } else { 1 }.to_le_bytes());
-    bytes.extend_from_slice(&channels.to_le_bytes());
-    bytes.extend_from_slice(&48_000_u32.to_le_bytes());
-    bytes.extend_from_slice(&(48_000 * u32::from(channels) * 2).to_le_bytes());
-    bytes.extend_from_slice(&(channels * 2).to_le_bytes());
-    bytes.extend_from_slice(&16_u16.to_le_bytes());
-    if let Some(mask) = channel_mask {
-        bytes.extend_from_slice(&22_u16.to_le_bytes());
-        bytes.extend_from_slice(&16_u16.to_le_bytes());
-        bytes.extend_from_slice(&mask.to_le_bytes());
-        bytes.extend_from_slice(&[1, 0, 0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113]);
-    }
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&data_size.to_le_bytes());
-    for index in 0..frames {
-        let sample = ((index as f32 * std::f32::consts::TAU / 100.0).sin() * 8_192.0) as i16;
-        for channel in 0..channels {
-            bytes.extend_from_slice(&if channel % 2 == 0 { sample } else { -sample }.to_le_bytes());
-        }
-    }
-    bytes
+fn decode_wav(channels: u16, channel_mask: Option<u32>) -> Vec<f32> {
+    let samples = decode_fixture(&pcm_wav(channels, channel_mask), "wav", Repeat::Once);
+    assert_eq!(samples.len(), 9_600, "a complete PCM tone must reach the mixer");
+    samples
 }
 
-fn decode_wav(channels: u16, channel_mask: Option<u32>) -> Vec<f32> {
+fn decode_fixture(bytes: &[u8], extension: &str, repeat: Repeat) -> Vec<f32> {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("tone.wav");
-    std::fs::write(&path, pcm_wav(channels, channel_mask)).unwrap();
+    let path = directory.path().join(format!("tail.{extension}"));
+    std::fs::write(&path, bytes).unwrap();
     let (mut producer, mut consumer) = ring(48_000);
     let stopped = AtomicBool::new(false);
     let restart = decode_loop(
@@ -101,13 +76,168 @@ fn decode_wav(channels: u16, channel_mask: Option<u32>) -> Vec<f32> {
         &HOLD,
         &RESTART,
         &FLOW.wake,
-        Repeat::Once,
+        repeat,
     )
     .unwrap();
     assert!(!restart);
-    let samples = drain(&mut consumer);
-    assert_eq!(samples.len(), 9_600, "a complete PCM tone must reach the mixer");
-    samples
+    drain(&mut consumer)
+}
+
+fn reference(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).collect()
+}
+
+fn max_error(actual: &[f32], expected: &[f32]) -> f32 {
+    assert!(actual.iter().chain(expected).all(|sample| sample.is_finite()));
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0, f32::max)
+}
+
+fn ffmpeg_pcm(media: &[u8], extension: &str) -> Vec<f32> {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(format!("tail.{extension}"));
+    std::fs::write(&path, media).unwrap();
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "0:a:0", "-ac", "2", "-ar", "48000", "-f", "f32le", "pipe:1"])
+        .output()
+        .expect("run ffmpeg reference");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!output.stdout.is_empty());
+    assert_eq!(output.stdout.len() % std::mem::size_of::<f32>(), 0);
+    reference(&output.stdout)
+}
+
+const TAIL_FIXTURES: [(&str, &[u8]); 4] = [
+    ("wav", include_bytes!("fixtures/tail-44100.wav")),
+    ("m4a", include_bytes!("fixtures/tail-aac.m4a")),
+    ("ogg", include_bytes!("fixtures/tail-vorbis.ogg")),
+    ("opus", include_bytes!("fixtures/tail-opus.ogg")),
+];
+
+#[test]
+fn pcm_tail_matches_golden() {
+    let actual = decode_fixture(include_bytes!("fixtures/tail-44100.wav"), "wav", Repeat::Once);
+    let expected = reference(include_bytes!("fixtures/tail-44100.f32"));
+    assert_eq!(actual.len(), expected.len());
+    assert!(max_error(&actual, &expected) <= 0.00001);
+}
+
+#[test]
+fn compressed_tail_matches_ffmpeg() {
+    for (extension, media) in TAIL_FIXTURES {
+        let actual = decode_fixture(media, extension, Repeat::Once);
+        let expected = ffmpeg_pcm(media, extension);
+        assert_eq!(actual.len(), expected.len(), "{extension} sample count");
+        let error = max_error(&actual, &expected);
+        assert!(error <= 0.00001, "{extension} max error: {error}");
+    }
+}
+
+#[test]
+fn loop_preserves_tail() {
+    for (extension, media) in TAIL_FIXTURES {
+        check_loop(extension, media);
+    }
+}
+
+fn check_loop(extension: &str, media: &[u8]) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(format!("tail.{extension}"));
+    std::fs::write(&path, media).unwrap();
+    let expected = ffmpeg_pcm(media, extension);
+    let needed = expected.len() * 2;
+    let (mut producer, mut consumer) = ring(48_000);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stopped);
+    let path = path.to_str().unwrap().to_owned();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = decode_loop(
+            &path,
+            &mut producer,
+            &thread_stop,
+            &FLOW.mute,
+            &FLOW.paused,
+            &HOLD,
+            &RESTART,
+            &FLOW.wake,
+            Repeat::Forever,
+        );
+        done_tx.send(result).unwrap();
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut actual = Vec::with_capacity(needed);
+    while actual.len() < needed && std::time::Instant::now() < deadline {
+        if let Some(sample) = consumer.try_pop() {
+            actual.push(sample);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    signal_stop(&stopped, &FLOW.wake);
+    assert!(!done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap());
+    worker.join().unwrap();
+    assert_eq!(actual.len(), needed);
+    for cycle in actual.chunks_exact(expected.len()) {
+        let error = max_error(cycle, &expected);
+        assert!(error <= 0.00001, "{extension} loop error: {error}");
+    }
+}
+
+#[test]
+fn empty_loop_finishes() {
+    let mut wav = pcm_wav(2, None);
+    wav.truncate(44);
+    wav[4..8].copy_from_slice(&36_u32.to_le_bytes());
+    wav[40..44].copy_from_slice(&0_u32.to_le_bytes());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        done_tx.send(decode_fixture(&wav, "wav", Repeat::Forever)).unwrap();
+    });
+    assert!(done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().is_empty());
+    worker.join().unwrap();
+}
+
+#[test]
+fn paused_decode_stops() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("tail.wav");
+    std::fs::write(&path, include_bytes!("fixtures/tail-44100.wav")).unwrap();
+    let flow = Arc::new(Flow {
+        mute: AtomicBool::new(false),
+        paused: AtomicBool::new(true),
+        wake: (Mutex::new(()), Condvar::new()),
+    });
+    let (mut producer, mut consumer) = ring(48_000);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stopped);
+    let thread_flow = Arc::clone(&flow);
+    let path = path.to_str().unwrap().to_owned();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = decode_loop(
+            &path,
+            &mut producer,
+            &thread_stop,
+            &thread_flow.mute,
+            &thread_flow.paused,
+            &HOLD,
+            &RESTART,
+            &thread_flow.wake,
+            Repeat::Forever,
+        );
+        done_tx.send(result).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(drain(&mut consumer).is_empty());
+    signal_stop(&stopped, &flow.wake);
+    assert!(!done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap());
+    worker.join().unwrap();
 }
 
 #[test]

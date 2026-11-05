@@ -1,0 +1,16 @@
+[package]
+name = "paper-text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Font shaping and glyph rasterisation shared by Paper renderers"
+
+[dependencies]
+swash = "0.2.10"
+freetype-sys = "0.20.1"
+read-fonts = "0.35"
+
+[lints]
+workspace = true

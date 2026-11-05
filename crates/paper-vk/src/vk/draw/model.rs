@@ -1,16 +1,45 @@
 #[cfg(feature = "shared-device")]
 use ash::vk;
 
+#[repr(C)]
+pub(in crate::vk) struct EffectPush {
+    pub(in crate::vk) res: [f32; 2],
+    pub(in crate::vk) progress: f32,
+    pub(in crate::vk) style: i32,
+    pub(in crate::vk) pid_base: i32,
+    pub(in crate::vk) fill: i32,
+    pub(in crate::vk) rgba_a: i32,
+    pub(in crate::vk) rgba_b: i32,
+    pub(in crate::vk) uv_a: [f32; 4],
+    pub(in crate::vk) uv_b: [f32; 4],
+    pub(in crate::vk) colours: [u32; 2],
+    pub(in crate::vk) clock: f32,
+    pub(in crate::vk) ink_style: i32,
+}
+
+pub(in crate::vk) const EFFECT_PUSH_BYTES: u32 = std::mem::size_of::<EffectPush>() as u32;
+
 #[cfg(feature = "shared-device")]
 pub enum Src<'a> {
     Avvk(&'a ffmpeg_the_third::frame::Video),
     Imported(&'a crate::vk::FrameImages),
     Views(vk::ImageView, vk::ImageView),
     Rgba(vk::ImageView),
+    Drawing {
+        photo: vk::ImageView,
+        ink: vk::ImageView,
+        strokes: &'a crate::vk::DrawingStrokes,
+        focus: [f32; 2],
+        colours: paper_control::DrawingColours,
+    },
 }
 
 #[cfg(feature = "shared-device")]
 impl Src<'_> {
+    pub(in crate::vk) fn is_rgba(&self) -> bool {
+        matches!(self, Self::Rgba(_) | Self::Drawing { .. })
+    }
+
     pub(in crate::vk) fn texture_uv(&self, uv: [f32; 4]) -> [f32; 4] {
         let Self::Avvk(frame) = self else {
             return uv;
@@ -72,15 +101,3 @@ fn remap_texture_uv(
 
 #[cfg(all(test, feature = "shared-device"))]
 mod tests;
-
-pub(in crate::vk) struct QueueGuard {
-    #[cfg(feature = "shared-device")]
-    pub(super) family: u32,
-}
-
-impl Drop for QueueGuard {
-    fn drop(&mut self) {
-        #[cfg(feature = "shared-device")]
-        crate::shared::unlock_queue_family(self.family);
-    }
-}

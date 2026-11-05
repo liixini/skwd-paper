@@ -6,9 +6,9 @@ use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::path::Path;
 
 pub(super) struct Shown {
-    memory: OwnedFd,
-    layout: Layout,
-    source: [u32; 4],
+    pub(super) memory: OwnedFd,
+    pub(super) layout: Layout,
+    pub(super) source: [u32; 4],
 }
 
 pub(super) struct Mirror {
@@ -18,6 +18,7 @@ pub(super) struct Mirror {
 
 impl SurfaceState {
     pub(super) fn show(&mut self, buffer: &BufferSet, source: [u32; 4]) {
+        self.shown_at += 1;
         self.shown = match buffer.share() {
             Ok((memory, layout)) => Some(Shown { memory, layout, source }),
             Err(error) => {
@@ -31,6 +32,7 @@ impl SurfaceState {
     pub(super) fn move_source(&mut self, source: [u32; 4]) {
         let Some(shown) = self.shown.as_mut() else { return };
         shown.source = source;
+        self.shown_at += 1;
         let sent = self.mirror.as_ref().and_then(|mirror| {
             let id = mirror.id?;
             Some(mirror.link.send(&Message::Show { id, source }, &[]))
@@ -42,6 +44,7 @@ impl SurfaceState {
 
     pub(super) fn hide(&mut self) {
         self.shown = None;
+        self.shown_at += 1;
         let sent = self.mirror.as_mut().and_then(|mirror| {
             let id = mirror.id.take()?;
             Some(mirror.link.send(&Message::Forget { id }, &[]))

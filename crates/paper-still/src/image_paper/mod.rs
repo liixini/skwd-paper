@@ -8,9 +8,11 @@ mod protocol;
 mod readiness;
 mod shm_pixels;
 mod slide;
+mod snapshot;
 mod span;
 mod stream;
 mod surface_effects;
+mod widgets;
 
 pub use lifecycle::run;
 pub use paper_control::OutputTarget;

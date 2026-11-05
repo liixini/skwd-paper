@@ -8,6 +8,7 @@ authors.workspace = true
 description = "Single-source sand grain transition GLSL, composed per graphics API dialect"
 
 [dependencies]
+paper-control = { path = "../paper-control" }
 regex-lite = "0.1"
 
 [dev-dependencies]

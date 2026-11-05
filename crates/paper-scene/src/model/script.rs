@@ -1,6 +1,6 @@
 use super::{
     Attachments, Layer, Parallax, Properties, ancestor_chain, id_of, number, resolve_transform,
-    truthy, vec3,
+    vec3,
 };
 use serde_json::Value;
 
@@ -13,9 +13,15 @@ pub struct Layout {
     pub offset: [f32; 2],
     pub text: bool,
     pub hidden_without_fx: bool,
+    pub puppet: bool,
+    pub fullscreen: bool,
 }
 
 pub struct Frame {
+    pub planar_owner: bool,
+    pub origin: [f32; 2],
+    pub geometry: Option<super::Geometry>,
+    pub visible: bool,
     pub rect: [f32; 4],
     pub angle: f32,
     pub tint: [f32; 4],
@@ -31,14 +37,19 @@ pub struct ParticleFrame {
     origin: (f32, f32, f32),
     angle: f32,
     scale: [f32; 3],
+    spatial: Option<crate::matrix::Mat4>,
 }
 
 impl ParticleFrame {
     pub fn apply(&self, system: &mut crate::particles::ParticleSystem) {
+        let scale =
+            if system.world { crate::particles::nonzero_scale(self.scale) } else { self.scale };
         system.origin = self.origin;
         system.angle = self.angle;
-        system.scale = self.scale[0];
-        system.scale3 = self.scale;
+        system.spatial = self.spatial.filter(|_| !system.world);
+        system.world_matrix = self.spatial.filter(|_| system.world && scale == self.scale);
+        system.scale = scale[0];
+        system.scale3 = scale;
     }
 }
 
@@ -69,7 +80,7 @@ pub(super) fn particle_frame(
 ) -> ParticleFrame {
     let transform = resolve_transform(object, by_id, props, parallax, attachments);
     let ancestors = ancestor_chain(object, by_id);
-    let visible = ancestors.iter().all(|node| truthy(node.get("visible"), props, true));
+    let visible = super::visible_chain(&ancestors, props);
     let scale_z = ancestors
         .iter()
         .map(|node| vec3(node.get("scale"), props).map_or(1.0, |scale| scale.2))
@@ -84,6 +95,7 @@ pub(super) fn particle_frame(
         origin: transform.origin,
         angle: transform.angle,
         scale: [transform.scale.0, transform.scale.1, scale_z],
+        spatial: transform.spatial,
     }
 }
 
@@ -121,12 +133,17 @@ impl Layout {
                 (-dx * sin + dy * cos) / if scale.1.abs() > 0.00001 { scale.1 } else { 1.0 },
             ]
         });
+        let (size, offset) =
+            layer.geometry.map_or((size, offset), |geometry| (geometry.size, geometry.offset));
         Self {
             id: layer.id.clone(),
             size,
             offset,
-            text: layer.is_text,
-            hidden_without_fx: layer.passthrough || (layer.solid && !layer.effects.is_empty()),
+            text: layer.is_text(),
+            hidden_without_fx: layer.passthrough
+                || (layer.solid && layer.effects.iter().any(|effect| effect.state.visible)),
+            puppet: layer.puppet.is_some(),
+            fullscreen: layer.fullscreen,
         }
     }
 }
@@ -142,27 +159,45 @@ pub fn frames(
     let by_id: std::collections::HashMap<String, &Value> =
         objects.iter().filter_map(|o| Some((o.get("id").and_then(id_of)?, o))).collect();
     let parallax = Parallax::of(scene, canvas, props);
+    let hdr = super::hdr::enabled(scene.get(super::GENERAL_FIELD), props);
+    let spatial = super::spatial_scene(scene, props);
     layouts
         .iter()
         .map(|layout| {
             let object = by_id.get(&layout.id)?;
-            let t = resolve_transform(object, &by_id, props, parallax.as_ref(), attachments);
-            let visible = ancestor_chain(object, &by_id)
-                .iter()
-                .all(|o| truthy(o.get("visible"), props, true));
-            let color = vec3(object.get("color"), props).unwrap_or((1.0, 1.0, 1.0));
+            let t = resolve_transform(object, &by_id, props, parallax.as_ref(), attachments)
+                .placed(object, spatial && !layout.puppet);
+            let ancestors = ancestor_chain(object, &by_id);
+            let visible = super::visible_chain(&ancestors, props);
+            let planar_owner = ancestors.iter().all(|node| {
+                vec3(node.get(super::ANGLES_FIELD), props)
+                    .is_none_or(|(x, y, _)| x == 0.0 && y == 0.0)
+            });
+            let mut color = vec3(object.get("color"), props).unwrap_or((1.0, 1.0, 1.0));
+            if hdr && !layout.text {
+                let brightness = number(object.get(super::hdr::BRIGHTNESS_FIELD), props, 1.0);
+                color = (color.0 * brightness, color.1 * brightness, color.2 * brightness);
+            }
             let alpha = number(object.get("alpha"), props, 1.0).clamp(0.0, 1.0);
-            let (sin, cos) = (-t.angle).sin_cos();
-            let ox = layout.offset[0] * t.scale.0;
-            let oy = layout.offset[1] * t.scale.1;
+            let geometry = (!layout.fullscreen).then(|| {
+                super::Geometry::new(t, (layout.size[0], layout.size[1]), layout.offset, canvas)
+            });
+            let rect =
+                geometry.map_or([canvas.0 * 0.5, canvas.1 * 0.5, canvas.0, canvas.1], |geometry| {
+                    [
+                        geometry.transform.x,
+                        geometry.transform.y,
+                        layout.size[0] * t.scale.0,
+                        layout.size[1] * t.scale.1,
+                    ]
+                });
             Some(Frame {
-                rect: [
-                    t.origin.0 + ox * cos - oy * sin,
-                    canvas.1 - t.origin.1 + ox * sin + oy * cos,
-                    layout.size[0] * t.scale.0,
-                    layout.size[1] * t.scale.1,
-                ],
-                angle: -t.angle,
+                planar_owner,
+                origin: [t.origin.0, t.origin.1],
+                geometry,
+                visible,
+                rect,
+                angle: if layout.fullscreen { 0.0 } else { -t.angle },
                 tint: [color.0, color.1, color.2, if visible { alpha } else { 0.0 }],
                 source_tint: [color.0, color.1, color.2, alpha],
                 scale: [t.scale.0, t.scale.1],

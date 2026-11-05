@@ -146,6 +146,14 @@ impl Dispatch<wl_output::WlOutput, ()> for App {
                     state.outputs.iter_mut().find(|info| info.output.id() == output.id())
                 {
                     info.scale = factor.max(1);
+                    for surface in
+                        state.surfaces.iter_mut().filter(|surface| surface.output == *output)
+                    {
+                        if surface.scale != info.scale {
+                            surface.scale = info.scale;
+                            state.resized |= surface.configured && !surface.closed;
+                        }
+                    }
                 }
             }
             wl_output::Event::Mode { flags, width, height, .. } => {
@@ -157,6 +165,14 @@ impl Dispatch<wl_output::WlOutput, ()> for App {
                         state.outputs.iter_mut().find(|info| info.output.id() == output.id())
                 {
                     info.mode = (width as u32, height as u32);
+                    for surface in
+                        state.surfaces.iter_mut().filter(|surface| surface.output == *output)
+                    {
+                        if surface.mode != info.mode {
+                            surface.mode = info.mode;
+                            state.resized |= surface.configured && !surface.closed;
+                        }
+                    }
                 }
             }
             wl_output::Event::Geometry { x, y, .. } => {
@@ -428,7 +444,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ()> for App {
     }
 
     wayland_client::event_created_child!(App, ZwpLinuxBufferParamsV1, [
-        zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (wl_buffer::WlBuffer, (usize::MAX, usize::MAX)),
+        zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (wl_buffer::WlBuffer, (usize::MAX, usize::MAX, u64::MAX)),
     ]);
 }
 
@@ -504,16 +520,17 @@ impl Dispatch<wl_callback::WlCallback, ()> for App {
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, (usize, usize)> for App {
+impl Dispatch<wl_buffer::WlBuffer, (usize, usize, u64)> for App {
     fn event(
         state: &mut Self,
         _: &wl_buffer::WlBuffer,
         event: wl_buffer::Event,
-        (si, bi): &(usize, usize),
+        (si, bi, generation): &(usize, usize, u64),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event
+            && state.buffer_generations.release(*generation)
             && let Some(surf) = state.surfaces.get_mut(*si)
         {
             surf.give_back(*bi);

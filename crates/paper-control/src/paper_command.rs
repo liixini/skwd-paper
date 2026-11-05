@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaperCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawing_photo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Box<FrameSnapshot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawing: Option<Box<crate::DrawingTransition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<Box<crate::SurfacePolicy>>,
     #[serde(default, alias = "path")]
     pub to: String,
@@ -10,6 +18,8 @@ pub struct PaperCommand {
     pub mute: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,6 +40,12 @@ pub struct PaperCommand {
     pub pointer: Option<PointerState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror: Option<Box<crate::MirrorTarget>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameSnapshot {
+    pub path: String,
+    pub output: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +89,10 @@ pub struct SceneCapture {
 }
 
 impl PaperCommand {
+    pub fn drawing_photo(path: &str) -> Self {
+        Self { drawing_photo: Some(path.into()), ..Self::audio(None, None) }
+    }
+
     pub fn capture_scene(source: &str, path: &str) -> Self {
         let mut command = Self::audio(None, None);
         command.capture = Some(SceneCapture { source: source.into(), path: path.into() });
@@ -89,46 +109,25 @@ impl PaperCommand {
     }
 
     pub fn swap_video(to: &str, mute: bool, volume: u32) -> Self {
-        Self {
-            surface: None,
-            to: to.to_string(),
-            mute: Some(mute),
-            volume: Some(volume.min(100)),
-            pause: None,
-            duck: None,
-            capture: None,
-            freeze: None,
-            shader: None,
-            duration_ms: None,
-            outputs: None,
-            properties: None,
-            pointer: None,
-            mirror: None,
-        }
+        Self { to: to.into(), ..Self::audio(Some(mute), Some(volume)) }
     }
 
     pub fn swap_paper(to: &str, shader: &str, duration_ms: u64, mute: bool, volume: u32) -> Self {
         Self {
-            surface: None,
-            to: to.to_string(),
-            mute: Some(mute),
-            volume: Some(volume.min(100)),
-            pause: None,
-            duck: None,
-            capture: None,
-            freeze: None,
-            shader: Some(shader.to_string()),
+            shader: Some(shader.into()),
             duration_ms: Some(duration_ms),
-            outputs: None,
-            properties: None,
-            pointer: None,
-            mirror: None,
+            ..Self::swap_video(to, mute, volume)
         }
     }
 
     pub fn audio(mute: Option<bool>, volume: Option<u32>) -> Self {
         Self {
+            drawing_photo: None,
             surface: None,
+            system_audio: None,
+            drawing: None,
+            reveal: None,
+            snapshot: None,
             to: String::new(),
             mute,
             volume: volume.map(|value| value.min(100)),
@@ -159,7 +158,12 @@ impl PaperCommand {
 
     pub fn pause(paused: bool) -> Self {
         Self {
+            drawing_photo: None,
             surface: None,
+            system_audio: None,
+            drawing: None,
+            reveal: None,
+            snapshot: None,
             to: String::new(),
             mute: None,
             volume: None,
@@ -178,7 +182,12 @@ impl PaperCommand {
 
     pub fn duck(ducked: bool) -> Self {
         Self {
+            drawing_photo: None,
             surface: None,
+            system_audio: None,
+            drawing: None,
+            reveal: None,
+            snapshot: None,
             to: String::new(),
             mute: None,
             volume: None,
@@ -195,9 +204,21 @@ impl PaperCommand {
         }
     }
 
+    pub fn snapshot(path: &str, output: &str) -> Self {
+        let mut command = Self::audio(None, None);
+        command.snapshot =
+            Some(Box::new(FrameSnapshot { path: path.into(), output: output.into() }));
+        command
+    }
+
     pub fn freeze(path: &str) -> Self {
         Self {
+            drawing_photo: None,
             surface: None,
+            system_audio: None,
+            drawing: None,
+            reveal: None,
+            snapshot: None,
             to: String::new(),
             mute: None,
             volume: None,
@@ -216,7 +237,12 @@ impl PaperCommand {
 
     pub fn retain_outputs(outputs: &[String]) -> Self {
         Self {
+            drawing_photo: None,
             surface: None,
+            system_audio: None,
+            drawing: None,
+            reveal: None,
+            snapshot: None,
             to: String::new(),
             mute: None,
             volume: None,
@@ -256,7 +282,7 @@ pub enum CommandClass {
     Duck(bool),
     RetainOutputs(Vec<String>),
     Audio { mute: Option<bool>, volume: Option<u32> },
-    Swap(PaperCommand),
+    Swap(Box<PaperCommand>),
 }
 
 pub fn classify_command(command: PaperCommand) -> CommandClass {
@@ -288,7 +314,7 @@ pub fn classify_command(command: PaperCommand) -> CommandClass {
     if command.to.is_empty() {
         return CommandClass::Audio { mute: command.mute, volume: command.volume };
     }
-    CommandClass::Swap(command)
+    CommandClass::Swap(Box::new(command))
 }
 
 #[cfg(test)]

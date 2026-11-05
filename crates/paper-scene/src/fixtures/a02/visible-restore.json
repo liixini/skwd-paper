@@ -1,0 +1,121 @@
+[
+  {
+    "probe": "visible-restore",
+    "version": 1,
+    "cell": 1,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "init",
+    "fields": [
+      {
+        "runtime": 0,
+        "visible": true,
+        "frame": 0,
+        "playing": true,
+        "rate": 0,
+        "frameCount": 1380
+      }
+    ]
+  },
+  {
+    "probe": "visible-restore",
+    "version": 1,
+    "cell": 1,
+    "seq": 2,
+    "kind": "diagnostic",
+    "label": "seek",
+    "fields": [
+      {
+        "returnType": "undefined",
+        "state": {
+          "runtime": 0,
+          "visible": true,
+          "frame": 119.99999237060547,
+          "playing": true,
+          "rate": 0,
+          "frameCount": 1380
+        }
+      }
+    ]
+  },
+  {
+    "probe": "visible-restore",
+    "version": 1,
+    "cell": 1,
+    "seq": 3,
+    "kind": "diagnostic",
+    "label": "visible-false",
+    "fields": [
+      {
+        "returnType": "boolean",
+        "returned": false,
+        "state": {
+          "runtime": 0,
+          "visible": false,
+          "frame": 119.99999237060547,
+          "playing": true,
+          "rate": 0,
+          "frameCount": 1380
+        }
+      }
+    ]
+  },
+  {
+    "probe": "visible-restore",
+    "version": 1,
+    "cell": 1,
+    "seq": 4,
+    "kind": "diagnostic",
+    "label": "visible-true",
+    "fields": [
+      {
+        "returnType": "boolean",
+        "returned": true,
+        "state": {
+          "runtime": 0,
+          "visible": true,
+          "frame": 119.99999237060547,
+          "playing": true,
+          "rate": 0,
+          "frameCount": 1380
+        }
+      }
+    ]
+  },
+  {
+    "probe": "visible-restore",
+    "version": 1,
+    "cell": 1,
+    "seq": 5,
+    "kind": "diagnostic",
+    "label": "first-update",
+    "fields": [
+      {
+        "runtime": 0.001776200020685792,
+        "visible": true,
+        "frame": 119.99999237060547,
+        "playing": true,
+        "rate": 0,
+        "frameCount": 1380
+      }
+    ]
+  },
+  {
+    "probe": "visible-restore",
+    "version": 1,
+    "cell": 1,
+    "seq": 6,
+    "kind": "diagnostic",
+    "label": "held",
+    "fields": [
+      {
+        "runtime": 0.632620632648468,
+        "visible": true,
+        "frame": 119.99999237060547,
+        "playing": true,
+        "rate": 0,
+        "frameCount": 1380
+      }
+    ]
+  }
+]

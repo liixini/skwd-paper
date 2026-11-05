@@ -188,3 +188,34 @@ fn wallpaper_layer_choices_and_default() {
     assert_eq!(super::parse_layer(None).unwrap(), Layer::Bottom);
     assert!(super::parse_layer(Some("invalid")).is_err());
 }
+
+#[test]
+fn reexec_keeps_retained_outputs() {
+    let manifest = r#"[{"output":"DP-1","video":"/a.mp4"},{"output":"DP-2","video":"/a.mp4"}]"#;
+    let mut args = vec![
+        "skwd-wall-vk".into(),
+        "--multi-json".into(),
+        manifest.into(),
+        "--fill-mode".into(),
+        "fill".into(),
+    ];
+    super::retain_output_args(&mut args, &["DP-2".into()]).unwrap();
+    let entries: Vec<paper_control::MultiVideoEntry> = serde_json::from_str(&args[2]).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].output, "DP-2");
+    assert_eq!(entries[0].video, "/a.mp4");
+    assert_eq!(&args[3..], ["--fill-mode", "fill"]);
+    let mut single = vec!["skwd-wall-vk".into(), "DP-1".into(), "/a.mp4".into()];
+    let original = single.clone();
+    super::retain_output_args(&mut single, &["DP-2".into()]).unwrap();
+    assert_eq!(single, original);
+}
+
+#[test]
+fn scene_reexec_keeps_retained_outputs() {
+    let mut args =
+        ["skwd-wall-vk", "DP-1,DP-3", "/scene/cat", "--scene", "/scene/cat"].map(String::from);
+    super::retain_output_args(&mut args, &["DP-3".into()]).unwrap();
+    assert_eq!(args[1], "DP-3");
+    assert_eq!(args[4], "/scene/cat");
+}

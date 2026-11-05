@@ -10,12 +10,13 @@ members = [
     "crates/paper-scene",
     "crates/paper-shaders",
     "crates/paper-still",
-    "crates/paper-tinier",
+    "crates/paper-text",
     "crates/paper-vk",
+    "crates/paper-widgets",
 ]
 
 [workspace.package]
-version = "1.0.0-beta.26"
+version = "1.0.0-beta.27"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -23,7 +24,7 @@ authors = ["liixini"]
 
 [workspace.dependencies]
 anyhow = "1"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif", "tiff", "pnm"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif", "tiff", "pnm", "hdr", "exr", "tga", "dds"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
@@ -31,6 +32,7 @@ texpresso = "2.0.2"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+webp = "0.3.1"
 
 [profile.release]
 opt-level = 3

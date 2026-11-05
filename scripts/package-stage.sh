@@ -27,7 +27,7 @@ case "$binary_directory" in
     *) binary_directory="$root/$binary_directory" ;;
 esac
 
-for binary in skwd-paper skwd-paper-tinier skwd-wall-still skwd-wall-vk; do
+for binary in skwd-paper skwd-wall-still skwd-wall-vk; do
     path="$binary_directory/$binary"
     if [ ! -f "$path" ] || [ ! -x "$path" ]; then
         echo "missing executable Paper release binary: $path" >&2
@@ -35,12 +35,15 @@ for binary in skwd-paper skwd-paper-tinier skwd-wall-still skwd-wall-vk; do
     fi
 done
 
+three_license="$root/crates/paper-shaders/src/effects/resources/studio/THREE-LICENSE"
+
 for path in \
     "$root/LICENSE" \
     "$root/LICENSES/dav1d-BSD-2-Clause.txt" \
     "$root/LICENSES/ffmpeg-sys-the-third-WTFPL.txt" \
     "$root/LICENSES/OpenH264-BSD-2-Clause.txt" \
-    "$root/LICENSES/libyuv-BSD-3-Clause.txt"
+    "$root/LICENSES/libyuv-BSD-3-Clause.txt" \
+    "$three_license"
 do
     if [ ! -f "$path" ]; then
         echo "missing Paper license material: $path" >&2
@@ -57,8 +60,6 @@ install -m755 "$binary_directory/skwd-paper" "$destination/usr/bin/skwd-paper-v2
 for binary in skwd-wall-still skwd-wall-vk; do
     install -m755 "$binary_directory/$binary" "$destination/usr/bin/$binary"
 done
-install -m755 "$binary_directory/skwd-paper-tinier" \
-    "$destination/usr/lib/skwd-paper/skwd-paper-tinier"
 
 install -m644 "$root/LICENSE" "$license_directory/LICENSE"
 install -m644 "$root/LICENSES/OpenH264-BSD-2-Clause.txt" \
@@ -69,3 +70,4 @@ install -m644 "$root/LICENSES/libyuv-BSD-3-Clause.txt" \
     "$third_party_directory/libyuv-BSD-3-Clause.txt"
 install -m644 "$root/LICENSES/ffmpeg-sys-the-third-WTFPL.txt" \
     "$third_party_directory/ffmpeg-sys-the-third-LICENSE"
+install -m644 "$three_license" "$third_party_directory/three-js-LICENSE"

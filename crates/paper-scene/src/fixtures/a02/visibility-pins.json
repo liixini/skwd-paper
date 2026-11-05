@@ -1,0 +1,20 @@
+{
+  "visible-control": {
+    "receipt": "/home/liixini/projects/skwd-personal/wc18b/rem20/a02/r9/native/captures/visible-control-20261020T232251-d8707d/receipt.json",
+    "receipt_sha256": "e4bebe7c46c42f3afa08ccbc83333d7789b7788ef9d4102bba14b0badfd1af22",
+    "scene_sha256": "ee9667138b0ce5f80810f8f1b961bdd64c7e6e4cb0aca8ca4b93c25dd8c8f174",
+    "records_sha256": "50beda9b5008d11103435b55dd2dc44d8be7246f9118cc5daf5009453fb396ef"
+  },
+  "visible-false": {
+    "receipt": "/home/liixini/projects/skwd-personal/wc18b/rem20/a02/r9/native/captures/visible-false-20261020T232303-b84c58/receipt.json",
+    "receipt_sha256": "d58cde6b813f3c05ad2cb0d29cbeb7c01bffefae4f080f0cac6596fcff195140",
+    "scene_sha256": "9fa1ab98057d24c97d2533a65b9901f641dd145eb6119fbf5982773f82aa144b",
+    "records_sha256": "48818b80f04adf2a069e0843caf743e6d2c8b0aca5454b149ce8747c95da4d75"
+  },
+  "visible-restore": {
+    "receipt": "/home/liixini/projects/skwd-personal/wc18b/rem20/a02/r9/native/captures/visible-restore-20261020T232314-3c4401/receipt.json",
+    "receipt_sha256": "b688d13768d50b2c2db664fd6035354d29b976035f30f93a382e58f807d74ffa",
+    "scene_sha256": "44f04ad132cc0d0488fd91dd581614742f5b1f9869e9c46263c47b75f45b0178",
+    "records_sha256": "cf423390fd145e88fad6592baa942b6fa952f4cc2effdb7285568b190494045b"
+  }
+}

@@ -1,8 +1,18 @@
-use crate::backend::{BackendPaths, Worker, static_transition, transition_source};
+#[path = "handoff.rs"]
+mod handoff;
+#[path = "playback.rs"]
+pub(crate) mod playback;
+#[path = "surface.rs"]
+mod surface;
+
+use crate::backend::{
+    BackendPaths, OverlaySpec, Worker, drawing_source, static_transition, transition_source,
+};
 use anyhow::{Context, Result, anyhow};
+use paper_control::ALL_OUTPUT;
 use paper_control::{
     ApplyRequest, Assignment, AudioSetRequest, FillMode, PaperCommand, RendererFailed,
-    RendererPolicy, RendererReady, SandScope, StopRequest, VideoEngine,
+    RendererPolicy, RendererReady, SandScope, StopRequest,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -10,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const ALL_OUTPUT: &str = "*";
+const DRAWING_DIRECTORY: &str = "drawing-";
+const DRAWING_SNAPSHOT: &str = "target.ppm";
 const OUTPUT_SEPARATOR: &str = ",";
 
 async fn any_worker_exit(workers: &mut [Worker]) {
@@ -46,10 +57,13 @@ pub(crate) struct ApplyTransaction {
     replace_all: bool,
     generation: u64,
     policy: Option<RendererPolicy>,
+    surface_overrides: paper_control::SurfaceOverridesRequest,
     reported_failure: Option<String>,
+    handoff: Option<handoff::Handoff>,
 }
 
 struct ApplyStage {
+    freeze_parent: Option<PathBuf>,
     assignments: Vec<(Assignment, String)>,
     backends: BackendPaths,
     socket: PathBuf,
@@ -85,13 +99,46 @@ impl ApplyTransaction {
             self.overlays = std::mem::take(&mut self.candidates);
             self.ready.clear();
             for (assignment, output) in stage.assignments {
-                self.candidates.push(stage.backends.spawn_overlay(
-                    assignment,
+                let mut snapshot_directory = None;
+                let mut target_snapshot = None;
+                if assignment.source.kind != paper_control::SourceKind::Static
+                    || assignment
+                        .transition
+                        .as_ref()
+                        .is_some_and(|transition| transition.drawing.is_some())
+                {
+                    let index = self
+                        .overlays
+                        .iter()
+                        .position(|worker| worker.output == output)
+                        .ok_or_else(|| anyhow!("drawing candidate missing"))?;
+                    let directory =
+                        Arc::new(tempfile::Builder::new().prefix(DRAWING_DIRECTORY).tempdir_in(
+                            stage.freeze_parent.clone().map_or_else(freeze_parent, Ok)?,
+                        )?);
+                    let snapshot = directory.path().join(DRAWING_SNAPSHOT);
+                    self.overlays[index].snapshot(&snapshot, &output, true).await?;
+                    wait_snapshots(&mut self.overlays, &[index], std::slice::from_ref(&snapshot))
+                        .await?;
+                    target_snapshot = Some(snapshot);
+                    self.overlays[index].drawing_hold = Some(Arc::clone(&directory));
+                    snapshot_directory = Some(directory);
+                }
+
+                let mut worker = stage.backends.spawn_overlay(
+                    OverlaySpec { assignment, snapshot: target_snapshot },
                     output,
                     &stage.socket,
                     self.generation,
                     self.policy.as_ref(),
-                )?);
+                )?;
+                if let Some(directory) = snapshot_directory {
+                    worker.retain_snapshot(directory);
+                }
+                if let Some(handoff) = &self.handoff {
+                    worker.retain_snapshot(Arc::clone(&handoff.directory));
+                }
+                self.candidates.push(worker);
             }
             self.reveal_steady = true;
             return Ok(true);
@@ -164,11 +211,16 @@ impl ApplyTransaction {
 pub(crate) struct Manager {
     mirrors: BTreeMap<String, (String, u32)>,
     surface_override: Option<paper_control::SurfacePolicy>,
+    surface_overrides: paper_control::SurfaceOverridesRequest,
+    widgets: Option<paper_control::WidgetScene>,
+    surface_retry: BTreeSet<u32>,
     backends: Option<BackendPaths>,
     workers: Vec<Worker>,
     overlays: Vec<Worker>,
     next_generation: u64,
     paused: bool,
+    playback_pause: playback::Control,
+    duck: playback::Control,
     policy: Option<RendererPolicy>,
     freeze_parent: Option<PathBuf>,
     #[cfg(test)]
@@ -180,11 +232,16 @@ impl Manager {
         Self {
             mirrors: BTreeMap::new(),
             surface_override: None,
+            surface_overrides: paper_control::SurfaceOverridesRequest::default(),
+            widgets: None,
+            surface_retry: BTreeSet::new(),
             backends: None,
             workers: Vec::new(),
             overlays: Vec::new(),
             next_generation: 1,
             paused: false,
+            playback_pause: playback::Control::default(),
+            duck: playback::Control::default(),
             policy: None,
             freeze_parent: None,
             #[cfg(test)]
@@ -197,11 +254,16 @@ impl Manager {
         Self {
             mirrors: BTreeMap::new(),
             surface_override: None,
+            surface_overrides: paper_control::SurfaceOverridesRequest::default(),
+            widgets: None,
+            surface_retry: BTreeSet::new(),
             backends: Some(backends),
             workers: Vec::new(),
             overlays: Vec::new(),
             next_generation: 1,
             paused: false,
+            playback_pause: playback::Control::default(),
+            duck: playback::Control::default(),
             policy: None,
             freeze_parent: Some(freeze_parent),
             refresh_sweeps: Arc::default(),
@@ -219,28 +281,31 @@ impl Manager {
     ) -> Result<()> {
         surface.validate()?;
         if !self.is_empty() {
-            let current = self
-                .policy
-                .as_ref()
-                .and_then(|policy| policy.surface.as_ref())
-                .ok_or_else(|| anyhow!("active composition has no surface policy"))?;
-            if current.namespace != surface.namespace {
-                return Err(anyhow!("surface namespace does not match active composition"));
-            }
-            let previous = (**current).clone();
-            let mut workers: Vec<_> = self.workers.iter_mut().chain(&mut self.overlays).collect();
-            for index in 0..workers.len() {
-                if let Err(error) = workers[index].set_surface(&surface).await {
-                    for worker in &mut workers[..index] {
-                        let _ = worker.set_surface(&previous).await;
-                    }
-                    return Err(error);
-                }
-            }
+            surface::validate_namespace(self.policy.as_ref(), &surface.namespace)?;
+            self.apply_surfaces(&paper_control::SurfaceOverridesRequest::default(), Some(&surface))
+                .await?;
             self.policy.as_mut().unwrap().surface = Some(Box::new(surface.clone()));
         }
         self.surface_override = Some(surface);
+        self.surface_overrides.surfaces.clear();
         Ok(())
+    }
+
+    pub(crate) async fn set_widgets(&mut self, scene: paper_control::WidgetScene) -> Result<()> {
+        scene.validate().map_err(|error| anyhow!(error.to_string()))?;
+        self.widgets = Some(scene);
+        self.send_widgets().await;
+        self.widgets.take_if(|scene| scene.widgets.is_empty());
+        Ok(())
+    }
+
+    async fn send_widgets(&mut self) {
+        let Some(scene) = &self.widgets else { return };
+        for worker in &mut self.workers {
+            if let Err(error) = worker.set_widgets(scene).await {
+                tracing::warn!(error = %format!("{error:#}"), "widgets: worker did not take the scene");
+            }
+        }
     }
 
     pub(crate) async fn mirror(&mut self, target: &paper_control::MirrorTarget) -> Result<()> {
@@ -293,7 +358,7 @@ impl Manager {
     }
 
     pub(crate) fn paused(&self) -> bool {
-        self.paused
+        self.paused || self.playback_pause.all
     }
 
     pub(crate) fn policy(&self) -> Option<RendererPolicy> {
@@ -310,6 +375,35 @@ impl Manager {
             }
         }
         self.overlays = overlays;
+        for worker in &mut self.workers {
+            if worker.exited()?.is_none()
+                && worker.drawing_hold.is_some()
+                && !self.overlays.iter().any(|overlay| {
+                    overlay.generation == worker.generation && overlay.output == worker.output
+                })
+            {
+                if worker.dynamic() {
+                    use std::io::Write;
+                    let mut control = worker.control_file()?;
+                    control.write_all(
+                        PaperCommand::duck(self.duck.effective(worker)).line().as_bytes(),
+                    )?;
+                    let mut audio = PaperCommand::audio(
+                        Some(worker.assignment.mute),
+                        Some(worker.assignment.volume),
+                    );
+                    audio.system_audio = Some(worker.assignment.system_audio.unwrap_or(true));
+                    control.write_all(audio.line().as_bytes())?;
+                    control.write_all(
+                        PaperCommand::pause(self.paused || self.playback_pause.effective(worker))
+                            .line()
+                            .as_bytes(),
+                    )?;
+                }
+                worker.drawing_hold = None;
+                worker.pending_photos.clear();
+            }
+        }
         #[cfg(test)]
         self.refresh_sweeps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut live = Vec::with_capacity(self.workers.len());
@@ -355,11 +449,17 @@ impl Manager {
         {
             **surface = effects.clone();
         }
+        self.launch_surfaces(policy.as_ref(), request.replace_all)?;
         if !self.workers.is_empty() && !request.replace_all && policy != self.policy {
             return Err(anyhow!("changing renderer policy requires replace_all"));
         }
         if policy.as_ref().and_then(|policy| policy.transitions_enabled) == Some(false)
-            && request.assignments.iter().any(|assignment| assignment.transition.is_some())
+            && request.assignments.iter().any(|assignment| {
+                assignment
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.drawing.is_none())
+            })
         {
             return Err(anyhow!("assignment transitions conflict with the active renderer policy"));
         }
@@ -379,7 +479,7 @@ impl Manager {
         }
         if !request.replace_all {
             for worker in &self.workers {
-                if worker.retain_capable() || worker.assignment.outputs.len() < 2 {
+                if worker.assignment.outputs.len() < 2 {
                     continue;
                 }
                 let keep = worker
@@ -401,9 +501,25 @@ impl Manager {
         }
         let mut expanded = expand(&assignments, transition_primary.as_deref());
         for (assignment, _) in &mut expanded {
+            self.playback_pause.validate(&assignment.outputs)?;
+            self.duck.validate(&assignment.outputs)?;
+            if let Some(transition) = assignment.transition.as_ref()
+                && let Some(drawing) = &transition.drawing
+            {
+                if assignment.outputs.len() != 1 || assignment.outputs[0] == ALL_OUTPUT {
+                    return Err(anyhow!("drawing requires one named output per renderer"));
+                }
+                drawing.load(drawing_source(transition, assignment))?;
+            }
+        }
+        let handoff = self.capture_overlays(&mut expanded).await?;
+        for (assignment, _) in &mut expanded {
             resolve_transition_from(assignment, &self.workers)?;
         }
-        self.stage(expanded, touched, request.replace_all, policy, socket).await
+        let mut transaction =
+            self.stage(expanded, touched, request.replace_all, policy, socket).await?;
+        transaction.handoff = handoff;
+        Ok(transaction)
     }
 
     async fn stage(
@@ -416,18 +532,24 @@ impl Manager {
     ) -> Result<ApplyTransaction> {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
-        let backends = self.backend_paths();
+        let mut backends = self.backend_paths();
+        backends.surface_overrides = self.launch_surfaces(policy.as_ref(), replace_all)?;
         let overlays = expanded
             .iter()
             .filter(|(assignment, _)| static_transition(assignment))
             .cloned()
             .collect::<Vec<_>>();
         let next = (!overlays.is_empty()).then(|| ApplyStage {
+            freeze_parent: self.freeze_parent.clone(),
             assignments: overlays,
             backends: backends.clone(),
             socket: socket.to_path_buf(),
         });
         let mut candidates = Vec::with_capacity(expanded.len());
+        for (assignment, _) in &expanded {
+            self.playback_pause.validate(&assignment.outputs)?;
+            self.duck.validate(&assignment.outputs)?;
+        }
         for (assignment, output) in expanded {
             let spawned = backends.spawn(assignment, output, socket, generation, policy.as_ref());
             match spawned {
@@ -450,7 +572,9 @@ impl Manager {
             replace_all,
             generation,
             policy,
+            surface_overrides: backends.surface_overrides,
             reported_failure: None,
+            handoff: None,
         })
     }
 
@@ -462,28 +586,26 @@ impl Manager {
             transaction.rollback().await;
             return Err(anyhow!("Paper composition has not completed presentation readiness"));
         }
-        if self.paused {
-            for candidate in &mut transaction.candidates {
-                if candidate.dynamic()
-                    && let Err(error) = candidate.send(&PaperCommand::pause(true)).await
+        for worker in transaction.candidates.iter_mut().chain(&mut transaction.overlays) {
+            if worker.dynamic() && worker.drawing_hold.is_none() {
+                let pause = self.paused || self.playback_pause.effective(worker);
+                let duck = self.duck.effective(worker);
+                if let Err(error) = async {
+                    worker.send(&PaperCommand::duck(duck)).await?;
+                    worker.send(&PaperCommand::pause(pause)).await
+                }
+                .await
                 {
                     transaction.rollback().await;
-                    return Err(error.context("pause ready Paper candidate"));
+                    return Err(error.context("control ready Paper candidate"));
                 }
             }
         }
         for candidate in &mut transaction.candidates {
             candidate.assignment.transition = None;
         }
-        for overlay in &mut transaction.overlays {
-            if let Err(error) = overlay.send(&PaperCommand::pause(false)).await {
-                transaction.rollback().await;
-                return Err(error.context("release Paper static transition"));
-            }
-        }
-        if let Err(error) = self.retain_untouched(&transaction).await {
-            transaction.rollback().await;
-            return Err(error);
+        if let Some(handoff) = &mut transaction.handoff {
+            handoff.disarm();
         }
         let mut overlays = Vec::new();
         for overlay in self.overlays.drain(..) {
@@ -524,6 +646,8 @@ impl Manager {
         retained.extend(transaction.candidates);
         self.workers = retained;
         self.policy = transaction.policy;
+        self.surface_overrides = transaction.surface_overrides;
+        self.send_widgets().await;
         for worker in retired {
             worker.stop().await;
         }
@@ -536,11 +660,22 @@ impl Manager {
         if self.paused {
             return Ok(None);
         }
+        if self.overlays.iter().any(|worker| {
+            worker
+                .assignment
+                .transition
+                .as_ref()
+                .is_some_and(|transition| transition.drawing.is_some())
+        }) {
+            self.set_dynamic_pause(true).await?;
+            self.paused = true;
+            return Ok(None);
+        }
         let freeze_indices = self
             .workers
             .iter()
             .enumerate()
-            .filter_map(|(index, worker)| worker.freeze_capable().then_some(index))
+            .filter_map(|(index, worker)| worker.pause_freeze_capable().then_some(index))
             .collect::<Vec<_>>();
         if freeze_indices.is_empty() {
             self.set_dynamic_pause(true).await?;
@@ -557,7 +692,7 @@ impl Manager {
             .collect::<Vec<_>>();
         let mut changed: Vec<usize> = Vec::new();
         for index in 0..self.workers.len() {
-            if !self.workers[index].dynamic() {
+            if !self.workers[index].dynamic() || self.workers[index].drawing_hold.is_some() {
                 continue;
             }
             let command =
@@ -567,7 +702,8 @@ impl Manager {
                 );
             if let Err(error) = self.workers[index].send(&command).await {
                 for changed_index in changed {
-                    let _ = self.workers[changed_index].send(&PaperCommand::pause(false)).await;
+                    let paused = self.playback_pause.effective(&self.workers[changed_index]);
+                    let _ = self.workers[changed_index].send(&PaperCommand::pause(paused)).await;
                 }
                 return Err(error.context("prepare Paper freeze frame"));
             }
@@ -575,7 +711,8 @@ impl Manager {
         }
         if let Err(error) = wait_snapshots(&mut self.workers, &freeze_indices, &snapshots).await {
             for index in changed {
-                let _ = self.workers[index].send(&PaperCommand::pause(false)).await;
+                let paused = self.playback_pause.effective(&self.workers[index]);
+                let _ = self.workers[index].send(&PaperCommand::pause(paused)).await;
             }
             return Err(error);
         }
@@ -615,7 +752,9 @@ impl Manager {
             replace_all: false,
             generation,
             policy: self.policy.clone(),
+            surface_overrides: self.surface_overrides.clone(),
             reported_failure: None,
+            handoff: None,
         }))
     }
 
@@ -636,8 +775,9 @@ impl Manager {
 
     pub(crate) async fn abort_pause(&mut self) {
         for worker in &mut self.workers {
-            if worker.dynamic() {
-                let _ = worker.send(&PaperCommand::pause(false)).await;
+            if worker.dynamic() && worker.drawing_hold.is_none() {
+                let paused = self.playback_pause.effective(worker);
+                let _ = worker.send(&PaperCommand::pause(paused)).await;
             }
         }
     }
@@ -688,7 +828,9 @@ impl Manager {
             replace_all: false,
             generation,
             policy: self.policy.clone(),
+            surface_overrides: self.surface_overrides.clone(),
             reported_failure: None,
+            handoff: None,
         }))
     }
 
@@ -709,18 +851,21 @@ impl Manager {
     }
 
     async fn set_dynamic_pause(&mut self, paused: bool) -> Result<()> {
-        let mut changed: Vec<usize> = Vec::new();
-        for index in 0..self.workers.len() {
-            if !self.workers[index].dynamic() {
-                continue;
-            }
-            if let Err(error) = self.workers[index].send(&PaperCommand::pause(paused)).await {
-                for changed_index in changed {
-                    let _ = self.workers[changed_index].send(&PaperCommand::pause(!paused)).await;
+        let mut workers = self
+            .workers
+            .iter_mut()
+            .chain(&mut self.overlays)
+            .filter(|worker| worker.dynamic() && worker.drawing_hold.is_none())
+            .collect::<Vec<_>>();
+        for index in 0..workers.len() {
+            let effective = paused || self.playback_pause.effective(workers[index]);
+            if let Err(error) = workers[index].send(&PaperCommand::pause(effective)).await {
+                for worker in &mut workers[..index] {
+                    let previous = !paused || self.playback_pause.effective(worker);
+                    let _ = worker.send(&PaperCommand::pause(previous)).await;
                 }
                 return Err(error.context("set Paper pause state"));
             }
-            changed.push(index);
         }
         Ok(())
     }
@@ -731,6 +876,7 @@ impl Manager {
     ) -> Result<(usize, Vec<WorkerStatus>)> {
         request.validate().map_err(|error| anyhow!(error.to_string()))?;
         self.refresh()?;
+        playback::validate_scope(&request.outputs, self.workers.iter().chain(&self.overlays))?;
         let all = request.outputs.is_empty() || request.outputs.as_slice() == [ALL_OUTPUT];
         if !all && self.workers.iter().any(|worker| worker.output == ALL_OUTPUT) {
             return Err(anyhow!(
@@ -751,38 +897,41 @@ impl Manager {
                 .then_some(index)
             })
             .collect::<Vec<_>>();
-        let previous = targets
-            .iter()
-            .map(|index| {
-                let assignment = &self.workers[*index].assignment;
-                (*index, assignment.mute, assignment.volume)
-            })
-            .collect::<Vec<_>>();
-        let mut changed: Vec<(usize, bool, u32)> = Vec::new();
-        for (index, mute, volume) in &previous {
-            if !self.workers[*index].dynamic() {
+        let mut duck = self.duck.clone();
+        if let Some(value) = request.duck {
+            duck.set(&request.outputs, value);
+        }
+        for index in &targets {
+            if !self.workers[*index].dynamic() || self.workers[*index].drawing_hold.is_some() {
                 continue;
             }
-            if let Err(error) =
-                self.workers[*index].send(&PaperCommand::audio(request.mute, request.volume)).await
-            {
-                for (changed_index, old_mute, old_volume) in changed {
-                    let _ = self.workers[changed_index]
-                        .send(&PaperCommand::audio(Some(old_mute), Some(old_volume)))
-                        .await;
-                }
+            if let Err(error) = self.workers[*index].send_audio(request).await {
+                self.restore_audio(&request.outputs).await;
                 return Err(error.context("set Paper audio state"));
             }
-            changed.push((*index, *mute, *volume));
+        }
+        if let Some(ducked) = request.duck {
+            for index in 0..self.overlays.len() {
+                if playback::selected(&request.outputs, &self.overlays[index])
+                    && let Err(error) = self.overlays[index].send(&PaperCommand::duck(ducked)).await
+                {
+                    self.restore_audio(&request.outputs).await;
+                    return Err(error.context("set Paper overlay audio state"));
+                }
+            }
         }
         for index in &targets {
             if let Some(mute) = request.mute {
                 self.workers[*index].assignment.mute = mute;
             }
+            if let Some(source) = request.system_audio {
+                self.workers[*index].assignment.system_audio = Some(source);
+            }
             if let Some(volume) = request.volume {
                 self.workers[*index].assignment.volume = volume;
             }
         }
+        self.duck = duck;
         let statuses = targets.iter().map(|index| worker_status(&self.workers[*index])).collect();
         Ok((targets.len(), statuses))
     }
@@ -791,26 +940,12 @@ impl Manager {
         let all =
             request.outputs.is_empty() || request.outputs.iter().any(|output| output == ALL_OUTPUT);
         let wanted: BTreeSet<&str> = request.outputs.iter().map(String::as_str).collect();
-        let mut changes = Vec::new();
-        let mut count = 0;
-        if !all {
-            for index in 0..self.workers.len() {
-                let old = self.workers[index].assignment.outputs.clone();
-                let keep = old
-                    .iter()
-                    .filter(|output| !wanted.contains(output.as_str()))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                count += old.len() - keep.len();
-                if !keep.is_empty() && keep.len() != old.len() {
-                    if let Err(error) = retarget(&mut self.workers[index], &keep).await {
-                        rollback_retargets(&mut self.workers, changes).await;
-                        return Err(error.context("retarget Paper worker during stop"));
-                    }
-                    changes.push((index, old));
-                }
-            }
-        }
+        let mut count = self
+            .workers
+            .iter()
+            .flat_map(|worker| &worker.assignment.outputs)
+            .filter(|output| wanted.contains(output.as_str()))
+            .count();
         let mut retained = Vec::new();
         let mut stopped = Vec::new();
         for worker in self.workers.drain(..) {
@@ -868,10 +1003,7 @@ impl Manager {
                 .cloned()
                 .collect::<Vec<_>>();
             count += worker.assignment.outputs.len() - keep.len();
-            if worker.retain_capable()
-                || keep.is_empty()
-                || keep.len() == worker.assignment.outputs.len()
-            {
+            if keep.is_empty() || keep.len() == worker.assignment.outputs.len() {
                 continue;
             }
             let mut assignment = worker.assignment.clone();
@@ -888,29 +1020,6 @@ impl Manager {
         Ok(Some((transaction, count)))
     }
 
-    async fn retain_untouched(&mut self, transaction: &ApplyTransaction) -> Result<()> {
-        if transaction.replace_all || transaction.touched.contains(ALL_OUTPUT) {
-            return Ok(());
-        }
-        let mut changes = Vec::new();
-        for index in 0..self.workers.len() {
-            let old = self.workers[index].assignment.outputs.clone();
-            let keep = old
-                .iter()
-                .filter(|output| !transaction.touched.contains(*output))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !keep.is_empty() && keep.len() != old.len() {
-                if let Err(error) = retarget(&mut self.workers[index], &keep).await {
-                    rollback_retargets(&mut self.workers, changes).await;
-                    return Err(error.context("retarget incumbent Paper worker"));
-                }
-                changes.push((index, old));
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn status(&self) -> Vec<WorkerStatus> {
         self.workers.iter().map(worker_status).collect()
     }
@@ -920,7 +1029,14 @@ impl Manager {
     }
 
     fn backend_paths(&self) -> BackendPaths {
-        self.backends.clone().unwrap_or_else(BackendPaths::discover)
+        let mut backends = self.backends.clone().unwrap_or_else(BackendPaths::discover);
+        backends.pause = self.playback_pause.clone();
+        if self.paused {
+            backends.pause.set(&[], true);
+        }
+        backends.duck = self.duck.clone();
+        backends.surface_overrides = self.surface_overrides.clone();
+        backends
     }
 }
 
@@ -1118,8 +1234,7 @@ fn expand(
             {
                 assignment.transition = None;
             }
-            if (assignment.source.effective_video_engine() == Some(VideoEngine::Tinier)
-                || assignment.fill_mode == FillMode::Span)
+            if assignment.fill_mode == FillMode::Span
                 && output != "*"
                 && let Some((group, target)) =
                     expanded.iter_mut().find(|(candidate, _)| same_renderer(candidate, &assignment))
@@ -1152,22 +1267,6 @@ fn same_renderer(left: &Assignment, right: &Assignment) -> bool {
         })
         && left.layer == right.layer
         && (left.fill_mode == FillMode::Span || left.transition == right.transition)
-}
-
-async fn retarget(worker: &mut Worker, outputs: &[String]) -> Result<()> {
-    if !worker.retain_capable() {
-        return Err(anyhow!("Paper worker cannot retain a subset of its outputs"));
-    }
-    worker.send(&PaperCommand::retain_outputs(outputs)).await?;
-    worker.assignment.outputs = outputs.to_vec();
-    worker.output = outputs.join(OUTPUT_SEPARATOR);
-    Ok(())
-}
-
-async fn rollback_retargets(workers: &mut [Worker], changes: Vec<(usize, Vec<String>)>) {
-    for (index, outputs) in changes.into_iter().rev() {
-        let _ = retarget(&mut workers[index], &outputs).await;
-    }
 }
 
 #[cfg(test)]

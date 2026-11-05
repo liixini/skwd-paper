@@ -17,7 +17,6 @@ BINARIES = (
     "usr/bin/skwd-paper-v2",
     "usr/bin/skwd-wall-still",
     "usr/bin/skwd-wall-vk",
-    "usr/lib/skwd-paper/skwd-paper-tinier",
 )
 LICENSES = (
     "usr/share/licenses/skwd-paper/LICENSE",
@@ -25,6 +24,7 @@ LICENSES = (
     "usr/share/licenses/skwd-paper/third-party/dav1d-BSD-2-Clause.txt",
     "usr/share/licenses/skwd-paper/third-party/ffmpeg-sys-the-third-LICENSE",
     "usr/share/licenses/skwd-paper/third-party/libyuv-BSD-3-Clause.txt",
+    "usr/share/licenses/skwd-paper/third-party/three-js-LICENSE",
 )
 EXPECTED = BINARIES + LICENSES
 
@@ -120,14 +120,14 @@ class PackagingTests(unittest.TestCase):
             self.assertIn("skwd-wall-vk", result.stderr)
             self.assertFalse(destination.exists())
 
-    def test_stage_fails_before_writing_when_the_private_worker_is_missing(self):
+    def test_stage_fails_before_writing_when_a_renderer_is_missing(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             binaries = root / "release"
             destination = root / "stage"
             release_binaries(
                 binaries,
-                tuple(entry for entry in BINARIES if entry != "usr/lib/skwd-paper/skwd-paper-tinier"),
+                tuple(entry for entry in BINARIES if entry != "usr/bin/skwd-wall-vk"),
             )
             environment = {**os.environ, "SKWD_PAPER_BIN_DIR": str(binaries)}
             result = subprocess.run(
@@ -140,7 +140,7 @@ class PackagingTests(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("skwd-paper-tinier", result.stderr)
+            self.assertIn("skwd-wall-vk", result.stderr)
             self.assertFalse(destination.exists())
 
     def test_stage_refuses_a_nonempty_destination_without_mutation(self):

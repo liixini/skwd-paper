@@ -48,16 +48,27 @@ impl Default for Shake {
     }
 }
 
-pub const SHAKE_PIXELS: f32 = 11.2;
+const SHAKE_UNIT: f32 = 0.1;
+const SHAKE_FLAT_HEIGHT_SCALE: f32 = 0.1;
+const SHAKE_Y_RATE: f32 = 1.333;
+const SHAKE_ROUGHNESS_POWER: i32 = 3;
+const SHAKE_MIN_EXPONENT: f32 = 0.001;
 
 impl Shake {
     #[must_use]
-    pub fn offset(self, time: f32) -> [f32; 2] {
-        let t = time * self.speed;
-        let rough = (self.roughness - 1.0).clamp(0.0, 8.0) * 0.25;
-        let x = (t * 1.03).sin() + rough * (t * 5.3).sin();
-        let y = (t * 1.31 + 1.9).sin() + rough * (t * 6.7 + 0.7).sin();
-        [x * self.amplitude * SHAKE_PIXELS, y * self.amplitude * SHAKE_PIXELS]
+    pub fn eye_offset(self, time: f32, flat_height: Option<f32>) -> [f32; 3] {
+        let t = self.speed * self.speed * time;
+        let depth = if flat_height.is_some() { 0.0 } else { t.sin() };
+        let mut axes = [t.cos(), (t * SHAKE_Y_RATE).sin(), depth];
+        let exponent = self.roughness.powi(SHAKE_ROUGHNESS_POWER);
+        if exponent > SHAKE_MIN_EXPONENT && exponent != 1.0 {
+            let length = axes.iter().map(|axis| axis * axis).sum::<f32>().sqrt();
+            let bent = length.powf(exponent) / length;
+            axes = axes.map(|axis| axis * bent);
+        }
+        let scale =
+            self.amplitude * SHAKE_UNIT * flat_height.map_or(1.0, |h| h * SHAKE_FLAT_HEIGHT_SCALE);
+        axes.map(|axis| axis * scale)
     }
 }
 

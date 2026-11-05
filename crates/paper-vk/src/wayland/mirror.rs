@@ -9,6 +9,7 @@ use wayland_client::protocol::wl_shm;
 use wayland_client::{Proxy, protocol::wl_buffer::WlBuffer};
 
 const REPLACED: &str = "replaced";
+const RESIZED: &str = "presentation resized";
 const STALLED: &str = "consumer did not release its frames";
 const HOLD_LIMIT: Duration = Duration::from_millis(250);
 const UNCLAIMED_LIMIT: Duration = Duration::from_secs(2);
@@ -101,6 +102,10 @@ impl Buffers {
         }
     }
 
+    pub(super) fn retire(&mut self, buffer: &WlBuffer) {
+        self.by_buffer.retain(|shared| shared.buffer != *buffer);
+    }
+
     fn find(&self, buffer: &WlBuffer) -> Option<&Shared> {
         self.by_buffer.iter().find(|shared| shared.buffer == *buffer && buffer.is_alive())
     }
@@ -170,6 +175,12 @@ impl SurfaceUi {
 }
 
 impl App {
+    pub(super) fn end_mirrors_for_resize(&mut self) {
+        for surface in &mut self.surfaces {
+            surface.end_mirror(&RESIZED);
+        }
+    }
+
     pub(super) fn apply_mirror_requests(&mut self) {
         let names: Vec<String> = self.surfaces.iter().map(|surf| surf.name.clone()).collect();
         for target in take_requests(|output| names.iter().any(|name| name == output)) {
@@ -233,7 +244,7 @@ impl App {
         let Some(surf) = self.surfaces.get_mut(si) else { return };
         let source = surf.source_for(&shared.layout);
         let Some(mirror) = surf.mirror.as_mut() else { return };
-        let bi = buffer.data::<(usize, usize)>().map_or(usize::MAX, |&(_, bi)| bi);
+        let bi = buffer.data::<(usize, usize, u64)>().map_or(usize::MAX, |&(_, bi, _)| bi);
         let buffers = &self.mirror_buffers;
         let forgotten: Vec<u8> = mirror
             .sent

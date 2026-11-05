@@ -1,17 +1,65 @@
 {
   "schema": 1,
   "suites": [
-    {"id": "verify.repository", "expectedSkips": 0, "coverage": "external verifier self-tests and repository boundary"},
-    {"id": "paper.native-deps", "expectedSkips": 0, "coverage": "dav1d and libyuv linker availability"},
-    {"id": "paper.format", "expectedSkips": 0, "coverage": "Rust formatting"},
-    {"id": "paper.tests", "expectedSkips": 27, "coverage": "release workspace tests; the Vulkan NV12 color regression, seven Vulkan scene regressions for video, clocks, pointer shaders, particles, depth parallax and Proton layer movement, the real-audio-device test, the manual freeze-frame benchmark, installed-prefix font resolution, and six Vulkan checks for sound callbacks, sorted audio identity, sprite frames, audio-only lifetime, packed spectrum pixels and hidden targets, plus puppet straight-alpha rendering and animated X-ray source visibility, plus six Vulkan checks for keyframed effect opacity, parent origin, visibility, scripted parent vectors, text replacement and effect values, plus Vulkan append/grab and incremental scene-prefix equivalence checks remain opt-in"},
-    {"id": "paper.clippy", "expectedSkips": 0, "coverage": "workspace all-target lint gate"},
-    {"id": "paper.release", "expectedSkips": 0, "coverage": "release workspace build"},
-    {"id": "paper.dependencies", "expectedSkips": 0, "coverage": "unused dependency scan"},
-    {"id": "paper.unsafe", "expectedSkips": 0, "coverage": "unsafe inventory"},
-    {"id": "paper.python", "expectedSkips": 0, "coverage": "Python packaging and performance tooling tests"},
-    {"id": "paper.executables", "expectedSkips": 0, "coverage": "release executable contract"},
-    {"id": "paper.package", "expectedSkips": 0, "coverage": "real release package stage"},
-    {"id": "paper.native-scene", "expectedSkips": 1, "coverage": "live native scene renderer"}
+    {
+      "id": "verify.repository",
+      "expectedSkips": 0,
+      "coverage": "external verifier self-tests and repository boundary"
+    },
+    {
+      "id": "paper.native-deps",
+      "expectedSkips": 0,
+      "coverage": "dav1d and libyuv linker availability"
+    },
+    {
+      "id": "paper.format",
+      "expectedSkips": 0,
+      "coverage": "Rust formatting"
+    },
+    {
+      "id": "paper.tests",
+      "expectedSkips": 395,
+      "coverage": "Release workspace tests. The 394 explicit opt-in tests cover Vulkan rendering and resource lifetime; native Wallpaper Engine model, puppet, texture, shader, lighting, prelighting, scene zoom, effect space, descriptor pool, shadow, volume and dynamic-layer fixtures; Drawing GPU and artifact-frame checks; installed fonts, isolated audio and media; CPU reference profiles; and a manual freeze-frame benchmark. These require separate fixture, device or live-runtime qualification and are not counted as CI passes."
+    },
+    {
+      "id": "paper.clippy",
+      "expectedSkips": 0,
+      "coverage": "workspace all-target lint gate"
+    },
+    {
+      "id": "paper.release",
+      "expectedSkips": 0,
+      "coverage": "release workspace build"
+    },
+    {
+      "id": "paper.dependencies",
+      "expectedSkips": 0,
+      "coverage": "unused dependency scan"
+    },
+    {
+      "id": "paper.unsafe",
+      "expectedSkips": 0,
+      "coverage": "unsafe inventory"
+    },
+    {
+      "id": "paper.python",
+      "expectedSkips": 0,
+      "coverage": "Python packaging and performance tooling tests"
+    },
+    {
+      "id": "paper.executables",
+      "expectedSkips": 0,
+      "coverage": "release executable contract"
+    },
+    {
+      "id": "paper.package",
+      "expectedSkips": 0,
+      "coverage": "real release package stage"
+    },
+    {
+      "id": "paper.native-scene",
+      "expectedSkips": 1,
+      "coverage": "live native scene renderer"
+    }
   ]
 }

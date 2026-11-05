@@ -8,14 +8,16 @@ authors.workspace = true
 description = "Shared cpal + ffmpeg audio playback for skwd wallpaper renderers"
 
 [dependencies]
+paper-runtime = { path = "../paper-runtime" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-cpal = "0.16"
+cpal = "0.18.2"
 libloading = "0.8"
 ringbuf = "0.5.2"
 ffmpeg-the-third = { version = "6", default-features = false, features = ["codec", "format", "software-resampling"] }
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = { workspace = true }
 
 [lints.rust]

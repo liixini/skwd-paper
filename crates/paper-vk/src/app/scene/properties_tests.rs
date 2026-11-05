@@ -40,14 +40,14 @@ fn hot_updates_require_changed_properties_and_unchanged_source_files() {
 
 #[test]
 #[ignore = "requires Vulkan"]
-fn static_property_callbacks_deliver_sound_commands_without_another_frame() {
+fn static_sound_callbacks() {
     let root = tempfile::tempdir().unwrap();
     let scene = serde_json::json!({
         "general":{"orthogonalprojection":{"width":64,"height":64}},
         "objects":[
             {"id":7,"name":"BGM","sound":["missing.ogg"],"startsilent":true},
             {"id":2,"alpha":{"user":"opacity","value":1.0},"visible":{
-                "value":true,"script":"export function applyUserProperties(props) { const sound=thisScene.getLayer('BGM'); if(props.opacity>0.5) sound.play(); else sound.stop(); }"
+                "value":true,"script":"export function init(value) { thisScene.getLayer('BGM').play(); return value; } export function applyUserProperties(props) { const sound=thisScene.getLayer('BGM'); thisLayer.name=String(sound.isPlaying()); if(props.opacity>0.5) sound.play(); else sound.stop(); }"
             }}
         ]
     }).to_string();
@@ -68,7 +68,7 @@ fn static_property_callbacks_deliver_sound_commands_without_another_frame() {
     .unwrap();
     let package = paper_scene::pkg::Package::parse(bytes).unwrap();
     let mut model = paper_scene::model::load_from_dir(&package, root.path()).unwrap();
-    let shared = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let shared = crate::shared::test_device();
     let mut group = super::super::build_group(
         &shared,
         &mut model,
@@ -79,21 +79,38 @@ fn static_property_callbacks_deliver_sound_commands_without_another_frame() {
     .unwrap();
     assert!(!group.animated());
     assert!(!group.frozen);
-    group.take_script_sounds();
     let directory = root.path().to_string_lossy();
     let mut source = PropertySource::new(&directory, &Properties::new());
-    let mut delivered = Vec::new();
-    for (opacity, expected) in
-        [(0.25, paper_audio::VoiceOp::Stop), (1.0, paper_audio::VoiceOp::Play)]
+    let mut ctl = crate::ctl::Ctl::start_opts("", true, 100, false, false);
+    ctl.set_scene_voices(
+        vec![paper_audio::Voice {
+            id: "7".into(),
+            name: "BGM".into(),
+            clips: vec!["missing.ogg".into()],
+            gain: 1.0,
+            mode: paper_audio::VoiceMode::Once,
+            min_gap: 0.0,
+            max_gap: 0.0,
+            autostart: false,
+        }],
+        None,
+    );
+    group.apply_script_sounds(&mut ctl);
+    assert_eq!(ctl.scene_voice_states(), [("7".into(), true)]);
+    group.sync_sound_states(&ctl);
+    ctl.scene_sound("7", paper_audio::VoiceOp::Stop);
+    for (opacity, before, after) in [(0.25, false, false), (1.0, false, true), (0.25, true, false)]
     {
         assert!(group.update_properties(
             &mut source,
             &directory,
             &Properties::from([("opacity".into(), vec![opacity])]),
-            |id, op| delivered.push((id.to_owned(), op)),
+            &mut ctl,
         ));
         assert!(!group.animated());
-        assert_eq!(delivered.pop(), Some(("7".into(), expected)));
+        let host = group.scripts.as_ref().unwrap().host.as_ref().unwrap();
+        assert_eq!(host.scene["objects"][1]["name"], before.to_string());
+        assert_eq!(ctl.scene_voice_states(), vec![("7".into(), after)]);
         assert!(group.take_script_sounds().is_empty());
     }
     group.destroy();

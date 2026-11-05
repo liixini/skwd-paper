@@ -1,0 +1,20 @@
+{
+  "matrix": {
+    "package_sha256": "829454df084a3a1f89bb39cd90d2400b4ac24417f046de80b3f89fb2f53927fc",
+    "records_sha256": "f79d99d39e26ccd5bffe8f01e55d58b377058f16ca8a44859273efaa367d0591",
+    "receipt": "/home/liixini/projects/skwd-personal/wc18b/rem20/a03/probes/native/captures/matrix-20261020T222408-338c87/receipt.json",
+    "receipt_sha256": "565b4831084d76d16de1ce8e87c40a6cb1c59972ec2a98ee6ecf6c0b686022ea",
+    "native_status": "CAPTURED",
+    "owned_cgroup_empty": true,
+    "stable_rgb_sha256": "8b4502bea01b210b160d96881f93bddf78477b7f56c69139f6a1d757dc3ff6a7"
+  },
+  "matrix-detail": {
+    "package_sha256": "e4e97abc362711b7e5615dab1af38d007e2939ac4fd3e61ff584d398fd6c3153",
+    "records_sha256": "db6a641b263f08a13a36c18a25aa0d10f3015078f01e8fb5f94b476eba4e94ab",
+    "receipt": "/home/liixini/projects/skwd-personal/wc18b/rem20/a03/r2/native/captures/matrix-detail-20261020T223056-7d363d/receipt.json",
+    "receipt_sha256": "8ac30067ed08b2eb0e570b023187e5fb07dceb161b25e6bc164c5468180f8718",
+    "native_status": "CAPTURED",
+    "owned_cgroup_empty": true,
+    "stable_rgb_sha256": "8b4502bea01b210b160d96881f93bddf78477b7f56c69139f6a1d757dc3ff6a7"
+  }
+}

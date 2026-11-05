@@ -41,6 +41,7 @@ pub struct SceneTargetPlan {
     pub retain: Vec<bool>,
     pub sampled: Vec<BTreeSet<CompositeBuffer>>,
     pub shadow_targets: usize,
+    pub reflection_consumers: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,11 +115,18 @@ pub fn plan_scene_targets(
     let mut sampled = vec![BTreeSet::new(); nodes.len()];
     let mut passive_dynamic = vec![false; nodes.len()];
     let mut dependencies = Vec::new();
+    let mut reflection_consumers = Vec::new();
     for (consumer, node) in nodes.iter().enumerate() {
         snapshots[consumer] = node.passthrough;
         for (_, binding) in node.binds.iter().flatten() {
             match binding {
-                EffectBind::Previous => {}
+                EffectBind::Previous | EffectBind::ShadowAtlas | EffectBind::LightCookie => {}
+                EffectBind::Reflection => {
+                    if !reflection_consumers.contains(&consumer) {
+                        reflection_consumers.push(consumer);
+                    }
+                }
+                EffectBind::SceneHistory => passive_dynamic[consumer] = true,
                 EffectBind::Named(target) => {
                     if resolve_fbo_index(node.local_targets.iter().map(String::as_str), target)
                         .is_none()
@@ -255,7 +263,16 @@ pub fn plan_scene_targets(
     }
 
     let shadow_targets = usize::from(snapshots.iter().any(|needed| *needed));
-    Ok(SceneTargetPlan { order, dependencies, snapshots, dynamic, retain, sampled, shadow_targets })
+    Ok(SceneTargetPlan {
+        order,
+        dependencies,
+        snapshots,
+        dynamic,
+        retain,
+        sampled,
+        shadow_targets,
+        reflection_consumers,
+    })
 }
 
 #[cfg(test)]

@@ -1,0 +1,355 @@
+[
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 1,
+    "kind": "diagnostic",
+    "label": "init",
+    "fields": [
+      {
+        "state": {
+          "runtime": 0,
+          "frametimeType": "number",
+          "frametime": 0,
+          "frame": 0,
+          "rate": 0,
+          "playing": true
+        },
+        "fps": 59.999996185302734,
+        "frameCount": 1380,
+        "duration": 23
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 2,
+    "kind": "diagnostic",
+    "label": "rate-two",
+    "fields": [
+      {
+        "returnType": "undefined",
+        "state": {
+          "runtime": 0,
+          "frametimeType": "number",
+          "frametime": 0,
+          "frame": 0,
+          "rate": 2,
+          "playing": true
+        }
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 3,
+    "kind": "diagnostic",
+    "label": "seek-zero",
+    "fields": [
+      {
+        "returnType": "undefined",
+        "state": {
+          "runtime": 0,
+          "frametimeType": "number",
+          "frametime": 0,
+          "frame": 0,
+          "rate": 2,
+          "playing": true
+        }
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 4,
+    "kind": "diagnostic",
+    "label": "play",
+    "fields": [
+      {
+        "returnType": "undefined",
+        "state": {
+          "runtime": 0,
+          "frametimeType": "number",
+          "frametime": 0,
+          "frame": 0,
+          "rate": 2,
+          "playing": true
+        }
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 5,
+    "kind": "diagnostic",
+    "label": "update-1",
+    "fields": [
+      {
+        "runtime": 0.00170519994571805,
+        "frametimeType": "number",
+        "frametime": 0.00170519994571805,
+        "frame": 0.2046239823102951,
+        "rate": 2,
+        "playing": true
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 6,
+    "kind": "diagnostic",
+    "label": "update-2",
+    "fields": [
+      {
+        "runtime": 0.1336957961320877,
+        "frametimeType": "number",
+        "frametime": 0.13199059665203094,
+        "frame": 16.043495178222656,
+        "rate": 2,
+        "playing": true
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 7,
+    "kind": "diagnostic",
+    "label": "update-3",
+    "fields": [
+      {
+        "runtime": 0.15728279948234558,
+        "frametimeType": "number",
+        "frametime": 0.023586999624967575,
+        "frame": 18.87393569946289,
+        "rate": 2,
+        "playing": true
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 8,
+    "kind": "diagnostic",
+    "label": "rate-one",
+    "fields": [
+      {
+        "returnType": "undefined",
+        "state": {
+          "runtime": 0.15728279948234558,
+          "frametimeType": "number",
+          "frametime": 0.023586999624967575,
+          "frame": 18.87393569946289,
+          "rate": 1,
+          "playing": true
+        }
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 9,
+    "kind": "diagnostic",
+    "label": "update-4",
+    "fields": [
+      {
+        "runtime": 0.18718869984149933,
+        "frametimeType": "number",
+        "frametime": 0.029905900359153748,
+        "frame": 20.668289184570312,
+        "rate": 1,
+        "playing": true
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 10,
+    "kind": "diagnostic",
+    "label": "update-5",
+    "fields": [
+      {
+        "runtime": 0.2170753926038742,
+        "frametimeType": "number",
+        "frametime": 0.029886700212955475,
+        "frame": 22.461490631103516,
+        "rate": 1,
+        "playing": true
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 11,
+    "kind": "diagnostic",
+    "label": "pause",
+    "fields": [
+      {
+        "returnType": "undefined",
+        "state": {
+          "runtime": 0.2170753926038742,
+          "frametimeType": "number",
+          "frametime": 0.029886700212955475,
+          "frame": 22.461490631103516,
+          "rate": 1,
+          "playing": false
+        }
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 12,
+    "kind": "diagnostic",
+    "label": "update-6",
+    "fields": [
+      {
+        "runtime": 0.24689869582653046,
+        "frametimeType": "number",
+        "frametime": 0.02982329949736595,
+        "frame": 22.461490631103516,
+        "rate": 1,
+        "playing": false
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 13,
+    "kind": "diagnostic",
+    "label": "resume",
+    "fields": [
+      {
+        "returnType": "undefined",
+        "state": {
+          "runtime": 0.24689869582653046,
+          "frametimeType": "number",
+          "frametime": 0.02982329949736595,
+          "frame": 22.461490631103516,
+          "rate": 1,
+          "playing": true
+        }
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 14,
+    "kind": "diagnostic",
+    "label": "update-7",
+    "fields": [
+      {
+        "runtime": 0.277340292930603,
+        "frametimeType": "number",
+        "frametime": 0.03044160082936287,
+        "frame": 24.287988662719727,
+        "rate": 1,
+        "playing": true
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 15,
+    "kind": "diagnostic",
+    "label": "update-8",
+    "fields": [
+      {
+        "runtime": 0.30827629566192627,
+        "frametimeType": "number",
+        "frametime": 0.030936000868678093,
+        "frame": 26.144147872924805,
+        "rate": 1,
+        "playing": true
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 16,
+    "kind": "diagnostic",
+    "label": "final-pause",
+    "fields": [
+      {
+        "returnType": "undefined",
+        "state": {
+          "runtime": 0.30827629566192627,
+          "frametimeType": "number",
+          "frametime": 0.030936000868678093,
+          "frame": 26.144147872924805,
+          "rate": 1,
+          "playing": false
+        }
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 17,
+    "kind": "diagnostic",
+    "label": "seek-held-120",
+    "fields": [
+      {
+        "returnType": "undefined",
+        "state": {
+          "runtime": 0.30827629566192627,
+          "frametimeType": "number",
+          "frametime": 0.030936000868678093,
+          "frame": 119.99999237060547,
+          "rate": 1,
+          "playing": false
+        }
+      }
+    ]
+  },
+  {
+    "probe": "clock-step",
+    "version": 1,
+    "cell": 1,
+    "seq": 18,
+    "kind": "diagnostic",
+    "label": "update-9",
+    "fields": [
+      {
+        "runtime": 0.3383857011795044,
+        "frametimeType": "number",
+        "frametime": 0.030109399929642677,
+        "frame": 119.99999237060547,
+        "rate": 1,
+        "playing": false
+      }
+    ]
+  }
+]

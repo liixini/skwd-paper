@@ -267,3 +267,40 @@ fn vk_shaders_carry_fill_guard() {
     assert!(!SAND_BASE_FRAG_GL.contains("u_fill"));
     assert!(!SAND_GRAIN_FRAG_GL.contains("u_fill"));
 }
+
+#[test]
+fn random_skips_drawing() {
+    assert_eq!(effect_index(DRAWING_SHADER), Some(RANDOM_EFFECT_COUNT));
+}
+
+#[test]
+fn random_stays_classic() {
+    for _ in 0..64 {
+        let name = resolve_shader("random");
+        assert!(
+            SAND_STYLES.contains(&name)
+                || effect_index(name).is_some_and(|index| index < RANDOM_EFFECT_COUNT),
+            "{name}"
+        );
+    }
+    assert_eq!(resolve_shader("slat-turn"), "slat-turn");
+}
+
+#[test]
+fn studio_effects_resolve() {
+    for spec in paper_control::transitions::STUDIO_TRANSITIONS {
+        let index = effect_index(spec.id).expect("studio effect");
+        assert!(index > RANDOM_EFFECT_COUNT);
+        let needs_environment = matches!(spec.id, "slat-turn" | "sunlit-arcade");
+        assert_eq!(effect_requires_environment(index), needs_environment, "{}", spec.id);
+        let vk = effect_frag_vk(EFFECTS[index].1);
+        assert_eq!(vk.contains("set = 2"), needs_environment, "{}", spec.id);
+        assert!(!vk.contains("u_tex_old") && !vk.contains("u_tex_new"), "{}", spec.id);
+    }
+}
+
+#[test]
+fn environment_bytes() {
+    let [width, height] = STUDIO_ENVIRONMENT_SIZE;
+    assert_eq!(STUDIO_ENVIRONMENT_RGBA.len(), width as usize * height as usize * 4);
+}

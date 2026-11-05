@@ -191,13 +191,17 @@ pub fn plan_targets_with(
         }
 
         // An unresolved name leaves the renderer's existing descriptor input in place.
-        let mut target_reads = BTreeMap::from([(0usize, source)]);
+        let mut target_reads = BTreeMap::from([(0usize, previous)]);
         for (slot, binding) in pass_binds {
             let bound = match binding {
                 EffectBind::Previous => Some(previous),
                 EffectBind::Named(name) => fbo_target(fbo_names, fbo_owners, *owner, &remap, name),
                 EffectBind::LayerComposite { .. }
                 | EffectBind::SceneSoFar
+                | EffectBind::SceneHistory
+                | EffectBind::Reflection
+                | EffectBind::ShadowAtlas
+                | EffectBind::LightCookie
                 | EffectBind::SceneUnderLayer => None,
             };
             if let Some(bound) = bound {
@@ -215,7 +219,7 @@ pub fn plan_targets_with(
             named
         } else {
             let candidate = if flip { Target::Ping } else { Target::Pong };
-            if reads.contains(&candidate) {
+            if candidate == previous || reads.contains(&candidate) {
                 flip = !flip;
                 if flip { Target::Ping } else { Target::Pong }
             } else {

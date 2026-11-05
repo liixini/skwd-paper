@@ -1,10 +1,10 @@
 #![cfg(test)]
 
 use super::{
-    AnyDecoder, CONSECUTIVE_PACKET_ERROR_LIMIT, FOURCC_GR88, FOURCC_NV12, FOURCC_R8, VaapiDecoder,
-    container_wrap_is_fatal, decoder_requires_software, descriptor_planes, open_decoder,
-    open_vulkan_decoder, packet_error_is_fatal, pump_decode, resolved_thread_count, retain_frame,
-    source_requires_software, vaapi_device,
+    AnyDecoder, CONSECUTIVE_PACKET_ERROR_LIMIT, FOURCC_GR88, FOURCC_NV12, FOURCC_R8,
+    HardwareDecode, VaapiDecoder, container_wrap_is_fatal, decoder_requires_software,
+    descriptor_planes, open_decoder, open_vulkan_decoder, packet_error_is_fatal, pump_decode,
+    resolved_thread_count, retain_frame, source_requires_software, vaapi_device,
 };
 use ffmpeg_the_third as ff;
 use std::path::{Path, PathBuf};
@@ -39,7 +39,7 @@ fn ivf_sample(directory: &Path, frames: &[&[u8]]) -> PathBuf {
     path
 }
 
-fn still_named_as_video(directory: &Path) -> PathBuf {
+pub(crate) fn still_named_as_video(directory: &Path) -> PathBuf {
     let mut encoded = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image::RgbaImage::new(4, 4))
         .write_to(&mut encoded, image::ImageFormat::Png)
@@ -63,25 +63,28 @@ fn png_decoder_linked() {
     assert!(ff::codec::decoder::find(ff::codec::Id::PNG).is_some());
 }
 
+pub(crate) fn animated_gif(directory: &Path) -> PathBuf {
+    let path = directory.join("animated.gif");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut encoder = image::codecs::gif::GifEncoder::new(file);
+    encoder.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
+    for color in [[220, 25, 25, 255], [20, 30, 220, 255]] {
+        encoder
+            .encode_frame(image::Frame::from_parts(
+                image::RgbaImage::from_pixel(4, 4, image::Rgba(color)),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(350, 1),
+            ))
+            .unwrap();
+    }
+    path
+}
+
 #[test]
 fn animated_gif_loops_all_frames() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("animated.gif");
-    {
-        let file = std::fs::File::create(&path).unwrap();
-        let mut encoder = image::codecs::gif::GifEncoder::new(file);
-        encoder.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
-        for color in [[220, 25, 25, 255], [20, 30, 220, 255]] {
-            encoder
-                .encode_frame(image::Frame::from_parts(
-                    image::RgbaImage::from_pixel(4, 4, image::Rgba(color)),
-                    0,
-                    0,
-                    image::Delay::from_numer_denom_ms(350, 1),
-                ))
-                .unwrap();
-        }
-    }
+    let path = animated_gif(directory.path());
     let mut decoder = super::SwDecoder::open(path.to_str().unwrap()).unwrap();
     assert!(!decoder.still);
     let frames: Vec<_> = (0..6)
@@ -154,7 +157,7 @@ fn cascade_falls_back_software() {
     let _serialized = vaapi_device_tests();
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = ivf_sample(directory.path(), &[VP8_KEYFRAME_TAG]);
-    let decoder = open_decoder(path.to_str().expect("sample path"), None, true, None, false)
+    let decoder = open_decoder(&HardwareDecode::local(path.to_str().expect("sample path")), false)
         .expect("cascade must still produce a decoder for a codec Vulkan rejects");
     assert!(matches!(decoder, AnyDecoder::Sw(_)));
 }
@@ -180,8 +183,8 @@ fn still_detection_in_decoder() {
     let path = still_named_as_video(directory.path());
     let path = path.to_str().expect("sample path");
     assert!(!decoder_requires_software(path, false));
-    let decoder =
-        open_decoder(path, None, true, None, false).expect("a still container must still decode");
+    let decoder = open_decoder(&HardwareDecode::local(path), false)
+        .expect("a still container must still decode");
     assert!(matches!(decoder, AnyDecoder::Sw(_)));
     assert!(decoder.still());
 }
@@ -311,4 +314,51 @@ fn drm_rejects_bad_layers() {
     descriptor.layers[0].format = FOURCC_NV12;
     descriptor.layers[0].planes[1].object_index = 1;
     assert!(descriptor_planes(&descriptor).is_err());
+}
+
+#[test]
+fn denied_vulkan_uses_descriptor() {
+    use std::os::fd::AsRawFd;
+    let _serialized = vaapi_device_tests();
+    let scratch = std::env::var_os("TMPDIR").expect("disk scratch required");
+    let directory = tempfile::tempdir_in(scratch).unwrap();
+    let path = still_named_as_video(directory.path());
+    let source = std::fs::File::open(&path).unwrap();
+    let descriptor = format!("/proc/self/fd/{}", source.as_raw_fd());
+    assert!(!source_requires_software(path.to_str().unwrap()));
+    assert!(source_requires_software(&descriptor));
+    let mut decoder = super::open_hardware(&super::HardwareDecode {
+        path: &descriptor,
+        logical: "absent-logical-video.mp4",
+        hwdev: None,
+        vulkan_decode: false,
+        render_node: None,
+    })
+    .unwrap();
+    assert!(matches!(decoder, AnyDecoder::Sw(_)));
+    let (frame, _) = decoder.next().unwrap();
+    assert_eq!((frame.width(), frame.height()), (4, 4));
+}
+
+#[test]
+fn clip_url_bounds() {
+    let clip = super::Clip { offset: 5, length: 7 };
+    assert_eq!(clip.url("/proc/self/fd/3"), "subfile,,start,5,end,12,,:/proc/self/fd/3");
+}
+
+#[test]
+fn clipped_source_decodes() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let directory = tempfile::tempdir().unwrap();
+    let still = std::fs::read(still_named_as_video(directory.path())).unwrap();
+    let junk = [0xa5_u8; 37];
+    let mut file = tempfile::tempfile().unwrap();
+    for part in [&junk[..], &still, &junk] {
+        file.write_all(part).unwrap();
+    }
+    let clip = super::Clip { offset: junk.len() as u64, length: still.len() as u64 };
+    let url = clip.url(&format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let (frame, _) = super::SwDecoder::open(&url).unwrap().next_raw().unwrap();
+    assert_eq!((frame.width(), frame.height()), (4, 4));
 }

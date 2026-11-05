@@ -19,13 +19,34 @@ fn voice(clip: &str) -> Voice {
 #[test]
 fn muted_scene_no_mixer() {
     let clips = vec![voice("/nonexistent/skwd-test-clip.mp3")];
-    assert!(!GatedScene::new(clips.clone(), true, 80).pipeline_running());
-    assert!(!GatedScene::new(clips, false, 0).pipeline_running());
+    assert!(
+        !GatedScene::new(
+            clips.clone(),
+            SceneConfig { mute: true, volume: 80, wake: None, tap: None }
+        )
+        .pipeline_running()
+    );
+    assert!(
+        !GatedScene::new(clips, SceneConfig { mute: false, volume: 0, wake: None, tap: None })
+            .pipeline_running()
+    );
+}
+
+#[test]
+fn unavailable_voice_reports_stopped() {
+    let gated = GatedScene::new(
+        vec![voice("/nonexistent/skwd-test-clip.mp3")],
+        SceneConfig { mute: false, volume: 80, wake: None, tap: None },
+    );
+    assert!(!gated.pipeline_running());
+    assert!(!gated.voice_playing("1"));
+    assert_eq!(gated.voice_states(), [("1".to_owned(), false)]);
 }
 
 #[test]
 fn empty_scene_inert() {
-    let mut gated = GatedScene::new(Vec::new(), false, 80);
+    let mut gated =
+        GatedScene::new(Vec::new(), SceneConfig { mute: false, volume: 80, wake: None, tap: None });
     assert!(!gated.pipeline_running());
     assert_eq!(gated.voice_count(), 0);
     gated.set_mute(false);
@@ -37,9 +58,12 @@ fn empty_scene_inert() {
 
 #[test]
 fn swap_drops_mixer() {
-    let mut gated = GatedScene::new(vec![voice("/nonexistent/skwd-test-clip.mp3")], false, 80);
+    let mut gated = GatedScene::new(
+        vec![voice("/nonexistent/skwd-test-clip.mp3")],
+        SceneConfig { mute: false, volume: 80, wake: None, tap: None },
+    );
     assert!(!gated.pipeline_running());
-    gated.swap(Vec::new(), false, 80);
+    gated.swap(Vec::new(), SceneConfig { volume: 80, ..SceneConfig::default() });
     assert!(!gated.pipeline_running());
     assert_eq!(gated.voice_count(), 0);
 }
@@ -48,7 +72,10 @@ fn swap_drops_mixer() {
 fn voice_operations_track_intent_without_a_mixer() {
     let mut silent = voice("/nonexistent/skwd-test-clip.mp3");
     silent.autostart = false;
-    let mut gated = GatedScene::new(vec![silent], true, 80);
+    let mut gated = GatedScene::new(
+        vec![silent],
+        SceneConfig { mute: true, volume: 80, wake: None, tap: None },
+    );
     assert!(!gated.pipeline_running());
     assert!(!gated.voice_playing("1"));
     assert!(gated.voice("1", VoiceOp::Play));
@@ -61,11 +88,32 @@ fn voice_operations_track_intent_without_a_mixer() {
 
 #[test]
 fn duck_survives_voice_swap() {
-    let mut gated = GatedScene::new(vec![voice("/nonexistent/skwd-test-clip.mp3")], false, 80);
+    let mut gated = GatedScene::new(
+        vec![voice("/nonexistent/skwd-test-clip.mp3")],
+        SceneConfig { mute: false, volume: 80, wake: None, tap: None },
+    );
     gated.set_duck(true);
-    gated.swap(vec![voice("/nonexistent/skwd-test-other.mp3")], false, 100);
+    gated.swap(vec![voice("/nonexistent/skwd-test-other.mp3")], SceneConfig::default());
     assert!(gated.ducked());
     assert!(!gated.pipeline_running());
     gated.set_duck(false);
     assert!(!gated.ducked());
+}
+
+#[test]
+fn paused_scene_stays_inert() {
+    let mut gated = GatedScene::new(
+        vec![voice("/nonexistent/paused.wav")],
+        SceneConfig { mute: true, volume: 80, wake: None, tap: None },
+    );
+    gated.set_pause(true);
+    gated.set_mute(false);
+    gated.set_volume(42);
+    assert!(!gated.pipeline_running());
+    assert!(!gated.mute);
+    assert_eq!(gated.volume, 42);
+    gated.set_duck(true);
+    gated.set_pause(false);
+    assert!(!gated.pipeline_running());
+    assert!(gated.ducked());
 }

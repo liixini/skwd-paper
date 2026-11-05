@@ -1,9 +1,11 @@
 use crate::pkg::Package;
 use crate::tex;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const MAX_WALKED_REFS: usize = 4096;
+const MAX_TEXTURE_GAPS: usize = 64;
 
 #[derive(Debug, Default)]
 pub struct SceneFeatures {
@@ -32,9 +34,17 @@ pub struct SceneFeatures {
     pub tex_video: usize,
     pub tex_other_format: BTreeSet<String>,
     pub tex_failures: usize,
+    pub texture_gaps: Vec<TextureGap>,
+    pub texture_gaps_omitted: usize,
     pub json_failures: usize,
     pub refs_truncated: bool,
     pub sample_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TextureGap {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +56,14 @@ pub struct OtherObject {
 }
 
 impl SceneFeatures {
+    fn texture_gap(&mut self, path: &str, reason: String) {
+        if self.texture_gaps.len() == MAX_TEXTURE_GAPS {
+            self.texture_gaps_omitted += 1;
+        } else {
+            self.texture_gaps.push(TextureGap { path: path.to_owned(), reason });
+        }
+    }
+
     pub fn tier(&self) -> u8 {
         if self.puppet {
             return 3;
@@ -84,7 +102,8 @@ fn other_object(value: &Value) -> OtherObject {
         .filter(|kind| !kind.is_empty())
         .map(|kind| format!("type:{kind}"))
         .or_else(|| value.get("camera").is_some().then(|| "camera".into()))
-        .or_else(|| value.get("shape").is_some().then(|| "shape".into()))
+        .or_else(|| crate::model::shape::is_quad(value).then(|| crate::model::shape::KIND.into()))
+        .or_else(|| value.get(crate::model::shape::FIELD).is_some().then(|| "shape".into()))
         .or_else(|| value.get("attachment").is_some().then(|| "attachment".into()))
         .unwrap_or_else(|| "transform".into());
     OtherObject {
@@ -159,7 +178,7 @@ impl Walk<'_> {
         };
         if let Some(puppet) = model.get("puppet").and_then(Value::as_str) {
             out.puppet = true;
-            out.puppet_unsupported =
+            out.puppet_unsupported |=
                 self.pkg.find(puppet).is_none_or(|bytes| crate::puppet::parse(bytes).is_err());
         }
         if let Some(material) = model.get("material").and_then(Value::as_str) {
@@ -259,7 +278,9 @@ pub fn extract(pkg: &Package) -> Result<SceneFeatures, String> {
                 out.objects_text += 1;
             } else {
                 let other = other_object(object);
-                out.objects_other += usize::from(other.kind != "transform");
+                out.objects_other += usize::from(
+                    other.kind != "transform" && other.kind != crate::model::shape::KIND,
+                );
                 out.other_objects.push(other);
             }
             if let Some(effects) = object.get("effects").and_then(Value::as_array) {
@@ -289,8 +310,14 @@ pub fn extract(pkg: &Package) -> Result<SceneFeatures, String> {
         match tex::parse_meta(pkg.read(entry)) {
             Ok(meta) => {
                 *out.tex_formats.entry(meta.format.name()).or_insert(0) += 1;
-                if let tex::TexFormat::Other(_) = meta.format {
+                if let tex::TexFormat::Other(_) = meta.format
+                    && meta.free_image_format.is_none_or(|format| format < 0)
+                {
                     out.tex_other_format.insert(meta.format.name());
+                    out.texture_gap(
+                        &entry.path,
+                        format!("unmapped texture format {}", meta.format.name()),
+                    );
                 }
                 if meta.flags & tex::FLAG_IS_GIF != 0 {
                     out.tex_gif += 1;
@@ -301,6 +328,7 @@ pub fn extract(pkg: &Package) -> Result<SceneFeatures, String> {
             }
             Err(err) => {
                 out.tex_failures += 1;
+                out.texture_gap(&entry.path, format!("{err:#}"));
                 if out.sample_error.is_none() {
                     out.sample_error = Some(format!("{}: {err:#}", entry.path));
                 }

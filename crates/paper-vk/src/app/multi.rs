@@ -74,6 +74,15 @@ fn group_entries(entries: &[MultiVideoEntry], mode: FillMode) -> Vec<Group> {
 }
 
 fn routed_to(outputs: &[String], command: &PaperCommand) -> bool {
+    if let Some(snapshot) = &command.snapshot {
+        return outputs.contains(&snapshot.output);
+    }
+    if matches!(
+        paper_control::classify_command(command.clone()),
+        paper_control::CommandClass::RetainOutputs(_)
+    ) {
+        return true;
+    }
     command
         .outputs
         .as_ref()
@@ -116,6 +125,11 @@ pub(super) fn run_multi(
         paper_control::spawn_stdin_line_reader("skwd-wall-vk", move |line| {
             match serde_json::from_str::<PaperCommand>(line) {
                 Ok(cmd) => {
+                    if let paper_control::CommandClass::RetainOutputs(outputs) =
+                        paper_control::classify_command(cmd.clone())
+                    {
+                        wayland::Target::retain_reexec_outputs(&outputs);
+                    }
                     for (outputs, tx, wake_pipe) in &fanout {
                         if !routed_to(outputs, &cmd) {
                             continue;

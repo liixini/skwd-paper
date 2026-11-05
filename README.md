@@ -43,6 +43,11 @@ Repository for the wayland wallpaper daemon Skwd-paper, which can be used comple
 | --- | --- |
 | Fade (default) | `--effect fade` |
 | Random | `--effect random` |
+| Photo cutout | `--effect photo-cutout` |
+| Spinning photo slats | `--effect slat-turn` |
+| Moving crop relay | `--effect crop-relay` |
+| Theme-coloured arcade | `--effect sunlit-arcade` |
+| Framed paper heart | `--effect paper-heart` |
 | Pixelate | `--effect pixelate` |
 | Iris | `--effect iris` |
 | Glitch | `--effect glitch` |
@@ -90,7 +95,11 @@ Repository for the wayland wallpaper daemon Skwd-paper, which can be used comple
 | Fade from the current wallpaper | `--transition` |
 | Choose a transition | `--effect sand-mobius` |
 | Choose the starting image or video | `--transition-from previous.jpg` |
-| Duration: 50-10000 ms; default 600 ms | `--duration-ms 800` |
+| Override duration: 50-10000 ms | `--duration-ms 800` |
+
+Photo cutout and slats last 3.4 seconds, crop relay 3 seconds, arcade 3.1 seconds, and paper heart 3.9 seconds. Other effects default to 600 ms. `skwd-paper transitions` lists the selected presets and their durations as JSON.
+
+The arcade reads the current Skwd palette when the transition starts. Standalone use falls back to a saved palette; `SKWD_PAPER_PALETTE` can point to another `colors.json` file with `surface`, `surfaceVariant`, `primaryContainer` and `secondaryContainer` colours.
 
 ## Fill modes
 
@@ -111,14 +120,12 @@ Repository for the wayland wallpaper daemon Skwd-paper, which can be used comple
 | Static image | `--kind static` | Images; display GIFs as a still image |
 | Video | `--kind video` | Local videos and animated GIFs |
 | Wallpaper Engine | `--kind we` | Supported scene or video projects |
-| Default video engine | `--engine default` | Normal video playback, audio and transitions |
-| Tinier video engine | `--engine tinier --frame-rate 30000/1001` | AV1 IVF; explicit monitor names, background layer, fill mode only; no audio or transitions |
 
 ## Layers
 
 | Layer | Option | Placement |
 | --- | --- | --- |
-| Background (default) | `--layer background` | Behind desktop windows; required for static images and Tinier |
+| Background (default) | `--layer background` | Behind desktop windows; required for static images |
 | Bottom | `--layer bottom` | Above the background layer, below normal windows; video and scenes |
 | Top | `--layer top` | Above normal windows; video and scenes |
 | Overlay | `--layer overlay` | Above top-layer surfaces; video and scenes |
@@ -140,7 +147,7 @@ The direct `skwd-wall-vk` compatibility command defaults to `bottom`. Elevated v
 | JSON manifest inline; maximum 1 MiB | `--manifest '{"assignments":[{"outputs":["DP-1"],"source":{"kind":"static","path":"image.jpg"}}]}'` |
 
 
-A manifest can set `policy.surface` to `{"namespace":"skwd-paper-backdrop","blur":12,"dim":20}` for a separate overview surface. Blur and dimming range from 0 to 100 and work with images, default-engine videos, and native Wallpaper Engine scenes. Surface policies keep video players resident when paused so playback resumes from the same position. They do not support transitions or the tinier engine. Set `replace_all` when changing the policy.
+A manifest can set `policy.surface` to `{"namespace":"skwd-paper-backdrop","blur":12,"dim":20}` for a separate overview surface. Blur and dimming range from 0 to 100 and work with images, videos, and native Wallpaper Engine scenes. Surface policies keep video players resident when paused so playback resumes from the same position. They do not support transitions. Set `replace_all` when changing the policy.
 
 Use a separate `SKWD_PAPER_V2_SOCKET` for an independently controlled backdrop. Apply, pause, resume, and stop then affect only that instance.
 

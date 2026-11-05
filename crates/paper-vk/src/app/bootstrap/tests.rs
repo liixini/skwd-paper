@@ -1,6 +1,6 @@
-use super::{
-    control_stdin_enabled, parse_idle_secs, renderer_path, stream_targets, transition_hold_enabled,
-};
+use super::{control_stdin_enabled, parse_idle_secs, renderer_path, transition_hold_enabled};
+#[cfg(feature = "shared-device")]
+use super::{preview_drawing, stream_targets};
 
 #[test]
 fn standalone_mode_is_opt_in_and_disables_only_control_stdin() {
@@ -55,6 +55,7 @@ fn retired_cpu_path_uses_the_vulkan_default() {
     assert_eq!(renderer_path(Some("cpu"), false, false), "dmabuf-present");
 }
 
+#[cfg(feature = "shared-device")]
 #[test]
 fn stream_targets_pair_repeated_flags_by_position() {
     let args: Vec<String> = [
@@ -103,4 +104,16 @@ fn stream_targets_pair_repeated_flags_by_position() {
     assert!(single[0].paused);
     assert!(single[0].output.is_empty());
     assert!(stream_targets(&legacy[2..], false).is_empty());
+}
+
+#[cfg(feature = "shared-device")]
+#[test]
+fn preview_drawing_needs_shader() {
+    let drawing = r#"{"artifact":"/cache/drawing/manifest.json","ink":"rainbow"}"#;
+    assert!(preview_drawing("crossfade", Some("not json".into())).unwrap().is_none());
+    assert!(preview_drawing("crossfade", Some(drawing.into())).unwrap().is_none());
+    assert!(preview_drawing("drawing", Some("not json".into())).is_err());
+    assert!(preview_drawing("drawing", None).unwrap().is_none());
+    let parsed = preview_drawing("drawing", Some(drawing.into())).unwrap().unwrap();
+    assert_eq!(parsed.ink, paper_control::DrawingInk::Rainbow);
 }

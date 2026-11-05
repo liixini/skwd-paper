@@ -43,6 +43,24 @@ fn font(family: &str, full: &str) -> Vec<u8> {
 }
 
 #[test]
+fn fallback_cache_uses_prefix() {
+    let fixture = fixture();
+    let arial = font("Arial", "Arial");
+    let malgun = font("Malgun Gothic", "Malgun Gothic");
+    let other = font("Noto Sans Arabic", "Noto Sans Arabic");
+    for (name, bytes) in [("arial.ttf", &arial), ("malgun.ttf", &malgun), ("other.ttf", &other)] {
+        std::fs::write(fixture.fonts.join(name), bytes).unwrap();
+    }
+    let mut cache = Cache::default();
+    let first = cache.fallbacks(&fixture.assets);
+    assert_eq!(first.iter().map(AsRef::as_ref).collect::<Vec<_>>(), [&arial[..], &malgun[..]]);
+    std::fs::remove_file(fixture.fonts.join("arial.ttf")).unwrap();
+    let second = cache.fallbacks(&fixture.assets);
+    assert!(Arc::ptr_eq(&first[0], &second[0]));
+    assert!(Arc::ptr_eq(&first[1], &second[1]));
+}
+
+#[test]
 fn exact_prefix_family_and_full_name_keep_the_selected_font() {
     let fixture = fixture();
     let requested = font("Skwd Fixture", "Skwd Fixture Regular");

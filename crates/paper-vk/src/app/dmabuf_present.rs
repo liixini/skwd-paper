@@ -832,6 +832,9 @@ pub(super) fn run_nv12(
     mute: bool,
     volume: u32,
 ) -> Result<()> {
+    if target.hidden {
+        return run_shared_dmabuf(target, video, mute, volume, None);
+    }
     let force_linear = std::env::var("SKWD_VK_NV12_LINEAR").as_deref() == Ok("1");
     let modifiers = if force_linear {
         Vec::new()
@@ -868,10 +871,7 @@ pub(super) fn run_nv12(
     let mut next_base = DIRECT_NV12_BUFFER_BASE;
     'source: loop {
         let decoder = decode::open_decoder(
-            &path,
-            Some(sd.hwdev),
-            sd.video_decode,
-            sd.render_node.as_deref(),
+            &decode::HardwareDecode::shared(&sd, &path),
             force_software_decode,
         )?;
         if matches!(decoder, decode::AnyDecoder::Sw(_)) {
@@ -995,7 +995,7 @@ pub(super) fn run_nv12(
                 target.dispatch_wait_events(Instant::now() + std::time::Duration::from_secs(30))?;
                 continue;
             }
-            if ctl.paused && !ctl.freeze_pending() {
+            if source_presented && ctl.paused && !ctl.freeze_pending() {
                 target.dispatch_wait_events(Instant::now() + std::time::Duration::from_secs(30))?;
                 continue;
             }
@@ -1380,12 +1380,16 @@ fn run_shared_dmabuf_with_readiness(
         && pattern.is_none()
     {
         let req = ctl::SwapReq {
+            drawing: std::env::var(paper_control::DRAWING_ENV)
+                .ok()
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
             to: video.to_string(),
             duration_ms: sf.duration_ms,
             shader: sf.shader,
             properties: None,
         };
-        fade = start_swap(&req, sd, force_software_decode, &distinct, &dims, &mut ctl);
+        fade = start_swap(&req, sd, force_software_decode, &distinct, &dims);
         if fade.is_none() {
             tracing::info!("skwd-wall-vk: startup transition failed, keeping from-source");
         }
@@ -1404,6 +1408,8 @@ fn run_shared_dmabuf_with_readiness(
         None => None,
     };
     if let Some(fade) = &mut fade {
+        super::drawing::prepare(&mut renderers[0], fade)?;
+        ctl.swap_audio(&fade.path, !fade.still_b);
         prepare_transition_pipelines(
             &mut renderers,
             fade,
@@ -1448,6 +1454,8 @@ fn run_shared_dmabuf_with_readiness(
     let mut presenting_nv12 = false;
     let mut hybrid_rebuild_failed = None;
     let mut hybrid_copy_failed = false;
+    let mut last_presented_mix = None;
+    let mut repaint = false;
     let mut last_presented: Option<ffmpeg_the_third::frame::Video> = None;
     loop {
         if target.app.closed {
@@ -1465,13 +1473,19 @@ fn run_shared_dmabuf_with_readiness(
             tracing::info!("skwd-wall-vk: steady NV12 active, released XR24 transition ring");
         }
         let was_paused = ctl.paused;
+        let frozen_at = ctl.frozen_at;
         if let Some(req) = ctl.poll()
             && pattern.is_none()
         {
             if let Some(active) = fade.take() {
                 tracing::info!("skwd-wall-vk: canceling active swap before replacement");
+                let drawing_effect = active.drawing.as_ref().and(active.effect);
                 active.cancel();
                 for rend in &mut renderers {
+                    if let Some(effect) = drawing_effect {
+                        rend.retire_effect(effect)?;
+                    }
+                    rend.clear_transition()?;
                     let _ = rend.retire_plane_views();
                 }
                 if let Some(slot) = sw_b.take() {
@@ -1499,8 +1513,129 @@ fn run_shared_dmabuf_with_readiness(
                 &dims,
             ));
         }
-        crate::freeze::write_last_requested(&mut ctl, last_presented.as_ref())?;
-        if let Some(state) = poll_pending_swap(&mut pending_swap, &distinct, &mut ctl) {
+        let photo_changed = if let Some(path) = ctl.drawing_photo.take()
+            && fade.as_ref().is_some_and(|active| active.drawing.is_some())
+            && let Some(photo) = fade_rgba_b.as_mut()
+        {
+            match super::drawing::replace_photo(
+                &mut renderers[0],
+                photo,
+                std::path::Path::new(&path),
+                &distinct,
+            ) {
+                Ok(()) => {
+                    fade.as_mut().unwrap().path.clone_from(&path);
+                    active_source = path;
+                    true
+                }
+                Err(error) => {
+                    crate::freeze::fail_requested(&mut ctl, &error);
+                    tracing::warn!(%error, "drawing photo update failed");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if let Some(outputs) = ctl.retained_outputs.take() {
+            target.retain_outputs(&outputs)?;
+            if target.app.closed {
+                return Ok(());
+            }
+        }
+        if overlay && ctl.paused && ctl.frozen_at.is_none() {
+            ctl.frozen_at = Some(Instant::now());
+        }
+        if std::mem::take(&mut ctl.reveal) && target.reveal_prepared()? {
+            on_ready();
+        }
+        resume_fade(&mut fade, frozen_at, &ctl);
+        if ctl.snapshot_output().is_some() {
+            let mut slot = None;
+            let captured = (|| -> Result<()> {
+                let si = target
+                    .app
+                    .surfaces
+                    .iter()
+                    .position(|surface| ctl.snapshots_surface(&surface.name) && !surface.closed)
+                    .context("snapshot output unavailable")?;
+                let surface = &target.app.surfaces[si];
+                let renderer = &mut renderers[ridx[si]];
+                let frame = last_presented.as_ref().context("snapshot before presentation")?;
+                let size =
+                    if presenting_nv12 { (frame.width(), frame.height()) } else { render_dims[si] };
+                let frame = decode::RenderFrame::plain(decode::retain_frame(frame)?);
+                if needs_frame_slot(&frame) {
+                    ensure_frame_slot(&mut slot, renderer, &frame, 0.0)?;
+                }
+                let mut export = renderer.create_export_image_opts(size.0, size.1, false)?;
+                let render_target = renderer.create_render_target(size.0, size.1)?;
+                let uv = if presenting_nv12 { [1.0, 1.0, 0.0, 0.0] } else { uvs[ridx[si]] };
+                render_video(
+                    renderer,
+                    &render_target,
+                    &mut export,
+                    &frame,
+                    uv,
+                    (!presenting_nv12).then_some(fade.as_ref()).flatten(),
+                    last_presented_mix,
+                    ridx[si],
+                    slot.as_ref(),
+                    sw_b.as_ref(),
+                    fade_rgba_a.as_ref().or(steady_rgba.as_ref()),
+                    fade_rgba_b.as_ref(),
+                )?;
+                let pixels = read_rgba_export(renderer, &export, size)?;
+                crate::freeze::write_view_requested(
+                    &mut ctl,
+                    pixels,
+                    target.size_at(si),
+                    surface.source,
+                )?;
+                Ok(())
+            })();
+            finish_snapshot(&mut ctl, &mut slot, &renderers[0], captured);
+        } else if ctl.freeze_pending()
+            && fade.as_ref().is_some_and(|active| active.drawing.is_some())
+            && let (Some(frame), Some(progress)) = (&last_presented, last_presented_mix)
+        {
+            let captured = (|| -> Result<()> {
+                let (width, height) = render_dims[0];
+                let renderer = &mut renderers[0];
+                let mut export = renderer.create_export_image_opts(width, height, false)?;
+                let target = renderer.create_render_target(width, height)?;
+                let frame = decode::RenderFrame::plain(decode::retain_frame(frame)?);
+                render_video(
+                    renderer,
+                    &target,
+                    &mut export,
+                    &frame,
+                    uvs[0],
+                    fade.as_ref(),
+                    Some(progress),
+                    0,
+                    sw_a.as_ref(),
+                    sw_b.as_ref(),
+                    fade_rgba_a.as_ref(),
+                    fade_rgba_b.as_ref(),
+                )?;
+                let pixels = read_rgba_export(renderer, &export, (width, height))?;
+                crate::freeze::write_rgba_requested(&mut ctl, width, height, pixels.as_raw())?;
+                Ok(())
+            })();
+            if let Err(error) = captured {
+                crate::freeze::fail_requested(&mut ctl, &error);
+            }
+        } else {
+            crate::freeze::write_last_requested(&mut ctl, last_presented.as_ref())?;
+        }
+        if let Some(mut state) = poll_pending_swap(&mut pending_swap, &distinct) {
+            if let Err(error) = super::drawing::prepare(&mut renderers[0], &mut state) {
+                tracing::warn!(path = %state.path, %error, "drawing swap rejected");
+                state.cancel();
+                continue;
+            }
+            ctl.swap_audio(&state.path, !state.still_b);
             active_source.clone_from(&state.path);
             fade_rgba_a = steady_rgba.take();
             fade_rgba_b = upload_rgba_still(&mut renderers[0], &state.cur.0, &distinct)?;
@@ -1529,7 +1664,8 @@ fn run_shared_dmabuf_with_readiness(
             )?;
             xr_ready = true;
         }
-        let surface_changed = ctl.take_surface_change();
+        repaint |= ctl.take_surface_change() || photo_changed;
+        let surface_changed = repaint;
         if !surface_changed
             && target.app.idle
             && fade.is_none()
@@ -1553,7 +1689,8 @@ fn run_shared_dmabuf_with_readiness(
             wall_anchor = None;
             scheduled_q.clear();
         }
-        if !surface_changed
+        if last_presented.is_some()
+            && !surface_changed
             && ctl.render_paused(fade.is_some() || pending_swap.is_some())
             && !ctl.freeze_pending()
         {
@@ -1632,7 +1769,8 @@ fn run_shared_dmabuf_with_readiness(
             old_pace = None;
             queued_old = None;
         }
-        let fade_mix = fade.as_mut().map(FadeState::progress);
+        let frozen_mix = ctl.frozen_at.map(|_| last_presented_mix.unwrap_or(0.0));
+        let fade_mix = fade.as_mut().map(|active| active.progress(frozen_mix));
 
         if !fading && !still && frames > 0 {
             let (frame, pts) = pending.as_ref().map(|(nf, np)| (nf, *np)).unwrap();
@@ -1956,6 +2094,7 @@ fn run_shared_dmabuf_with_readiness(
         let ready = readiness.complete_after_presentation(
             committed,
             || match startup_readiness {
+                _ if target.hidden => Ok(()),
                 StartupReadiness::Presented => {
                     confirm_presentation(target, &presentation_checkpoint, "rendered frame")
                 }
@@ -1964,18 +2103,29 @@ fn run_shared_dmabuf_with_readiness(
             on_ready,
         )?;
         if committed {
+            if frames == 0 && ctl.paused {
+                ctl.frozen_at = Some(Instant::now());
+            }
+            repaint = false;
+            last_presented_mix = fade_mix;
             last_presented = Some(decode::retain_frame(frame.video())?);
         }
-        if ready && transition_held {
+        if ready && target.hidden {
             ctl.set_paused(true);
-            while ctl.paused && !target.app.closed {
-                target.dispatch_wait_events(Instant::now() + std::time::Duration::from_secs(30))?;
-                let _ = ctl.poll();
-            }
+        }
+        if ready && transition_held {
+            hold_transition(&mut ctl, &mut fade, || {
+                if !target.app.closed {
+                    target.dispatch_wait_events(
+                        Instant::now() + std::time::Duration::from_secs(30),
+                    )?;
+                }
+                Ok(target.app.closed)
+            })?;
             transition_held = false;
         }
         if committed && fade_mix.is_some() {
-            fade.as_mut().unwrap().note_committed();
+            fade.as_mut().unwrap().note_committed(ctl.frozen_at.unwrap_or_else(Instant::now));
         }
         if should_release_source_frame(still, fading) {
             pending = None;
@@ -2002,6 +2152,9 @@ fn run_shared_dmabuf_with_readiness(
             &mut still,
         );
         if finishing_fade {
+            for renderer in &mut renderers {
+                renderer.clear_transition()?;
+            }
             if let Some(source) = fade_rgba_a.take() {
                 renderers[0].destroy_scene_texture(source.texture);
             }

@@ -101,6 +101,8 @@ fn span_retains_output_layout() {
 fn lost_transition_source_promotes_the_ready_target() {
     let (_tx, rx) = std::sync::mpsc::sync_channel(1);
     let mut fade = Some(FadeState {
+        drawing: None,
+        drawing_texture: None,
         rx,
         abort: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         worker: None,
@@ -123,4 +125,43 @@ fn lost_transition_source_promotes_the_ready_target() {
     assert_eq!(pending.as_ref().map(|(_, pts)| *pts), Some(1.25));
     assert_eq!(fade.as_ref().map(|state| state.dur_ms), Some(0));
     assert_eq!(fade.as_ref().map(|state| state.first_frame), Some(false));
+}
+
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn snapshot_error_releases_upload() {
+    let shared = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let renderer = crate::shared::renderer(&shared, 64, 64).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    for paused in [false, true] {
+        let path = directory.path().join(format!("frame-{paused}.ppm"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut ctl = crate::ctl::Ctl::from_channel(rx, None, "", true, 80, false);
+        ctl.set_paused(paused);
+        tx.send(paper_control::PaperCommand::snapshot(path.to_str().unwrap(), "DP-1")).unwrap();
+        assert!(ctl.poll().is_none());
+        let frame = crate::decode::RenderFrame::plain(ffmpeg_the_third::frame::Video::new(
+            ffmpeg_the_third::format::Pixel::NV12,
+            64,
+            64,
+        ));
+        let mut slot = None;
+        let captured = (|| -> anyhow::Result<()> {
+            crate::app::shared_support::ensure_frame_slot(&mut slot, &renderer, &frame, 0.0)?;
+            anyhow::bail!("injected capture failure")
+        })();
+        assert!(slot.is_some());
+        assert!(captured.is_err());
+        super::finish_snapshot(&mut ctl, &mut slot, &renderer, captured);
+        assert!(slot.is_none());
+        assert!(!ctl.freeze_pending());
+        assert_eq!(ctl.paused, paused);
+        assert!(ctl.frozen_at.is_none());
+        assert!(!path.exists());
+        assert!(
+            std::fs::read_to_string(path.with_extension("ppm.error"))
+                .unwrap()
+                .contains("injected capture failure")
+        );
+    }
 }

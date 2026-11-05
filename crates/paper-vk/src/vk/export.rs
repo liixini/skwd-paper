@@ -1,5 +1,6 @@
 #[cfg(feature = "shared-device")]
-use anyhow::{Context, Result, anyhow};
+use anyhow::Context;
+use anyhow::{Result, anyhow};
 use ash::vk;
 
 use super::Renderer;
@@ -41,7 +42,6 @@ impl ExportOwner {
     }
 }
 
-#[cfg(feature = "shared-device")]
 /// The creating Vulkan device must outlive this value.
 pub struct ReadbackBuf {
     pub buffer: vk::Buffer,
@@ -52,10 +52,8 @@ pub struct ReadbackBuf {
     released: bool,
 }
 
-#[cfg(feature = "shared-device")]
 unsafe impl Send for ReadbackBuf {}
 
-#[cfg(feature = "shared-device")]
 impl ReadbackBuf {
     fn empty(device: &ash::Device, size: u64) -> Self {
         Self {
@@ -90,7 +88,6 @@ impl ReadbackBuf {
     }
 }
 
-#[cfg(feature = "shared-device")]
 impl Drop for ReadbackBuf {
     fn drop(&mut self) {
         self.release();
@@ -411,14 +408,13 @@ impl Renderer {
         unsafe {
             let semaphores = [semaphore.semaphore];
             self.device.reset_fences(&[semaphore.fence])?;
-            {
-                let _guard = self.queue_guard();
-                self.device.queue_submit(
-                    self.queue,
-                    &[vk::SubmitInfo::default().signal_semaphores(&semaphores)],
-                    semaphore.fence,
-                )?;
-            }
+            crate::shared::submit(
+                &self.device,
+                self.queue,
+                self.queue_family,
+                &[vk::SubmitInfo::default().signal_semaphores(&semaphores)],
+                semaphore.fence,
+            )?;
             self.device.wait_for_fences(&[semaphore.fence], true, u64::MAX)?;
         }
         Ok(())
@@ -526,7 +522,6 @@ impl Renderer {
         }
     }
 
-    #[cfg(feature = "shared-device")]
     pub fn create_readback_buf(&self, bytes: u64) -> Result<ReadbackBuf> {
         unsafe {
             let mut readback = ReadbackBuf::empty(&self.device, bytes);
@@ -601,6 +596,7 @@ impl Renderer {
         self.create_nv12_export_tiling(width, height, vk::ImageTiling::LINEAR, &[])
     }
 
+    #[cfg(feature = "shared-device")]
     fn create_nv12_export_tiling(
         &self,
         width: u32,
@@ -787,6 +783,7 @@ impl Renderer {
         Ok(output)
     }
 
+    #[cfg(feature = "shared-device")]
     fn create_xr24_export_tiling(
         &self,
         width: u32,

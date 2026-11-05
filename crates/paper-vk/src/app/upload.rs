@@ -2,7 +2,7 @@ use super::readiness::{PresentationReadiness, signal_ready};
 use crate::fill::mode_uv;
 use crate::timing::Pacer;
 use crate::{ctl, decode, vk, wayland};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::time::{Duration, Instant};
 
 pub(super) fn run_upload(
@@ -11,6 +11,7 @@ pub(super) fn run_upload(
     mute: bool,
     volume: u32,
 ) -> Result<()> {
+    ensure!(!target.hidden, "hidden preparation requires shared presentation");
     let mut dec = open_source(video).context("upload decoder")?;
     let (video_w, video_h) = dec.dims();
     tracing::info!("skwd-wall-vk: separate-device decode {video_w}x{video_h}");
@@ -44,7 +45,7 @@ pub(super) fn run_upload(
             readiness.arm_swap();
         }
         crate::freeze::write_last_requested(&mut ctl, last_presented.as_ref())?;
-        if ctl.paused && !ctl.freeze_pending() {
+        if last_presented.is_some() && ctl.paused && !ctl.freeze_pending() {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -76,7 +77,7 @@ pub(super) fn run_upload(
 type RenderSet = (Vec<vk::Renderer>, Vec<[f32; 4]>, Option<Vec<vk::UploadPath>>);
 
 fn open_source(video: &str) -> Result<decode::AnyDecoder> {
-    let dec = decode::open_decoder(video, None, true, None, false)?;
+    let dec = decode::open_decoder(&decode::HardwareDecode::local(video), false)?;
     if dec.still() {
         return Err(anyhow::anyhow!("still sources are rendered by skwd-wall-still"));
     }

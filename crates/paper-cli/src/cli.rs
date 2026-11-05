@@ -23,7 +23,7 @@ pub(crate) enum Command {
     Pause,
     #[command(about = "Resume all wallpaper playback")]
     Resume,
-    #[command(about = "Change wallpaper mute or volume on the named monitors")]
+    #[command(about = "Change wallpaper mute, volume, or spectrum source on the named monitors")]
     Audio(AudioArgs),
     #[command(about = "Show current wallpapers and available renderers as JSON")]
     Status,
@@ -31,6 +31,8 @@ pub(crate) enum Command {
     Outputs,
     #[command(about = "List supported media types, placement modes and controls as JSON")]
     Capabilities(CapabilitiesArgs),
+    #[command(about = "List transition presets and their default durations as JSON")]
+    Transitions,
     #[command(
         about = "Capture Wallpaper Engine and video thumbnails offscreen using newline-delimited JSON requests"
     )]
@@ -72,10 +74,6 @@ pub(crate) struct ApplyArgs {
     #[arg(long, value_enum)]
     pub(crate) kind: Option<KindArg>,
     #[arg(long, value_enum)]
-    pub(crate) engine: Option<EngineArg>,
-    #[arg(long)]
-    pub(crate) frame_rate: Option<String>,
-    #[arg(long, value_enum)]
     pub(crate) fill_mode: Option<FillModeArg>,
     #[arg(long, action = clap::ArgAction::Set)]
     pub(crate) mute: Option<bool>,
@@ -90,9 +88,12 @@ pub(crate) struct ApplyArgs {
     pub(crate) transition: bool,
     #[arg(long)]
     pub(crate) transition_from: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Transition effect; see skwd-paper transitions for the selected presets")]
     pub(crate) effect: Option<String>,
-    #[arg(long, help = "Transition duration in milliseconds (50-10000; default 600)")]
+    #[arg(
+        long,
+        help = "Transition duration in milliseconds (50-10000; defaults to the preset duration)"
+    )]
     pub(crate) duration_ms: Option<u64>,
     #[arg(
         long,
@@ -124,6 +125,8 @@ pub(crate) struct AudioArgs {
     pub(crate) mute: Option<bool>,
     #[arg(long)]
     pub(crate) volume: Option<u32>,
+    #[arg(long, value_enum)]
+    pub(crate) spectrum_source: Option<SpectrumSourceArg>,
 }
 
 #[derive(Args)]
@@ -133,17 +136,22 @@ pub(crate) struct CapabilitiesArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SpectrumSourceArg {
+    System,
+    Wallpaper,
+}
+
+impl SpectrumSourceArg {
+    pub(crate) fn system(self) -> bool {
+        matches!(self, Self::System)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum KindArg {
     Static,
     Video,
     We,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum EngineArg {
-    #[value(alias = "regular", alias = "tiny")]
-    Default,
-    Tinier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

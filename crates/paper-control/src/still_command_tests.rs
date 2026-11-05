@@ -1,6 +1,17 @@
 use super::*;
 
 #[test]
+fn snapshot_wire_compatible() {
+    let command = crate::PaperCommand::snapshot("/cache/frame.ppm", "DP-1");
+    let still: StillCommand = serde_json::from_str(&command.line()).unwrap();
+    assert_eq!(
+        still.snapshot.unwrap(),
+        crate::FrameSnapshot { path: "/cache/frame.ppm".into(), output: "DP-1".into() }
+    );
+    assert!(serde_json::from_str::<StillCommand>("{}").unwrap().snapshot.is_none());
+}
+
+#[test]
 fn still_ndjson_shape() {
     let command = StillCommand::new("/w/new.png");
     assert_eq!(command.line(), "{\"path\":\"/w/new.png\"}\n");

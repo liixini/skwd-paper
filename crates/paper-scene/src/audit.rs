@@ -1,10 +1,60 @@
 use crate::pkg::Package;
 use crate::scene::{self, SceneFeatures};
 use crate::sound::SoundInventory;
+use crate::{model, tex};
+use anyhow::{Result, anyhow};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::Path;
+
+const REPRESENTED_OBJECT: &str = "already-supported-under-another-representation";
+const QUAD_PARSER: &str = "scene parsed; quad contributes square geometry and material effects";
+const QUAD_ROUTE: &str = "render through the layer effect pipeline";
+const QUAD_STRICT: &str = "accepted subject to effect support";
+const TEXTURE_GAPS_FIELD: &str = "texture_gaps";
+const TEXTURE_GAPS_OMITTED_FIELD: &str = "texture_gaps_omitted";
+const EVALUATED_SCHEMA: u8 = 1;
+const TEX_EXTENSION: &str = ".tex";
+const ROUTE_VIDEO: &str = "video";
+const ROUTE_FREE_IMAGE: &str = "free-image";
+const ROUTE_TEXTURE_FORMAT: &str = "texture-format";
+const ROUTE_UNKNOWN: &str = "unknown";
+const OUTCOME_RUNTIME_VIDEO: &str = "runtime-video-decode-required";
+const OUTCOME_RGBA_DECODE: &str = "rejected: rgba decode";
+const OUTCOME_DECODED: &str = "decoded";
+const STATUS_RUNTIME_CHECK: &str = "runtime-check-required";
+const OUTCOME_UNMEASURED: &str = "unmeasured";
+
+#[derive(Serialize)]
+struct EvaluatedReport {
+    schema: u8,
+    scene: std::path::PathBuf,
+    package: std::path::PathBuf,
+    capability_gaps: Vec<&'static str>,
+    loader_reductions: Vec<String>,
+    strict_loader_rejects: bool,
+    texture_formats: Vec<TextureOutcome>,
+    effect_budget: BudgetOutcome,
+}
+
+#[derive(Serialize)]
+struct TextureOutcome {
+    path: String,
+    raw_id: Option<i32>,
+    raw_name: Option<String>,
+    effective_route: &'static str,
+    free_image_format: Option<i32>,
+    outcome: String,
+}
+
+#[derive(Serialize)]
+struct BudgetOutcome {
+    status: &'static str,
+    reason: &'static str,
+    outcome: &'static str,
+}
 
 #[derive(Default)]
 pub struct Totals {
@@ -50,7 +100,9 @@ pub struct Totals {
     pub object_gap_instances: usize,
     pub gap_scenes: BTreeMap<String, usize>,
     pub gap_instances: BTreeMap<String, usize>,
-    pub full_fidelity: usize,
+    pub without_known_gaps: usize,
+    pub texture_gaps: BTreeMap<String, Vec<scene::TextureGap>>,
+    pub texture_gaps_omitted: usize,
 }
 
 #[derive(Default)]
@@ -71,8 +123,8 @@ fn bump_all(map: &mut BTreeMap<String, usize>, keys: impl IntoIterator<Item = St
 fn record(totals: &mut Totals, id: &str, features: SceneFeatures, sound: &SoundInventory) {
     totals.parsed += 1;
     let compatibility = crate::capability::assess_native(&features);
-    if compatibility.full_fidelity() {
-        totals.full_fidelity += 1;
+    if compatibility.has_no_known_gaps() {
+        totals.without_known_gaps += 1;
     }
     for gap in &compatibility.gaps {
         *totals.gap_scenes.entry(gap.code().to_string()).or_insert(0) += 1;
@@ -125,6 +177,10 @@ fn record(totals: &mut Totals, id: &str, features: SceneFeatures, sound: &SoundI
         totals.with_tex_video += 1;
     }
     totals.tex_failures += features.tex_failures;
+    totals.texture_gaps_omitted += features.texture_gaps_omitted;
+    if !features.texture_gaps.is_empty() {
+        totals.texture_gaps.insert(id.to_owned(), features.texture_gaps);
+    }
     totals.json_failures += features.json_failures;
     if features.refs_truncated {
         totals.refs_truncated += 1;
@@ -168,11 +224,14 @@ pub fn render_json(totals: &Totals) -> serde_json::Value {
                 .as_str()
             {
                 "transform" => (
-                    "already-supported-under-another-representation",
+                    REPRESENTED_OBJECT,
                     "scene parsed; object contributes parent transform state without a render node",
                     "retain for descendant transform resolution",
                     "accepted",
                 ),
+                crate::model::shape::KIND => {
+                    (REPRESENTED_OBJECT, QUAD_PARSER, QUAD_ROUTE, QUAD_STRICT)
+                }
                 "camera" | "shape" | "attachment" => (
                     "native-candidate",
                     "scene parsed; object is not represented by the native model",
@@ -209,6 +268,8 @@ pub fn render_json(totals: &Totals) -> serde_json::Value {
         "parsed": totals.parsed,
         "failed": totals.failures.len(),
         "remaining_object_instances": totals.object_gap_instances,
+        (TEXTURE_GAPS_FIELD): totals.texture_gaps,
+        (TEXTURE_GAPS_OMITTED_FIELD): totals.texture_gaps_omitted,
         "object_shapes": object_gaps,
     })
 }
@@ -225,6 +286,76 @@ fn scene_pkg_path(dir: &Path) -> Option<std::path::PathBuf> {
         .flatten()
         .map(|entry| entry.path())
         .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("pkg") && path.is_file())
+}
+
+pub fn evaluate_scene(dir: &Path) -> Result<Value> {
+    let path = paper_control::we_project::Project::scene_package_at(dir)?;
+    let pkg = Package::open(&path)?;
+    let features = scene::extract(&pkg).map_err(|reason| anyhow!("{reason}"))?;
+    let compatibility = crate::capability::assess_native(&features);
+    let model = model::load_from_dir(&pkg, dir)?;
+    let reductions = model.skipped.clone();
+    drop(model);
+    let formats = pkg
+        .entries()
+        .iter()
+        .filter(|entry| entry.path.ends_with(TEX_EXTENSION))
+        .map(|entry| texture_outcome(&pkg, entry))
+        .collect();
+    let budget = BudgetOutcome {
+        status: STATUS_RUNTIME_CHECK,
+        reason: crate::capability::EFFECT_CHAIN_BUDGET_GAP,
+        outcome: OUTCOME_UNMEASURED,
+    };
+    Ok(serde_json::to_value(EvaluatedReport {
+        schema: EVALUATED_SCHEMA,
+        scene: dir.to_path_buf(),
+        package: path,
+        capability_gaps: compatibility.reason_codes(),
+        strict_loader_rejects: !reductions.is_empty(),
+        loader_reductions: reductions,
+        texture_formats: formats,
+        effect_budget: budget,
+    })?)
+}
+
+fn texture_outcome(pkg: &Package, entry: &crate::pkg::Entry) -> TextureOutcome {
+    let bytes = pkg.read(entry);
+    let path = entry.path.clone();
+    let meta = match tex::parse_meta(bytes) {
+        Ok(meta) => meta,
+        Err(error) => {
+            return TextureOutcome {
+                path,
+                raw_id: None,
+                raw_name: None,
+                effective_route: ROUTE_UNKNOWN,
+                free_image_format: None,
+                outcome: format!("rejected: {error:#}"),
+            };
+        }
+    };
+    let route = if meta.flags & tex::FLAG_IS_VIDEO != 0 {
+        ROUTE_VIDEO
+    } else if meta.free_image_format.is_some_and(|format| format >= 0) {
+        ROUTE_FREE_IMAGE
+    } else {
+        ROUTE_TEXTURE_FORMAT
+    };
+    let outcome = match model::load_texture(bytes, pkg.origin(&entry.path), None) {
+        Err(reason) => format!("rejected: {reason}"),
+        Ok(texture) if texture.video.is_some() => OUTCOME_RUNTIME_VIDEO.to_string(),
+        Ok(texture) if texture.pixels.base_rgba().is_some() => OUTCOME_DECODED.to_string(),
+        Ok(_) => OUTCOME_RGBA_DECODE.to_string(),
+    };
+    TextureOutcome {
+        path,
+        raw_id: Some(meta.format.raw()),
+        raw_name: Some(meta.format.name()),
+        effective_route: route,
+        free_image_format: meta.free_image_format,
+        outcome,
+    }
 }
 
 pub fn audit_workshop(root: &Path) -> Totals {
@@ -371,10 +502,10 @@ pub fn render_markdown(totals: &Totals) -> String {
     }
     let _ = writeln!(
         out,
-        "\nfull native fidelity: {} of {} parsed scenes ({}%)",
-        totals.full_fidelity,
+        "\nNo statically detected native gaps: {} of {} parsed scenes ({}%)",
+        totals.without_known_gaps,
         totals.parsed,
-        totals.full_fidelity * 100 / total
+        totals.without_known_gaps * 100 / total
     );
     if !totals.gap_scenes.is_empty() {
         let _ = writeln!(out, "\n## native gaps (scenes affected, instances)\n");
@@ -412,3 +543,7 @@ pub fn render_markdown(totals: &Totals) -> String {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "audit/tests.rs"]
+mod tests;

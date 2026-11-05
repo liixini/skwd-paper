@@ -22,3 +22,18 @@ fn duck_is_independent_of_mute() {
     gated.set_duck(false);
     assert!(!gated.ducked());
 }
+
+#[test]
+fn paused_start_stays_inert() {
+    let mut gated = GatedAudio::new("/nonexistent/paused.mp4", true, 80);
+    gated.set_pause(true);
+    gated.set_mute(false);
+    gated.set_volume(42);
+    assert!(!gated.pipeline_running());
+    assert!(!gated.mute);
+    assert_eq!(gated.volume, 42);
+    gated.set_duck(true);
+    gated.set_pause(false);
+    assert!(!gated.pipeline_running());
+    assert!(gated.ducked());
+}

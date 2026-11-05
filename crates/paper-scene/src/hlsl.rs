@@ -1,9 +1,21 @@
-use crate::shader::{Sampler, Stage, Uniform, UniformKind};
+use crate::shader::{
+    DEFINE_PREFIX, PACKED_COMPONENTS, Sampler, Stage, UNDEF_PREFIX, Uniform, UniformKind,
+    VaryingPack,
+};
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
 mod audio;
+mod bounds;
+mod spirv;
+
+const HLSL_MAT4X3: &str = "float4x3";
+const PACKED_VARYING_TYPES: [(&str, u32); 3] = [("float", 1), ("vec2", 2), ("vec3", 3)];
+const VARYING_FIELD_TYPES: [(&str, u32); 3] = [("float", 1), ("vec2", 2), ("vec3", 3)];
+const HLSL_RETURN_OUT: &str = "return OUT;";
+const HLSL_FRAGMENT_OUT: &str = "PS_OUTPUT OUT = (PS_OUTPUT)0;";
+const HLSL_PACKED_FIELDS: &str = "skwd_packed_fields";
 
 pub const PRELUDE: &str = "#define HLSL 1
 #define HLSL_SM40 1
@@ -28,11 +40,15 @@ pub const PRELUDE: &str = "#define HLSL 1
 #define CAST4U(x) ((uint4)(x))
 #define CAST4(x) ((float4)(x))
 #define CAST3X3(x) ((float3x3)(x))
-#define texSample2D(s, u) s.Sample(s ## SamplerState, u)
-#define texSample2DLod(s, u, m) s.SampleLevel(s ## SamplerState, u, m)
-#define texSample2DCompare(s, u, d) s.SampleCmpLevelZero(s ## SamplerComparisonState, u, d)
+#define SKWD_SAMPLER(s) s ## SamplerState
+#define SKWD_COMPARE_SAMPLER(s) s ## SamplerComparisonState
+#define DECLARE_SAMPLER2D_PARAMETER(s) Texture2D s, SamplerState SKWD_SAMPLER(s)
+#define MAKE_SAMPLER2D_ARGUMENT(s) s, SKWD_SAMPLER(s)
+#define texSample2D(s, u) s.Sample(SKWD_SAMPLER(s), u)
+#define texSample2DLod(s, u, m) s.SampleLevel(SKWD_SAMPLER(s), u, m)
+#define texSample2DCompare(s, u, d) s.SampleCmpLevelZero(SKWD_COMPARE_SAMPLER(s), u, d)
 #define texLoad2D(s, u, r) s.Load(int3((u) * (r), 0))
-#define texSample3D(s, u) s.Sample(s ## SamplerState, u)
+#define texSample3D(s, u) s.Sample(SKWD_SAMPLER(s), u)
 #define texSample2DBackBuffer(s, u, r) texSample2D(s, (u))
 #define fract frac
 #define inversesqrt rsqrt
@@ -88,62 +104,90 @@ fn split_decl(rest: &str) -> Option<Decl> {
     Some(Decl { ty, name, array })
 }
 
-fn packed_scalar_array(decl: &Decl) -> Option<u32> {
-    if decl.ty != "float" {
-        return None;
-    }
+fn packed_varying_array(decl: &Decl) -> Option<VaryingPack> {
+    let width =
+        PACKED_VARYING_TYPES.iter().find(|(ty, _)| *ty == decl.ty).map(|(_, width)| *width)?;
     let count: u32 = decl.array.trim_matches(['[', ']']).trim().parse().ok()?;
-    (count > 4).then_some(count.div_ceil(4))
+    (count * width > PACKED_COMPONENTS).then_some(VaryingPack { width, count })
 }
 
-fn pack_indices(text: &str, name: &str) -> String {
-    let pattern = format!("{name}[");
-    let mut out = String::with_capacity(text.len() + 64);
-    let mut rest = text;
-    while let Some(at) = rest.find(&pattern) {
-        let preceded_by_word = rest[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.');
-        let start = at + pattern.len();
-        let mut depth = 1usize;
-        let mut end = None;
-        for (offset, ch) in rest[start..].char_indices() {
-            match ch {
-                '[' => depth += 1,
-                ']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(start + offset);
-                        break;
-                    }
-                }
-                _ => {}
+fn declaration_slots(decl: &Decl) -> u32 {
+    packed_varying_array(decl).map_or_else(
+        || decl.array.trim_matches(['[', ']']).trim().parse::<u32>().unwrap_or(1).max(1),
+        |pack| pack.slots(),
+    )
+}
+
+struct FieldPack {
+    base: u32,
+    pack: VaryingPack,
+    fields: BTreeMap<String, (u32, u32)>,
+}
+
+impl FieldPack {
+    fn of(varyings: &[Decl]) -> Option<Self> {
+        let raw: u32 = varyings.iter().map(declaration_slots).sum();
+        if raw <= MAX_VARYING_SLOTS {
+            return None;
+        }
+        let mut base = 0;
+        let mut count = 0;
+        let mut fields = BTreeMap::new();
+        for decl in varyings {
+            let width = VARYING_FIELD_TYPES
+                .iter()
+                .find(|(ty, _)| decl.array.is_empty() && *ty == decl.ty)
+                .map(|(_, width)| *width);
+            if let Some(width) = width {
+                fields.insert(decl.name.clone(), (count, width));
+                count += width;
+            } else {
+                base += declaration_slots(decl);
             }
         }
-        let Some(end) = end else {
-            break;
-        };
-        if preceded_by_word && !name.contains('.') {
-            out.push_str(&rest[..=end]);
-            rest = &rest[end + 1..];
-            continue;
-        }
-        let index = rest[start..end].trim();
-        out.push_str(&rest[..at]);
-        let _ = write!(out, "{name}[int({index}) / 4][int({index}) % 4]");
-        rest = &rest[end + 1..];
+        (count > 0).then_some(Self { base, pack: VaryingPack { width: 1, count }, fields })
     }
-    out.push_str(rest);
-    out
+
+    fn copies(&self, out: &mut String, decl: &Decl, stage: Stage) {
+        let Some(&(start, width)) = self.fields.get(&decl.name) else { return };
+        for component in 0..width {
+            let (slot, lane) = self.pack.element(start + component);
+            let local = if width == 1 {
+                decl.name.clone()
+            } else {
+                let (_, field) = self.pack.element(component);
+                format!("{}.{field}", decl.name)
+            };
+            let io = format!("{HLSL_PACKED_FIELDS}[{slot}].{lane}");
+            let statement = if stage == Stage::Vertex {
+                format!("\tOUT.{io} = {local};")
+            } else {
+                format!("\t{local} = IN.{io};")
+            };
+            let _ = writeln!(out, "{statement}");
+        }
+    }
 }
 
-fn strip_declarations(source: &str) -> (String, Vec<Decl>, Vec<Decl>) {
+fn strip_declarations(
+    source: &str,
+    combos: &BTreeMap<String, i64>,
+) -> (String, Vec<Decl>, Vec<Decl>) {
+    let mut symbols = combos.clone();
     let mut body = String::with_capacity(source.len());
     let mut attributes = Vec::new();
     let mut varyings = Vec::new();
     for line in source.lines() {
         let code = line.trim_start().split("//").next().unwrap_or("").trim();
+        if let Some(rest) = code.strip_prefix(DEFINE_PREFIX) {
+            let mut words = rest.split_whitespace();
+            if let (Some(name), Some(Ok(value))) = (words.next(), words.next().map(str::parse)) {
+                symbols.insert(name.to_string(), value);
+            }
+        }
+        if let Some(name) = code.strip_prefix(UNDEF_PREFIX) {
+            symbols.remove(name.trim());
+        }
         if code.starts_with("#version") || code.starts_with("uniform ") {
             continue;
         }
@@ -154,7 +198,11 @@ fn strip_declarations(source: &str) -> (String, Vec<Decl>, Vec<Decl>) {
             continue;
         }
         if let Some(rest) = code.strip_prefix("varying ") {
-            if let Some(decl) = split_decl(rest) {
+            if let Some(mut decl) = split_decl(rest) {
+                let token = decl.array.trim_matches(['[', ']']);
+                if let Some(size) = symbols.get(token) {
+                    decl.array = format!("[{size}]");
+                }
                 varyings.push(decl);
             }
             continue;
@@ -197,6 +245,7 @@ fn word_char(byte: u8) -> bool {
 fn rewrite_main(body: &str, stage: Stage) -> String {
     let signature = match stage {
         Stage::Vertex => "VS_OUTPUT main(VS_INPUT IN) {\n\tVS_OUTPUT OUT = (VS_OUTPUT)0;",
+        Stage::Geometry => return body.to_string(),
         Stage::Fragment => "PS_OUTPUT main(VS_OUTPUT IN) {\n\tPS_OUTPUT OUT = (PS_OUTPUT)0;",
     };
     let Some(at) = body.find("void main") else {
@@ -276,28 +325,6 @@ fn static_const(body: &str) -> String {
     out
 }
 
-fn names_globals(words: &[u32]) -> bool {
-    let mut at = 5;
-    while at < words.len() {
-        let count = (words[at] >> 16) as usize;
-        if count == 0 {
-            return false;
-        }
-        if words[at] & 0xffff == 5 && count > 2 {
-            let bytes: Vec<u8> = words[at + 2..(at + count).min(words.len())]
-                .iter()
-                .flat_map(|w| w.to_le_bytes())
-                .collect();
-            let name = bytes.split(|b| *b == 0).next().unwrap_or(&[]);
-            if name == b"$Globals" {
-                return true;
-            }
-        }
-        at += count;
-    }
-    false
-}
-
 fn hlsl_type(kind: &UniformKind) -> &'static str {
     match kind {
         UniformKind::Float => "float",
@@ -306,25 +333,41 @@ fn hlsl_type(kind: &UniformKind) -> &'static str {
         UniformKind::Vec4 => "float4",
         UniformKind::Mat3 => "float3x3",
         UniformKind::Mat4 => "float4x4",
+        UniformKind::Mat4x3 => HLSL_MAT4X3,
         UniformKind::Int => "int",
+        UniformKind::Uint => crate::shader::GLSL_UINT,
     }
+}
+
+const COMPARISON_STATE: &str = "SamplerComparisonState";
+const SAMPLER_STATE: &str = "SamplerState";
+
+pub(crate) fn reads_texture(source: &str, name: &str) -> bool {
+    source
+        .lines()
+        .filter(|line| !line.contains(SAMPLER_STATE) && !line.contains(COMPARISON_STATE))
+        .any(|line| crate::shader::words_of(line).iter().any(|word| word == name))
 }
 
 fn declare_resources(out: &mut String, uniforms: &[Uniform], samplers: &[Sampler]) {
     if !uniforms.is_empty() {
         out.push_str("cbuffer SkwdParams : register(b0) {\n");
         for uniform in uniforms {
-            let array =
-                if uniform.count > 1 { format!("[{}]", uniform.count) } else { String::new() };
+            let array = if uniform.count > 1 || uniform.name.contains('[') {
+                format!("[{}]", uniform.count)
+            } else {
+                String::new()
+            };
             let name = uniform.name.split('[').next().unwrap_or(&uniform.name);
             let _ = writeln!(out, "\t{} {name}{array};", hlsl_type(&uniform.kind));
         }
         out.push_str("};\n");
     }
     for sampler in samplers {
+        let state = if sampler.comparison { COMPARISON_STATE } else { SAMPLER_STATE };
         let _ = writeln!(
             out,
-            "Texture2D {0} : register(t{1}); SamplerState {0}SamplerState : register(s{1});",
+            "Texture2D {0} : register(t{1}); {state} {0}{state} : register(s{1});",
             sampler.name, sampler.index
         );
     }
@@ -333,24 +376,29 @@ fn declare_resources(out: &mut String, uniforms: &[Uniform], samplers: &[Sampler
 pub const MAX_VARYING_SLOTS: u32 = 32;
 
 #[must_use]
-pub fn varying_slots(vertex: &str) -> u32 {
-    let (_, _, varyings) = strip_declarations(vertex);
-    varyings
-        .iter()
-        .map(|decl| {
-            packed_scalar_array(decl).unwrap_or_else(|| {
-                decl.array.trim_matches(['[', ']']).trim().parse::<u32>().unwrap_or(1).max(1)
-            })
-        })
-        .sum()
+pub fn varying_slots(vertex: &str, fragment: &str, combos: &BTreeMap<String, i64>) -> u32 {
+    let vertex = crate::shader::rename_authored_mod(vertex);
+    let fragment = crate::shader::rename_authored_mod(fragment);
+    let (vertex_body, _, mut varyings) = strip_declarations(&vertex, combos);
+    let (fragment_body, _, fragment_varyings) = strip_declarations(&fragment, combos);
+    if bounds::supported_source(&vertex) && bounds::supported_source(&fragment) {
+        bounds::shrink(&vertex_body, &fragment_body, combos, &mut varyings, &fragment_varyings);
+    }
+    FieldPack::of(&varyings).map_or_else(
+        || varyings.iter().map(declaration_slots).sum(),
+        |fields| fields.base + fields.pack.slots(),
+    )
 }
 
 #[must_use]
-pub fn fragment_indexes_varying_arrays_dynamically(fragment: &str) -> bool {
-    let (body, _, varyings) = strip_declarations(fragment);
+pub fn fragment_indexes_varying_arrays_dynamically(
+    fragment: &str,
+    combos: &BTreeMap<String, i64>,
+) -> bool {
+    let (body, _, varyings) = strip_declarations(fragment, combos);
     let scalar =
         |decl: &&Decl| !decl.array.is_empty() && matches!(decl.ty.as_str(), "float" | "int");
-    varyings.iter().filter(scalar).any(|decl| {
+    varyings.iter().filter(scalar).filter(|decl| packed_varying_array(decl).is_none()).any(|decl| {
         let pattern = format!("{}[", decl.name);
         let mut rest = body.as_str();
         while let Some(at) = rest.find(&pattern) {
@@ -374,8 +422,14 @@ pub fn rewrite(
     uniforms: &[Uniform],
     samplers: &[Sampler],
 ) -> HlslPair {
-    let (vert_body, attributes, varyings) = strip_declarations(vertex);
-    let (frag_body, _, _) = strip_declarations(fragment);
+    let vertex = crate::shader::rename_authored_mod(vertex);
+    let fragment = crate::shader::rename_authored_mod(fragment);
+    let (vert_body, attributes, mut varyings) = strip_declarations(&vertex, combos);
+    let (frag_body, _, fragment_varyings) = strip_declarations(&fragment, combos);
+    if bounds::supported_source(&vertex) && bounds::supported_source(&fragment) {
+        bounds::shrink(&vert_body, &frag_body, combos, &mut varyings, &fragment_varyings);
+    }
+    let fields = FieldPack::of(&varyings);
     let mut header = String::from(PRELUDE);
     for (key, value) in combos {
         let _ = writeln!(header, "#define {key} {value}");
@@ -396,37 +450,81 @@ pub fn rewrite(
     header.push_str("};\nstruct VS_OUTPUT {\n\tfloat4 gl_Position : SV_POSITION;\n");
     let mut slot = 0u32;
     for decl in &varyings {
-        if let Some(packed) = packed_scalar_array(decl) {
-            let _ = writeln!(header, "\tfloat4 {}[{packed}] : TEXCOORD{slot};", decl.name);
-            slot += packed;
+        if fields.as_ref().is_some_and(|fields| fields.fields.contains_key(&decl.name)) {
+            continue;
+        }
+        if let Some(pack) = packed_varying_array(decl) {
+            let _ = writeln!(
+                header,
+                "\tfloat4 skwd_io_{}[{}] : TEXCOORD{slot};",
+                decl.name,
+                pack.slots()
+            );
+            slot += pack.slots();
         } else {
             let _ = writeln!(header, "\t{} {}{} : TEXCOORD{slot};", decl.ty, decl.name, decl.array);
-            slot += decl.array.trim_matches(['[', ']']).parse::<u32>().unwrap_or(1).max(1);
+            slot += declaration_slots(decl);
         }
     }
+    if let Some(fields) = &fields {
+        let _ = writeln!(
+            header,
+            "\tfloat4 {HLSL_PACKED_FIELDS}[{}] : TEXCOORD{};",
+            fields.pack.slots(),
+            fields.base
+        );
+    }
     header.push_str("};\nstruct PS_OUTPUT { float4 gl_FragColor : SV_TARGET; };\n");
+    for decl in &varyings {
+        if packed_varying_array(decl).is_some()
+            || fields.as_ref().is_some_and(|fields| fields.fields.contains_key(&decl.name))
+        {
+            let _ = writeln!(header, "static {} {}{};", decl.ty, decl.name, decl.array);
+        }
+    }
 
     let mut vert = audio::flatten(&static_const(&vert_body), uniforms);
     for decl in &attributes {
         vert = replace_word(&vert, &decl.name, &format!("IN.{}", decl.name));
     }
     for decl in &varyings {
-        vert = replace_word(&vert, &decl.name, &format!("OUT.{}", decl.name));
-        if packed_scalar_array(decl).is_some() {
-            vert = pack_indices(&vert, &format!("OUT.{}", decl.name));
+        if packed_varying_array(decl).is_none()
+            && !fields.as_ref().is_some_and(|fields| fields.fields.contains_key(&decl.name))
+        {
+            vert = replace_word(&vert, &decl.name, &format!("OUT.{}", decl.name));
         }
     }
     vert = replace_word(&vert, "gl_Position", "OUT.gl_Position");
     vert = rewrite_main(&vert, Stage::Vertex);
+    let mut output_copies = String::new();
+    for decl in &varyings {
+        if let Some(pack) = packed_varying_array(decl) {
+            for (io, local) in pack.bindings(&decl.name) {
+                let _ = writeln!(output_copies, "\tOUT.{io} = {local};");
+            }
+        }
+        if let Some(fields) = &fields {
+            fields.copies(&mut output_copies, decl, Stage::Vertex);
+        }
+    }
+    if !output_copies.is_empty() {
+        vert =
+            vert.replace(HLSL_RETURN_OUT, &format!("{{\n{output_copies}\t{HLSL_RETURN_OUT}\n\t}}"));
+    }
 
     let mut frag = audio::flatten(&static_const(&frag_body), uniforms);
     let mut input_copies = String::new();
     for decl in &varyings {
-        if decl.array.is_empty() {
+        if let Some(fields) = &fields
+            && fields.fields.contains_key(&decl.name)
+        {
+            fields.copies(&mut input_copies, decl, Stage::Fragment);
+        } else if decl.array.is_empty() {
             frag = replace_word(&frag, &decl.name, &format!("IN.{}", decl.name));
-        } else if let Some(packed) = packed_scalar_array(decl) {
-            let _ = writeln!(input_copies, "\tfloat4 {}[{packed}] = IN.{};", decl.name, decl.name);
-            frag = pack_indices(&frag, &decl.name);
+        } else if let Some(pack) = packed_varying_array(decl) {
+            for (io, local) in pack.bindings(&decl.name) {
+                let _ = writeln!(input_copies, "\t{local} = IN.{io};");
+            }
         } else {
             let _ = writeln!(
                 input_copies,
@@ -438,9 +536,14 @@ pub fn rewrite(
     frag = replace_word(&frag, "gl_FragColor", "OUT.gl_FragColor");
     frag = rewrite_main(&frag, Stage::Fragment);
     if !input_copies.is_empty() {
-        let marker = "PS_OUTPUT OUT = (PS_OUTPUT)0;\n";
+        let marker = HLSL_FRAGMENT_OUT;
         if let Some(at) = frag.find(marker) {
-            frag.insert_str(at + marker.len(), &input_copies);
+            let end = at + marker.len();
+            if frag[end..].starts_with('\n') {
+                frag.insert_str(end + 1, &input_copies);
+            } else {
+                frag.insert_str(end, &format!("\n{input_copies}"));
+            }
         }
     }
 
@@ -494,12 +597,18 @@ pub fn available() -> bool {
 }
 
 pub fn compile(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>> {
+    const GEOMETRY_CACHE_TAG: &str = "hgeom";
+    const GEOMETRY_PROFILE: &str = "gs_6_0";
     if std::env::var("SKWD_PAPER_SHADER_BACKEND").as_deref() == Ok("glsl") {
         return Err(anyhow!("hlsl backend disabled"));
     }
-    let tag = if stage == Stage::Vertex { "hvert" } else { "hfrag" };
+    let tag = match stage {
+        Stage::Vertex => "hvert",
+        Stage::Geometry => GEOMETRY_CACHE_TAG,
+        Stage::Fragment => "hfrag",
+    };
     if let Some(words) = crate::shader::cached_spirv(source, tag) {
-        return Ok(words);
+        return spirv::normalize(words);
     }
     let words = DXC.with(|cell| {
         let dxc = cell.get_or_init(load_dxc).as_ref().ok_or_else(|| anyhow!("dxc unavailable"))?;
@@ -508,7 +617,11 @@ pub fn compile(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>> {
         let blob = library
             .create_blob_with_encoding_from_str(source)
             .map_err(|err| anyhow!("dxc blob: {err}"))?;
-        let profile = if stage == Stage::Vertex { "vs_6_0" } else { "ps_6_0" };
+        let profile = match stage {
+            Stage::Vertex => "vs_6_0",
+            Stage::Geometry => GEOMETRY_PROFILE,
+            Stage::Fragment => "ps_6_0",
+        };
         let args = [
             "-spirv",
             "-HV",
@@ -533,7 +646,7 @@ pub fn compile(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>> {
             Ok(result) => {
                 let blob = result.get_result().map_err(|err| anyhow!("dxc result: {err}"))?;
                 let words = blob.to_vec::<u32>();
-                if names_globals(&words) {
+                if spirv::names_globals(&words)? {
                     return Err(anyhow!("dxc {label}: non-static global landed in $Globals"));
                 }
                 Ok(words)
@@ -549,7 +662,7 @@ pub fn compile(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>> {
         }
     })?;
     crate::shader::store_spirv(source, tag, &words);
-    Ok(words)
+    spirv::normalize(words)
 }
 
 #[cfg(test)]

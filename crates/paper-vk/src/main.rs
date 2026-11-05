@@ -6,6 +6,8 @@ mod dmabuf;
 mod ffmpeg_vulkan;
 mod fill;
 mod freeze;
+#[cfg(all(target_os = "linux", feature = "shared-device"))]
+mod health;
 mod memory;
 #[cfg(feature = "shared-device")]
 mod preview;
@@ -16,6 +18,8 @@ mod sandbox;
 mod shared;
 mod surface;
 mod timing;
+#[cfg(feature = "shared-device")]
+mod transition_theme;
 mod vk;
 mod wayland;
 
@@ -27,6 +31,10 @@ fn version_requested(arguments: &[String]) -> bool {
 
 fn main() {
     let arguments: Vec<String> = std::env::args().collect();
+    #[cfg(all(target_os = "linux", feature = "shared-device"))]
+    if health::child_requested(&arguments) {
+        std::process::exit(health::child(&arguments));
+    }
     if version_requested(&arguments) {
         println!("skwd-wall-vk {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -38,7 +46,10 @@ fn main() {
         tracing::error!("renderer sandbox unavailable: {err}");
         std::process::exit(1);
     }
-    if let Err(err) = app::run() {
+    let result = app::run();
+    #[cfg(all(target_os = "linux", feature = "shared-device"))]
+    sandbox::broker::shutdown();
+    if let Err(err) = result {
         app::signal_startup_failure(&format!("{err:#}"));
         tracing::error!("skwd-wall-vk exited with error: {err:?}");
         std::process::exit(1);

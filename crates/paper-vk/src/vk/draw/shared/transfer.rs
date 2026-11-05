@@ -138,9 +138,7 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
+        self.wait_render()?;
         let frame =
             ffmpeg_vulkan::Frame::from_video(frame).ok_or_else(|| anyhow!("no AVVkFrame"))?.lock();
         if !frame.held() {
@@ -258,9 +256,7 @@ impl Renderer {
                 .wait_dst_stage_mask(&stages)
                 .signal_semaphores(&semaphores)
                 .command_buffers(&commands);
-            self.device.reset_fences(&[self.fence])?;
-            let _guard = self.queue_guard();
-            self.device.queue_submit(self.queue, &[submit], self.fence)?;
+            self.submit_fenced(&[submit])?;
         }
         frame.commit(
             0,
@@ -409,20 +405,12 @@ impl Renderer {
             let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
                 .wait_semaphore_values(waits.values())
                 .signal_semaphore_values(waits.signal_values());
-            self.device.reset_fences(&[self.fence])?;
-            {
-                let _qg = self.queue_guard();
-                self.device.queue_submit(
-                    self.queue,
-                    &[vk::SubmitInfo::default()
-                        .push_next(&mut timeline)
-                        .wait_semaphores(waits.sems())
-                        .wait_dst_stage_mask(&stages[..waits.len])
-                        .signal_semaphores(waits.signal_sems())
-                        .command_buffers(&cmds)],
-                    self.fence,
-                )?;
-            }
+            self.submit_fenced(&[vk::SubmitInfo::default()
+                .push_next(&mut timeline)
+                .wait_semaphores(waits.sems())
+                .wait_dst_stage_mask(&stages[..waits.len])
+                .signal_semaphores(waits.signal_sems())
+                .command_buffers(&cmds)])?;
         }
         Ok(())
     }

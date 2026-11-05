@@ -18,8 +18,6 @@ fn apply_all_options() {
         "/wall/a.mp4",
         "--kind",
         "video",
-        "--engine",
-        "default",
         "--fill-mode",
         "fit",
         "--mute",
@@ -42,7 +40,6 @@ fn apply_all_options() {
     assert_eq!(args.output.as_deref(), Some("DP-1"));
     assert_eq!(args.path.as_deref(), Some("/wall/a.mp4"));
     assert_eq!(args.kind, Some(KindArg::Video));
-    assert_eq!(args.engine, Some(EngineArg::Default));
     assert_eq!(args.fill_mode, Some(FillModeArg::Fit));
     assert_eq!(args.mute, Some(false));
     assert_eq!(args.volume, Some(45));
@@ -173,5 +170,18 @@ fn output_discovery_and_comma_separated_controls() {
     assert!(
         Cli::try_parse_from(["skwd-paper", "apply", "--manifest", "{}", "--idle-seconds", "30"])
             .is_err()
+    );
+}
+
+#[test]
+fn spectrum_source_selection() {
+    for (name, expected) in [("system", true), ("wallpaper", false)] {
+        let cli = Cli::try_parse_from(["skwd-paper", "audio", "DP-1", "--spectrum-source", name])
+            .unwrap();
+        let Command::Audio(args) = cli.command else { panic!("expected audio") };
+        assert_eq!(args.spectrum_source.unwrap().system(), expected);
+    }
+    assert!(
+        Cli::try_parse_from(["skwd-paper", "audio", "--spectrum-source", "microphone"]).is_err()
     );
 }

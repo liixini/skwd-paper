@@ -83,9 +83,29 @@ impl Renderer {
         }
     }
 
+    pub(crate) fn create_present_semaphores(&self) -> Result<Vec<vk::Semaphore>> {
+        let mut semaphores = Vec::with_capacity(self.views.len());
+        for _ in &self.views {
+            match unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+            {
+                Ok(semaphore) => semaphores.push(semaphore),
+                Err(error) => {
+                    for semaphore in semaphores {
+                        unsafe { self.device.destroy_semaphore(semaphore, None) };
+                    }
+                    return Err(error).context("create present semaphore");
+                }
+            }
+        }
+        Ok(semaphores)
+    }
+
     pub(crate) fn recreate_swapchain(&mut self) -> Result<()> {
+        crate::shared::wait_idle(&self.device)?;
         unsafe {
-            self.device.device_wait_idle()?;
+            for semaphore in self.render_sems.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
             for fb in self.framebuffers.drain(..) {
                 self.device.destroy_framebuffer(fb, None);
             }
@@ -158,6 +178,7 @@ impl Renderer {
                 self.views.push(view);
                 self.framebuffers.push(fb);
             }
+            self.render_sems = self.create_present_semaphores()?;
             Ok(())
         }
     }

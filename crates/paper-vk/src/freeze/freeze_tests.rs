@@ -45,3 +45,56 @@ fn measure_rgba_freeze_latency() {
         );
     }
 }
+
+#[test]
+fn snapshot_failure_preserves_pause() {
+    let directory = tempfile::tempdir().unwrap();
+    for paused in [false, true] {
+        let path = directory.path().join(format!("snapshot-{paused}.ppm"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut ctl = ctl::Ctl::from_channel(rx, None, "", true, 80, false);
+        ctl.set_paused(paused);
+        tx.send(paper_control::PaperCommand::snapshot(path.to_str().unwrap(), "DP-1")).unwrap();
+        assert!(ctl.poll().is_none());
+        assert!(!write_rgba_requested(&mut ctl, 2, 2, &[0; 3]).unwrap());
+        assert_eq!(ctl.paused, paused);
+        assert!(ctl.frozen_at.is_none());
+        assert!(!path.exists());
+        assert!(path.with_extension("ppm.error").exists());
+    }
+}
+
+#[test]
+fn snapshot_writes_current_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshot.ppm");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut ctl = ctl::Ctl::from_channel(rx, None, "", true, 80, false);
+    tx.send(paper_control::PaperCommand::snapshot(path.to_str().unwrap(), "DP-1")).unwrap();
+    assert!(ctl.poll().is_none());
+    assert!(write_rgba_requested(&mut ctl, 2, 1, &[255, 0, 0, 255, 0, 255, 0, 255]).unwrap());
+    assert_eq!(image::open(path).unwrap().into_rgb8().into_raw(), [255, 0, 0, 0, 255, 0]);
+    assert!(!ctl.paused);
+    assert!(ctl.frozen_at.is_none());
+}
+
+#[test]
+fn snapshot_preserves_viewport_crop() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("crop.ppm");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut ctl = ctl::Ctl::from_channel(rx, None, "", true, 80, false);
+    tx.send(paper_control::PaperCommand::snapshot(path.to_str().unwrap(), "DP-1")).unwrap();
+    assert!(ctl.poll().is_none());
+    let frame = image::RgbaImage::from_raw(
+        4,
+        1,
+        vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 255, 0, 0, 255],
+    )
+    .unwrap();
+    assert!(write_view_requested(&mut ctl, frame, (2, 2), Some([1, 0, 2, 1])).unwrap());
+    let image = image::open(path).unwrap().into_rgb8();
+    assert_eq!(image.dimensions(), (2, 2));
+    assert!(image.pixels().all(|pixel| pixel.0 == [0, 255, 0]));
+    assert!(!ctl.paused);
+}

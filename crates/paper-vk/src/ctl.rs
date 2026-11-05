@@ -12,6 +12,7 @@ pub fn stdin_enabled() -> bool {
 }
 
 pub struct SwapReq {
+    pub drawing: Option<paper_control::DrawingTransition>,
     pub to: String,
     pub duration_ms: u64,
     pub shader: Option<String>,
@@ -24,6 +25,14 @@ pub enum AudioSink {
 }
 
 impl AudioSink {
+    fn media(video: &str, mute: bool, volume: u32, playback: paper_control::PlaybackState) -> Self {
+        let mut audio = paper_audio::GatedAudio::new(video, true, volume);
+        audio.set_pause(playback.paused);
+        audio.set_duck(playback.ducked);
+        audio.set_mute(mute);
+        Self::Media(audio)
+    }
+
     pub fn set_mute(&mut self, mute: bool) {
         match self {
             Self::Media(audio) => audio.set_mute(mute),
@@ -53,7 +62,16 @@ impl AudioSink {
     }
 }
 
+struct FreezeState {
+    paused: bool,
+    frozen_at: Option<std::time::Instant>,
+}
+
 pub struct Ctl {
+    pub drawing_photo: Option<String>,
+    pub reveal: bool,
+    pub retained_outputs: Option<Vec<String>>,
+    snapshot: Option<paper_control::FrameSnapshot>,
     pub output_pauses: Vec<(String, bool)>,
     route_output_pauses: bool,
     rx: std::sync::mpsc::Receiver<PaperCommand>,
@@ -61,13 +79,16 @@ pub struct Ctl {
     pub mute: bool,
     pub volume: u32,
     pub paused: bool,
+    pub frozen_at: Option<std::time::Instant>,
     pub ducked: bool,
     freeze: Option<String>,
+    freeze_restore: Option<FreezeState>,
     capture: Option<paper_control::SceneCapture>,
     wake: Option<paper_runtime::wake::Pipe>,
     pointer: Option<paper_control::PointerState>,
     pointer_revision: u64,
     surface_changed: bool,
+    system_audio: Option<bool>,
 }
 
 pub fn parse_audio_opts(args: &[String]) -> (bool, u32) {
@@ -95,7 +116,7 @@ pub fn parse_audio_opts(args: &[String]) -> (bool, u32) {
 
 impl Ctl {
     pub fn render_paused(&self, transitioning: bool) -> bool {
-        self.paused && !transitioning
+        self.frozen_at.is_some() || (self.paused && !transitioning)
     }
 
     pub fn start(video: &str, mute: bool, volume: u32, with_audio: bool) -> Self {
@@ -110,10 +131,9 @@ impl Ctl {
         with_stdin: bool,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut wake = None;
+        let wake = paper_runtime::wake::make_pipe();
         if with_stdin && stdin_enabled() {
-            let wake_pipe = paper_runtime::wake::make_pipe();
-            wake.clone_from(&wake_pipe);
+            let wake_pipe = wake.clone();
             paper_control::spawn_stdin_line_reader("skwd-wall-vk", move |line| {
                 match serde_json::from_str::<PaperCommand>(line) {
                     Ok(cmd) => {
@@ -127,24 +147,7 @@ impl Ctl {
                 }
             });
         }
-        let audio =
-            with_audio.then(|| AudioSink::Media(paper_audio::GatedAudio::new(video, mute, volume)));
-        Self {
-            rx,
-            audio,
-            mute,
-            volume,
-            paused: false,
-            ducked: false,
-            freeze: None,
-            capture: None,
-            wake,
-            output_pauses: Vec::new(),
-            route_output_pauses: false,
-            pointer: None,
-            pointer_revision: 0,
-            surface_changed: false,
-        }
+        Self::from_channel(rx, wake, video, mute, volume, with_audio)
     }
 
     #[cfg(test)]
@@ -155,15 +158,22 @@ impl Ctl {
             mute: true,
             volume: 80,
             paused: false,
+            frozen_at: None,
             ducked: false,
             freeze: None,
+            freeze_restore: None,
+            snapshot: None,
+            retained_outputs: None,
             capture: None,
-            wake: None,
+            wake: paper_runtime::wake::make_pipe(),
             output_pauses: Vec::new(),
             route_output_pauses: false,
             pointer: None,
             pointer_revision: 0,
             surface_changed: false,
+            system_audio: None,
+            drawing_photo: None,
+            reveal: false,
         }
     }
 
@@ -175,17 +185,23 @@ impl Ctl {
         volume: u32,
         with_audio: bool,
     ) -> Self {
+        let wake = wake.or_else(paper_runtime::wake::make_pipe);
         let volume = volume.min(100);
-        let audio =
-            with_audio.then(|| AudioSink::Media(paper_audio::GatedAudio::new(video, mute, volume)));
+        let playback =
+            paper_control::PlaybackState::from_env().expect("invalid playback environment");
+        let audio = with_audio.then(|| AudioSink::media(video, mute, volume, playback));
         Self {
             rx,
             audio,
             mute,
             volume,
-            paused: false,
-            ducked: false,
+            paused: playback.paused,
+            frozen_at: playback.paused.then(std::time::Instant::now),
+            ducked: playback.ducked,
             freeze: None,
+            freeze_restore: None,
+            snapshot: None,
+            retained_outputs: None,
             capture: None,
             wake,
             output_pauses: Vec::new(),
@@ -193,6 +209,9 @@ impl Ctl {
             pointer: None,
             pointer_revision: 0,
             surface_changed: false,
+            system_audio: None,
+            drawing_photo: None,
+            reveal: false,
         }
     }
 
@@ -210,17 +229,38 @@ impl Ctl {
         }
     }
 
-    pub fn set_scene_voices(&mut self, voices: Vec<paper_audio::Voice>) {
+    pub fn scene_voice_states(&self) -> Vec<(String, bool)> {
+        match &self.audio {
+            Some(AudioSink::Scene(scene)) => scene.voice_states(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn set_scene_voices(
+        &mut self,
+        voices: Vec<paper_audio::Voice>,
+        tap: Option<paper_audio::PlaybackTap>,
+    ) {
         if voices.is_empty() {
             self.audio = None;
             return;
         }
+        let config = paper_audio::SceneConfig {
+            mute: self.mute,
+            volume: self.volume,
+            wake: self.wake.clone(),
+            tap,
+        };
         match &mut self.audio {
-            Some(AudioSink::Scene(scene)) => scene.swap(voices, self.mute, self.volume),
+            Some(AudioSink::Scene(scene)) => scene.swap(voices, config),
             _ => {
-                let mut scene = paper_audio::GatedScene::new(voices, self.mute, self.volume);
+                let mut scene = paper_audio::GatedScene::new(
+                    voices,
+                    paper_audio::SceneConfig { mute: true, ..config },
+                );
                 scene.set_pause(self.paused);
                 scene.set_duck(self.ducked);
+                scene.set_mute(self.mute);
                 self.audio = Some(AudioSink::Scene(scene));
             }
         }
@@ -247,29 +287,68 @@ impl Ctl {
                 swap = Some(req);
             }
         }
+        if let Some(AudioSink::Scene(scene)) = &self.audio {
+            scene.poll();
+        }
         swap
     }
 
+    fn hold(&mut self) {
+        self.freeze_restore
+            .get_or_insert(FreezeState { paused: self.paused, frozen_at: self.frozen_at });
+        self.paused = true;
+        self.frozen_at.get_or_insert_with(std::time::Instant::now);
+        if let Some(audio) = &mut self.audio {
+            audio.set_pause(true);
+        }
+    }
+
     pub fn set_paused(&mut self, paused: bool) {
+        if let Some(previous) = self.freeze_restore.take() {
+            self.frozen_at = previous.frozen_at;
+        }
         self.paused = paused;
+        if !paused {
+            self.frozen_at = None;
+        }
         if let Some(audio) = &mut self.audio {
             audio.set_pause(paused);
         }
     }
 
     pub fn freeze_pending(&self) -> bool {
-        self.freeze.is_some()
+        self.freeze.is_some() || self.snapshot.is_some()
     }
 
-    pub fn take_freeze(&mut self) -> Option<String> {
-        self.freeze.take()
+    pub fn snapshot_output(&self) -> Option<&str> {
+        self.snapshot.as_ref().map(|snapshot| snapshot.output.as_str())
+    }
+
+    pub fn snapshots_surface(&self, name: &str) -> bool {
+        self.snapshot.as_ref().is_none_or(|snapshot| {
+            snapshot.output == paper_control::ALL_OUTPUT || snapshot.output == name
+        })
+    }
+
+    pub fn take_freeze(&mut self) -> Option<(String, bool)> {
+        self.snapshot
+            .take()
+            .map(|snapshot| (snapshot.path, false))
+            .or_else(|| self.freeze.take().map(|path| (path, true)))
+    }
+
+    pub fn finish_freeze(&mut self) {
+        self.freeze_restore = None;
     }
 
     pub fn cancel_freeze(&mut self) {
         self.freeze = None;
-        self.paused = false;
-        if let Some(audio) = &mut self.audio {
-            audio.set_pause(false);
+        if let Some(previous) = self.freeze_restore.take() {
+            self.paused = previous.paused;
+            self.frozen_at = previous.frozen_at;
+            if let Some(audio) = &mut self.audio {
+                audio.set_pause(self.paused);
+            }
         }
     }
 
@@ -285,7 +364,28 @@ impl Ctl {
         std::mem::take(&mut self.output_pauses)
     }
 
+    pub fn system_audio(&self) -> Option<bool> {
+        self.system_audio
+    }
+
     fn reduce(&mut self, mut cmd: PaperCommand) -> Option<SwapReq> {
+        if let Some(enabled) = cmd.system_audio.take() {
+            self.system_audio = Some(enabled);
+        }
+        if let Some(photo) = cmd.drawing_photo.take() {
+            self.drawing_photo = Some(photo);
+        }
+        if let Some(snapshot) = cmd.snapshot.take() {
+            if cmd.pause == Some(true) {
+                self.hold();
+            }
+            self.snapshot = Some(*snapshot);
+            return None;
+        }
+        if cmd.reveal == Some(true) {
+            self.reveal = true;
+            return None;
+        }
         if let Some(capture) = cmd.capture.take() {
             self.capture = Some(capture);
             return None;
@@ -319,18 +419,12 @@ impl Ctl {
             }
             paper_control::CommandClass::Freeze(path) => {
                 tracing::info!(path, "skwd-wall-vk: freeze frame requested");
-                self.paused = true;
+                self.hold();
                 self.freeze = Some(path);
-                if let Some(audio) = &mut self.audio {
-                    audio.set_pause(true);
-                }
                 None
             }
             paper_control::CommandClass::Pause(paused) => {
-                self.paused = paused;
-                if let Some(audio) = &mut self.audio {
-                    audio.set_pause(paused);
-                }
+                self.set_paused(paused);
                 None
             }
             paper_control::CommandClass::Duck(ducked) => {
@@ -340,7 +434,10 @@ impl Ctl {
                 }
                 None
             }
-            paper_control::CommandClass::RetainOutputs(_) => None,
+            paper_control::CommandClass::RetainOutputs(outputs) => {
+                self.retained_outputs = Some(outputs);
+                None
+            }
             paper_control::CommandClass::Audio { mute, volume } => {
                 if let Some(mute) = mute {
                     self.mute = mute;
@@ -360,6 +457,7 @@ impl Ctl {
                 self.mute = swap.mute.unwrap_or(true);
                 self.volume = swap.volume.unwrap_or(80).min(100);
                 Some(SwapReq {
+                    drawing: swap.drawing.map(|drawing| *drawing),
                     to: swap.to,
                     duration_ms: swap.duration_ms.unwrap_or(0),
                     shader: swap.shader,
@@ -374,9 +472,12 @@ impl Ctl {
             match &mut self.audio {
                 Some(AudioSink::Media(audio)) => audio.swap(path, self.mute, self.volume),
                 _ => {
-                    let mut audio = paper_audio::GatedAudio::new(path, self.mute, self.volume);
-                    audio.set_duck(self.ducked);
-                    self.audio = Some(AudioSink::Media(audio));
+                    self.audio = Some(AudioSink::media(
+                        path,
+                        self.mute,
+                        self.volume,
+                        paper_control::PlaybackState { paused: self.paused, ducked: self.ducked },
+                    ));
                 }
             }
         } else {

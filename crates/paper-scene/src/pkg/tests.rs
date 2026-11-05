@@ -92,3 +92,17 @@ fn declared_scene_errors_do_not_fall_back_or_read_external_files() {
         assert!(error.contains(file), "{error}");
     }
 }
+
+#[test]
+fn paths_ignore_case() {
+    let package = Package::parse(crate::tests::build_pkg(&[
+        ("models/BackGround/background.mdl", b"folded"),
+        ("models/case/a.json", b"lower"),
+        ("models/Case/a.json", b"upper"),
+    ]))
+    .unwrap();
+    assert_eq!(package.find("models/background/background.mdl"), Some(&b"folded"[..]));
+    assert_eq!(package.find("models/Case/a.json"), Some(&b"upper"[..]));
+    assert_eq!(package.find("MODELS/CASE/A.JSON"), Some(&b"lower"[..]));
+    assert!(package.find("models/missing.mdl").is_none());
+}

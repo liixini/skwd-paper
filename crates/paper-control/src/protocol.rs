@@ -9,23 +9,16 @@ pub use paper_geom::FillMode;
 
 pub const PROTOCOL_NAME: &str = "skwd-paper";
 pub const PROTOCOL_VERSION: u32 = 1;
+const MISSING_AUDIO_CHANGE: &str = "audio update requires mute, volume, duck or spectrum source";
+pub const ALL_OUTPUT: &str = "*";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {
     Static,
     Video,
     #[serde(rename = "we")]
     WallpaperEngine,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VideoEngine {
-    #[default]
-    #[serde(alias = "regular", alias = "tiny")]
-    Default,
-    Tinier,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +49,10 @@ pub enum SandScope {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitionPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawing_source: Option<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawing: Option<crate::DrawingTransition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fps: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
@@ -67,14 +64,22 @@ pub struct TransitionPolicy {
 
 impl TransitionPolicy {
     pub fn effect(&self) -> &str {
-        self.effect.as_deref().unwrap_or("fade")
+        self.effect.as_deref().unwrap_or(crate::transitions::DEFAULT_EFFECT)
     }
 
     pub fn duration_ms(&self) -> u64 {
-        self.duration_ms.unwrap_or(600)
+        self.duration_ms.unwrap_or_else(|| crate::transitions::transition_duration(self.effect()))
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if self
+            .drawing_source
+            .as_ref()
+            .is_some_and(|source| !source.is_absolute() || self.drawing.is_none())
+            || self.drawing.is_some() != (self.effect() == crate::DRAWING_EFFECT)
+        {
+            return Err(ValidationError::InvalidTransitionEffect(self.effect().into()));
+        }
         if let Some(from) = &self.from {
             if from.trim().is_empty() {
                 return Err(ValidationError::EmptyTransitionFrom);
@@ -98,7 +103,12 @@ impl TransitionPolicy {
             return Err(ValidationError::TransitionFpsOutOfRange(fps));
         }
         let duration_ms = self.duration_ms();
-        if !(50..=10_000).contains(&duration_ms) {
+        let maximum = if self.drawing.is_some() {
+            crate::DRAWING_DURATION_MAX
+        } else {
+            crate::transitions::MAX_DURATION_MS
+        };
+        if !(crate::transitions::MIN_DURATION_MS..=maximum).contains(&duration_ms) {
             return Err(ValidationError::TransitionDurationOutOfRange(duration_ms));
         }
         Ok(())
@@ -154,6 +164,24 @@ pub struct SurfacePolicy {
     pub blur: u32,
     #[serde(default)]
     pub dim: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceOverridesRequest {
+    pub surfaces: BTreeMap<SourceKind, SurfacePolicy>,
+}
+
+impl SurfaceOverridesRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let namespace = self.surfaces.values().next().map(|surface| &surface.namespace);
+        for surface in self.surfaces.values() {
+            surface.validate()?;
+            if Some(&surface.namespace) != namespace {
+                return Err(ValidationError::InvalidSurfacePolicy);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,10 +278,6 @@ pub struct Source {
     pub kind: SourceKind,
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub engine: Option<VideoEngine>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_rate: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -262,43 +286,15 @@ pub const MAX_SCENE_PROPERTY_NAME: usize = 128;
 
 impl Source {
     pub fn static_file(path: impl Into<String>) -> Self {
-        Self {
-            kind: SourceKind::Static,
-            path: path.into(),
-            engine: None,
-            frame_rate: None,
-            properties: None,
-        }
+        Self { kind: SourceKind::Static, path: path.into(), properties: None }
     }
 
-    pub fn video(path: impl Into<String>, engine: Option<VideoEngine>) -> Self {
-        Self {
-            kind: SourceKind::Video,
-            path: path.into(),
-            engine,
-            frame_rate: None,
-            properties: None,
-        }
-    }
-
-    pub fn tinier_video(path: impl Into<String>, frame_rate: impl Into<String>) -> Self {
-        Self {
-            kind: SourceKind::Video,
-            path: path.into(),
-            engine: Some(VideoEngine::Tinier),
-            frame_rate: Some(frame_rate.into()),
-            properties: None,
-        }
+    pub fn video(path: impl Into<String>) -> Self {
+        Self { kind: SourceKind::Video, path: path.into(), properties: None }
     }
 
     pub fn wallpaper_engine(path: impl Into<String>) -> Self {
-        Self {
-            kind: SourceKind::WallpaperEngine,
-            path: path.into(),
-            engine: None,
-            frame_rate: None,
-            properties: None,
-        }
+        Self { kind: SourceKind::WallpaperEngine, path: path.into(), properties: None }
     }
 
     #[must_use]
@@ -310,22 +306,12 @@ impl Source {
         self
     }
 
-    pub fn effective_video_engine(&self) -> Option<VideoEngine> {
-        (self.kind == SourceKind::Video).then_some(self.engine.unwrap_or_default())
-    }
-
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.path.trim().is_empty() {
             return Err(ValidationError::EmptySourcePath);
         }
         if self.path.starts_with('-') {
             return Err(ValidationError::SourcePathStartsWithDash);
-        }
-        if self.kind != SourceKind::Video && self.engine.is_some() {
-            return Err(ValidationError::EngineNotAllowed(self.kind));
-        }
-        if self.kind != SourceKind::Video && self.frame_rate.is_some() {
-            return Err(ValidationError::FrameRateNotAllowed(self.kind));
         }
         if let Some(properties) = &self.properties {
             if self.kind != SourceKind::WallpaperEngine {
@@ -340,41 +326,8 @@ impl Source {
                 }
             }
         }
-        if let Some(frame_rate) = &self.frame_rate {
-            validate_frame_rate(frame_rate)?;
-        }
-        if self.effective_video_engine() == Some(VideoEngine::Tinier) && self.frame_rate.is_none() {
-            return Err(ValidationError::TinierFrameRateRequired);
-        }
-        if self.effective_video_engine() != Some(VideoEngine::Tinier) && self.frame_rate.is_some() {
-            return Err(ValidationError::FrameRateRequiresTinier);
-        }
         Ok(())
     }
-}
-
-fn validate_frame_rate(value: &str) -> Result<(), ValidationError> {
-    let (numerator, denominator) = match value.split_once('/') {
-        Some((left, right)) if !right.contains('/') => (left, right),
-        Some(_) => return Err(ValidationError::InvalidFrameRate(value.to_string())),
-        None => (value, "1"),
-    };
-    let parse = |part: &str| {
-        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        part.parse::<u32>().ok().filter(|part| *part > 0)
-    };
-    let Some(numerator) = parse(numerator) else {
-        return Err(ValidationError::InvalidFrameRate(value.to_string()));
-    };
-    let Some(denominator) = parse(denominator) else {
-        return Err(ValidationError::InvalidFrameRate(value.to_string()));
-    };
-    if u64::from(numerator) > u64::from(denominator) * 240 {
-        return Err(ValidationError::InvalidFrameRate(value.to_string()));
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +342,8 @@ pub struct Assignment {
     pub mute: bool,
     #[serde(default = "default_volume", skip_serializing_if = "is_assignment_default")]
     pub volume: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "is_assignment_default")]
     pub layer: Layer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -404,6 +359,7 @@ impl Assignment {
             background: crate::Background::default(),
             mute: default_mute(),
             volume: default_volume(),
+            system_audio: None,
             layer: Layer::default(),
             transition: None,
         }
@@ -438,23 +394,6 @@ impl ApplyRequest {
                 return Err(ValidationError::AssignmentWithoutOutputs);
             }
             assignment.source.validate()?;
-            if assignment.source.effective_video_engine() == Some(VideoEngine::Tinier) {
-                if assignment.outputs.iter().any(|output| output == "*") {
-                    return Err(ValidationError::TinierWildcardNotSupported);
-                }
-                if assignment.fill_mode != FillMode::Fill {
-                    return Err(ValidationError::TinierFillModeNotSupported(assignment.fill_mode));
-                }
-                if assignment.layer != Layer::Background {
-                    return Err(ValidationError::TinierLayerNotSupported(assignment.layer));
-                }
-                if assignment.transition.is_some() {
-                    return Err(ValidationError::TinierTransitionNotSupported);
-                }
-                if !assignment.mute {
-                    return Err(ValidationError::TinierAudioNotSupported);
-                }
-            }
             if assignment.volume > 100 {
                 return Err(ValidationError::VolumeOutOfRange(assignment.volume));
             }
@@ -464,6 +403,12 @@ impl ApplyRequest {
             }
             if let Some(transition) = &assignment.transition {
                 transition.validate()?;
+                if transition.drawing.is_some()
+                    && assignment.source.kind != SourceKind::Static
+                    && transition.drawing_source.is_none()
+                {
+                    return Err(ValidationError::TransitionNotAllowed(assignment.source.kind));
+                }
             }
             for output in &assignment.outputs {
                 if output.trim().is_empty() {
@@ -492,15 +437,13 @@ impl ApplyRequest {
         }
         if let Some(policy) = &self.policy {
             policy.validate()?;
-            if policy.surface.is_some()
-                && self.assignments.iter().any(|assignment| {
-                    assignment.source.effective_video_engine() == Some(VideoEngine::Tinier)
-                })
-            {
-                return Err(ValidationError::InvalidSurfacePolicy);
-            }
             if policy.transitions_enabled == Some(false)
-                && self.assignments.iter().any(|assignment| assignment.transition.is_some())
+                && self.assignments.iter().any(|assignment| {
+                    assignment
+                        .transition
+                        .as_ref()
+                        .is_some_and(|transition| transition.drawing.is_none())
+                })
             {
                 return Err(ValidationError::TransitionsDisabled);
             }
@@ -548,25 +491,50 @@ pub struct CapabilitiesRequest {
     pub reset_decode_cache: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PauseRequest {
     pub paused: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overrides: BTreeMap<String, bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<String>,
+}
+
+impl PauseRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        StopRequest { outputs: self.outputs.clone() }.validate()?;
+        if !self.overrides.is_empty() {
+            if self.outputs != [ALL_OUTPUT] || self.overrides.contains_key(ALL_OUTPUT) {
+                return Err(ValidationError::InvalidPauseOverrides);
+            }
+            StopRequest { outputs: self.overrides.keys().cloned().collect() }.validate()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioSetRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duck: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mute: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio: Option<bool>,
 }
 
 impl AudioSetRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         StopRequest { outputs: self.outputs.clone() }.validate()?;
-        if self.mute.is_none() && self.volume.is_none() {
+        if self.mute.is_none()
+            && self.volume.is_none()
+            && self.system_audio.is_none()
+            && self.duck.is_none()
+        {
             return Err(ValidationError::MissingAudioChange);
         }
         if let Some(volume) = self.volume
@@ -592,7 +560,7 @@ pub struct RendererFailed {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     #[serde(default)]
     pub id: u64,
@@ -610,10 +578,16 @@ impl Request {
             RequestParams::Mirror(request) => request.validate(),
             RequestParams::Apply(request) => request.validate(),
             RequestParams::Stop(request) => request.validate(),
-            RequestParams::AudioSet(request) => request.validate(),
+            RequestParams::AudioSet(request) | RequestParams::PlaybackAudio(request) => {
+                request.validate()
+            }
             RequestParams::SurfaceSet(request) => request.validate(),
-            RequestParams::Pause(_)
-            | RequestParams::Status(_)
+            RequestParams::SurfaceOverrides(request) => request.validate(),
+            RequestParams::Widgets(scene) => scene.validate(),
+            RequestParams::Pause(request) | RequestParams::PlaybackPause(request) => {
+                request.validate()
+            }
+            RequestParams::Status(_)
             | RequestParams::Capabilities(_)
             | RequestParams::Ready(_)
             | RequestParams::Failed(_) => Ok(()),
@@ -621,7 +595,7 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum RequestParams {
     #[serde(rename = "paper.mirror")]
@@ -632,10 +606,18 @@ pub enum RequestParams {
     Stop(StopRequest),
     #[serde(rename = "paper.pause")]
     Pause(PauseRequest),
+    #[serde(rename = "paper.playback.pause")]
+    PlaybackPause(PauseRequest),
+    #[serde(rename = "paper.playback.audio")]
+    PlaybackAudio(AudioSetRequest),
     #[serde(rename = "paper.audio.set")]
     AudioSet(AudioSetRequest),
     #[serde(rename = "paper.surface.set")]
     SurfaceSet(SurfacePolicy),
+    #[serde(rename = "paper.surface.overrides")]
+    SurfaceOverrides(SurfaceOverridesRequest),
+    #[serde(rename = "paper.widgets")]
+    Widgets(Box<crate::WidgetScene>),
     #[serde(rename = "paper.status")]
     Status(StatusRequest),
     #[serde(rename = "paper.capabilities")]
@@ -655,6 +637,8 @@ pub struct AssignmentStatus {
     pub background: crate::Background,
     pub mute: bool,
     pub volume: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio: Option<bool>,
     pub layer: Layer,
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -676,6 +660,7 @@ impl AssignmentStatus {
             background: assignment.background,
             mute: assignment.mute,
             volume: assignment.volume,
+            system_audio: assignment.system_audio,
             layer: assignment.layer,
             generation,
             pid,
@@ -721,8 +706,12 @@ pub struct AudioSetResult {
     pub assignments: Vec<AssignmentStatus>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlCapabilities {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surface_kinds: Vec<SourceKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub playback: Vec<PlaybackControl>,
     #[serde(default)]
     pub mirror: bool,
     pub pause: bool,
@@ -731,8 +720,19 @@ pub struct ControlCapabilities {
     pub surface_effects: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackControl {
+    ScopedPause,
+    Duck,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitionCapabilities {
+    #[serde(default)]
+    pub drawing: bool,
+    #[serde(default)]
+    pub drawing_max_duration_ms: u64,
     pub startup_source_kinds: Vec<SourceKind>,
     pub static_overlay: bool,
     pub default_effect: String,
@@ -777,7 +777,6 @@ pub struct DecodeCapabilities {
 pub enum RendererDiscovery {
     Configured,
     Sibling,
-    PrivateSibling,
     Path,
     Injected,
     #[default]
@@ -789,7 +788,6 @@ impl RendererDiscovery {
         match self {
             Self::Configured => "configured",
             Self::Sibling => "sibling",
-            Self::PrivateSibling => "private_sibling",
             Self::Path => "path",
             Self::Injected => "injected",
             Self::Unresolved => "unresolved",
@@ -808,8 +806,6 @@ pub struct RuntimeDependencyStatus {
 pub struct RendererCapability {
     pub executable: String,
     pub source_kinds: Vec<SourceKind>,
-    #[serde(default)]
-    pub video_engines: Vec<VideoEngine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub discovery: RendererDiscovery,
@@ -832,7 +828,6 @@ pub struct CapabilitiesResult {
     pub protocol: String,
     pub version: u32,
     pub source_kinds: Vec<SourceKind>,
-    pub video_engines: Vec<VideoEngine>,
     pub fill_modes: Vec<FillMode>,
     pub layers: Vec<Layer>,
     #[serde(default)]
@@ -855,22 +850,29 @@ impl CapabilitiesResult {
             protocol: PROTOCOL_NAME.to_string(),
             version: PROTOCOL_VERSION,
             source_kinds: vec![SourceKind::Static, SourceKind::Video, SourceKind::WallpaperEngine],
-            video_engines: vec![VideoEngine::Default, VideoEngine::Tinier],
             fill_modes: FillMode::ALL.to_vec(),
             layers: vec![Layer::Background, Layer::Bottom, Layer::Top, Layer::Overlay],
             controls: ControlCapabilities {
+                surface_kinds: vec![
+                    SourceKind::Static,
+                    SourceKind::Video,
+                    SourceKind::WallpaperEngine,
+                ],
+                playback: vec![PlaybackControl::ScopedPause, PlaybackControl::Duck],
                 mirror: true,
                 pause: true,
                 audio: true,
                 surface_effects: true,
             },
             transitions: TransitionCapabilities {
+                drawing: true,
+                drawing_max_duration_ms: crate::DRAWING_DURATION_MAX,
                 startup_source_kinds: vec![SourceKind::Video, SourceKind::WallpaperEngine],
                 static_overlay: true,
-                default_effect: "fade".to_string(),
-                default_duration_ms: 600,
-                min_duration_ms: 50,
-                max_duration_ms: 10_000,
+                default_effect: crate::transitions::DEFAULT_EFFECT.to_string(),
+                default_duration_ms: crate::transitions::DEFAULT_DURATION_MS,
+                min_duration_ms: crate::transitions::MIN_DURATION_MS,
+                max_duration_ms: crate::transitions::MAX_DURATION_MS,
             },
             renderer_policy: RendererPolicyCapabilities {
                 surface: true,
@@ -974,6 +976,7 @@ pub type CapabilitiesResponse = Response<CapabilitiesResult>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    InvalidPauseOverrides,
     InvalidMirrorTarget,
     LoadTimeoutOutOfRange(u64),
     InvalidSurfacePolicy,
@@ -982,16 +985,6 @@ pub enum ValidationError {
     EmptyOutput,
     EmptySourcePath,
     SourcePathStartsWithDash,
-    EngineNotAllowed(SourceKind),
-    FrameRateNotAllowed(SourceKind),
-    FrameRateRequiresTinier,
-    TinierFrameRateRequired,
-    InvalidFrameRate(String),
-    TinierFillModeNotSupported(FillMode),
-    TinierLayerNotSupported(Layer),
-    TinierTransitionNotSupported,
-    TinierAudioNotSupported,
-    TinierWildcardNotSupported,
     TransitionNotAllowed(SourceKind),
     EmptyTransitionFrom,
     TransitionFromStartsWithDash,
@@ -1017,11 +1010,25 @@ pub enum ValidationError {
     PropertiesNotAllowed(SourceKind),
     TooManySceneProperties(usize),
     InvalidScenePropertyName(String),
+    TooManyWidgets(usize),
+    TooManyOutlines(usize),
+    InvalidWidgetPin,
+    InvalidWidgetHeight,
+    RelativeWidgetPath,
 }
 
 impl Display for ValidationError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TooManyWidgets(count) => write!(formatter, "too many widgets: {count}"),
+            Self::TooManyOutlines(count) => write!(formatter, "too many widget outlines: {count}"),
+            Self::InvalidWidgetPin => {
+                formatter.write_str("widget anchors must be within the output and offsets finite")
+            }
+            Self::InvalidWidgetHeight => formatter.write_str("widget height is out of range"),
+            Self::RelativeWidgetPath => {
+                formatter.write_str("widget font and outline paths must be absolute")
+            }
             Self::InvalidMirrorTarget => {
                 write!(formatter, "mirror requires one output and an absolute socket path")
             }
@@ -1040,36 +1047,6 @@ impl Display for ValidationError {
             Self::SourcePathStartsWithDash => {
                 formatter.write_str("source path must not start with a hyphen")
             }
-            Self::EngineNotAllowed(kind) => {
-                write!(formatter, "video engine is not valid for {kind:?} sources")
-            }
-            Self::FrameRateNotAllowed(kind) => {
-                write!(formatter, "frame rate is not valid for {kind:?} sources")
-            }
-            Self::FrameRateRequiresTinier => {
-                formatter.write_str("frame rate is only valid for the tinier video engine")
-            }
-            Self::TinierFrameRateRequired => {
-                formatter.write_str("the tinier video engine requires a frame rate")
-            }
-            Self::InvalidFrameRate(value) => {
-                write!(formatter, "invalid frame rate '{value}'")
-            }
-            Self::TinierFillModeNotSupported(mode) => {
-                write!(formatter, "the tinier video engine does not support {mode:?} placement")
-            }
-            Self::TinierLayerNotSupported(layer) => {
-                write!(formatter, "the tinier video engine does not support the {layer:?} layer")
-            }
-            Self::TinierTransitionNotSupported => {
-                formatter.write_str("the tinier video engine does not support transitions")
-            }
-            Self::TinierAudioNotSupported => {
-                formatter.write_str("the tinier video engine does not support audio")
-            }
-            Self::TinierWildcardNotSupported => {
-                formatter.write_str("the tinier video engine requires named outputs")
-            }
             Self::TransitionNotAllowed(kind) => {
                 write!(formatter, "transitions are not supported for {kind:?} sources")
             }
@@ -1084,7 +1061,10 @@ impl Display for ValidationError {
             }
             Self::TransitionFpsOutOfRange(fps) => write!(formatter, "invalid transition FPS {fps}"),
             Self::TransitionDurationOutOfRange(duration_ms) => {
-                write!(formatter, "transition duration {duration_ms} is outside 50..=10000 ms")
+                write!(
+                    formatter,
+                    "transition duration {duration_ms} is outside the supported range"
+                )
             }
             Self::TransitionsDisabled => formatter
                 .write_str("assignment transitions conflict with disabled renderer transitions"),
@@ -1106,7 +1086,10 @@ impl Display for ValidationError {
             Self::WildcardMixed => {
                 formatter.write_str("wildcard output cannot be combined with other outputs")
             }
-            Self::MissingAudioChange => formatter.write_str("audio update requires mute or volume"),
+            Self::MissingAudioChange => formatter.write_str(MISSING_AUDIO_CHANGE),
+            Self::InvalidPauseOverrides => {
+                write!(formatter, "pause overrides require explicit global scope and named outputs")
+            }
             Self::SandFpsOutOfRange(fps) => {
                 write!(formatter, "sand FPS {fps} is outside the range 1..=1000")
             }

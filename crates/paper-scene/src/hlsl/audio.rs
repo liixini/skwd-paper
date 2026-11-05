@@ -19,8 +19,35 @@ fn subscript(text: &str) -> Option<(&str, &str)> {
     None
 }
 
+fn sized_aliases(source: &str, uniforms: &[Uniform]) -> String {
+    const FLOAT_DECL: &str = "float ";
+    const INFERRED_ARRAY: &str = "[]";
+    let mut out = String::with_capacity(source.len());
+    for line in source.lines() {
+        let declaration = line
+            .trim_start()
+            .strip_prefix(FLOAT_DECL)
+            .and_then(|line| line.split_once('='))
+            .and_then(|(name, source)| {
+                let name = name.trim().strip_suffix(INFERRED_ARRAY)?.trim();
+                let source = source.trim().trim_end_matches(';').trim();
+                let uniform = uniforms.iter().find(|uniform| {
+                    uniform.name.split('[').next() == Some(source) && uniform.count > 1
+                })?;
+                Some((name, source, uniform.count))
+            });
+        if let Some((name, source, count)) = declaration {
+            let _ = writeln!(out, "{FLOAT_DECL}{name}[{count}] = {source};");
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 pub(super) fn flatten(source: &str, uniforms: &[Uniform]) -> String {
-    let mut source = source.to_owned();
+    let mut source = sized_aliases(source, uniforms);
     for uniform in uniforms {
         let name = uniform.name.split('[').next().unwrap_or(&uniform.name);
         if uniform.kind != UniformKind::Float

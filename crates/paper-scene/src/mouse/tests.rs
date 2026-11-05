@@ -1,6 +1,42 @@
 use super::*;
 
 #[test]
+fn shake_matches_engine() {
+    let shake = Shake { amplitude: 2.0, speed: 0.5, roughness: 1.0 };
+    let cases = [
+        (None, [0.108_060_46, 0.194_371_9, 0.168_294_2]),
+        (Some(1000.0), [10.806_046, 19.437_19, 0.0]),
+    ];
+    for (height, expected) in cases {
+        let actual = shake.eye_offset(4.0, height);
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-4, "{height:?} {actual}");
+        }
+    }
+}
+
+#[test]
+fn shake_probe_offset() {
+    let still = Shake { amplitude: 3.0, speed: 0.0, roughness: 1.0 };
+    assert_eq!(still.eye_offset(20.0, Some(1080.0)), [32.4, 0.0, 0.0]);
+    let deep = Shake { amplitude: 10.0, speed: 0.0, roughness: 1.0 };
+    assert_eq!(deep.eye_offset(20.0, None), [1.0, 0.0, 0.0]);
+}
+
+#[test]
+fn shake_roughness_bends() {
+    let shake = Shake { amplitude: 10.0, speed: 1.0, roughness: 2.0 };
+    let rough = shake.eye_offset(1.0, None);
+    for (actual, expected) in rough.iter().zip([5.539_531_7, 9.964_137, 8.627_309]) {
+        assert!((actual - expected).abs() < 1e-3, "{rough:?}");
+    }
+    let smooth = Shake { roughness: 0.0, ..shake }.eye_offset(1.0, None);
+    for (actual, expected) in smooth.iter().zip([0.540_302_3, 0.971_859_4, 0.841_471]) {
+        assert!((actual - expected).abs() < 1e-5, "{smooth:?}");
+    }
+}
+
+#[test]
 fn clock_follows_world_position_and_offsets_shadow_away_from_pointer() {
     let clock = Clock3d { origin: [500.0, 200.0] };
     let canvas = [1000.0, 800.0];

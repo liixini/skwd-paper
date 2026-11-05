@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 
 const ALL_OUTPUT: &str = "*";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StillCommand {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<crate::FrameSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<crate::SurfacePolicy>,
     #[serde(default)]
@@ -20,6 +22,8 @@ pub struct StillCommand {
     pub fill: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror: Option<MirrorTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widgets: Option<crate::WidgetScene>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +48,7 @@ impl MirrorTarget {
 impl StillCommand {
     pub fn new(path: &str) -> Self {
         Self {
+            snapshot: None,
             surface: None,
             path: path.to_string(),
             reveal: false,
@@ -52,6 +57,7 @@ impl StillCommand {
             preload: Vec::new(),
             fill: None,
             mirror: None,
+            widgets: None,
         }
     }
 
@@ -68,6 +74,7 @@ impl StillCommand {
 
     pub fn slide(path: &str, direction: &str, duration_ms: u64) -> Self {
         Self {
+            snapshot: None,
             surface: None,
             path: path.to_string(),
             reveal: false,
@@ -76,11 +83,13 @@ impl StillCommand {
             preload: Vec::new(),
             fill: None,
             mirror: None,
+            widgets: None,
         }
     }
 
     pub fn preload(paths: Vec<String>) -> Self {
         Self {
+            snapshot: None,
             surface: None,
             path: String::new(),
             reveal: false,
@@ -89,6 +98,7 @@ impl StillCommand {
             preload: paths,
             fill: None,
             mirror: None,
+            widgets: None,
         }
     }
 

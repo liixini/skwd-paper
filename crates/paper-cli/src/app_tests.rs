@@ -109,44 +109,6 @@ fn transition_policy() {
 }
 
 #[test]
-fn tinier_ivf_source() {
-    let cli = <crate::cli::Cli as Parser>::try_parse_from([
-        "skwd-paper",
-        "apply",
-        "DP-1",
-        "/wall/loop.ivf",
-        "--engine",
-        "tinier",
-        "--frame-rate",
-        "30000/1001",
-    ])
-    .unwrap();
-    let crate::cli::Command::Apply(args) = cli.command else { panic!("expected apply") };
-    let request = apply_request(args).unwrap();
-    let source = &request.assignments[0].source;
-    assert_eq!(source.engine, Some(VideoEngine::Tinier));
-    assert_eq!(source.frame_rate.as_deref(), Some("30000/1001"));
-}
-
-#[test]
-fn engine_aliases() {
-    for value in ["default", "regular", "tiny"] {
-        let cli = <crate::cli::Cli as Parser>::try_parse_from([
-            "skwd-paper",
-            "apply",
-            "DP-1",
-            "/wall/loop.mp4",
-            "--engine",
-            value,
-        ])
-        .unwrap();
-        let crate::cli::Command::Apply(args) = cli.command else { panic!("expected apply") };
-        let request = apply_request(args).unwrap();
-        assert_eq!(request.assignments[0].source.engine, Some(VideoEngine::Default));
-    }
-}
-
-#[test]
 fn scene_properties_map() {
     let cli = <crate::cli::Cli as Parser>::try_parse_from([
         "skwd-paper",

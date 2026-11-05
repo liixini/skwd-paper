@@ -11,11 +11,11 @@ pub fn reexec(_args: Vec<std::ffi::CString>) -> String {
     String::from("reexec unsupported on this platform")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "shared-device")))]
 static REEXEC: std::sync::OnceLock<std::sync::mpsc::SyncSender<Vec<std::ffi::CString>>> =
     std::sync::OnceLock::new();
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "shared-device")))]
 pub fn arm_reexec() {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     if REEXEC.set(tx).is_err() {
@@ -37,7 +37,7 @@ pub fn arm_reexec() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "shared-device")))]
 pub fn reexec(args: Vec<std::ffi::CString>) -> String {
     let Some(tx) = REEXEC.get() else {
         return String::from("reexec thread not armed");
@@ -83,3 +83,18 @@ const BLOCKED: &[libc::c_long] = &[
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(all(target_os = "linux", feature = "shared-device"))]
+pub(crate) mod broker;
+
+#[cfg(all(target_os = "linux", feature = "shared-device"))]
+pub fn arm_reexec() {
+    if let Err(error) = broker::arm() {
+        tracing::error!("skwd-wall-vk: reexec thread unavailable ({error})");
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "shared-device"))]
+pub fn reexec(arguments: Vec<std::ffi::CString>) -> String {
+    broker::reexec(arguments)
+}

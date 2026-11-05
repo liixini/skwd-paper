@@ -263,3 +263,183 @@ fn stale_instance_tokens_preserve_global_and_target_pause_state() {
     assert_eq!(targets, before);
     assert_eq!(apply_output_pauses(&mut targets, Vec::new()), None);
 }
+
+const CPU_STREAM_VIDEO: &str = "SKWD_PAPER_TEST_CPU_STREAM";
+const CPU_STREAM_PAUSED: &str = "SKWD_PAPER_TEST_CPU_STREAM_PAUSED";
+const CPU_STREAM_OUTPUT: &str = "DP-1";
+const CPU_STREAM_OTHER_OUTPUT: &str = "DP-2";
+const CPU_STREAM_SIZE: u32 = 64;
+const CPU_STREAM_FPS: u32 = 30;
+const CPU_STREAM_FIRST_FRAME: std::time::Duration = std::time::Duration::from_secs(10);
+const CPU_STREAM_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+const CPU_STREAM_QUIET: std::time::Duration = std::time::Duration::from_millis(500);
+const CPU_STREAM_HELD: std::time::Duration = std::time::Duration::from_millis(1500);
+const CPU_STREAM_PACED_FRAMES: usize = 8;
+const CPU_STREAM_PACING_FLOOR: f64 = 0.8;
+
+fn cpu_stream_child() -> Option<()> {
+    let video = std::env::var_os(CPU_STREAM_VIDEO)?;
+    let paused = std::env::var_os(CPU_STREAM_PAUSED).is_some();
+    let stream = StreamTarget {
+        output: CPU_STREAM_OUTPUT.into(),
+        ..StreamTarget::single(NO_SOCKET, CPU_STREAM_SIZE, CPU_STREAM_SIZE, CPU_STREAM_FPS, paused)
+    };
+    video_stream(video.to_str().unwrap(), &stream, true).unwrap();
+    Some(())
+}
+
+struct CpuStream {
+    child: std::process::Child,
+    control: std::process::ChildStdin,
+    frames: std::sync::mpsc::Receiver<Instant>,
+    _directory: tempfile::TempDir,
+}
+
+impl CpuStream {
+    fn start(test: &str, paused: bool) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("motion.mp4");
+        let size =
+            format!("testsrc2=size={CPU_STREAM_SIZE}x{CPU_STREAM_SIZE}:rate={CPU_STREAM_FPS}");
+        let encoded = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", &size, "-t", "10", "-c:v", "mpeg4", "-y"])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(encoded.success());
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--include-ignored"])
+            .env(CPU_STREAM_VIDEO, &video)
+            .env_remove(paper_control::PLAYBACK_ENV)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        if paused {
+            command.env(CPU_STREAM_PAUSED, "1");
+        }
+        let mut child = command.spawn().unwrap();
+        let frames = cpu_frames(child.stdout.take().unwrap());
+        let control = child.stdin.take().unwrap();
+        Self { child, control, frames, _directory: directory }
+    }
+
+    fn send(&mut self, output: Option<&str>, paused: bool) {
+        use std::io::Write;
+        let command = match output {
+            Some(output) => serde_json::json!({"to": output, "pause": paused}),
+            None => serde_json::json!({"pause": paused}),
+        };
+        writeln!(self.control, "{command}").unwrap();
+    }
+
+    fn wait_frames(&self, count: usize) -> Vec<Instant> {
+        (0..count)
+            .map(|_| self.frames.recv_timeout(CPU_STREAM_FIRST_FRAME).expect("stream frame"))
+            .collect()
+    }
+
+    fn drain(&self) {
+        std::thread::sleep(CPU_STREAM_SETTLE);
+        while self.frames.try_recv().is_ok() {}
+    }
+
+    fn holds(&self) -> bool {
+        self.frames.recv_timeout(CPU_STREAM_QUIET).is_err()
+    }
+}
+
+impl Drop for CpuStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn cpu_frames(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<Instant> {
+    use std::io::Read;
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut window = [0u8; 4];
+        while &window != b"SKWP" {
+            window.rotate_left(1);
+            if stdout.read_exact(&mut window[3..]).is_err() {
+                return;
+            }
+        }
+        let mut frame = vec![0u8; 8];
+        stdout.read_exact(&mut frame).unwrap();
+        frame.resize(64 * 64 * 4, 0);
+        while stdout.read_exact(&mut frame).is_ok() && send.send(Instant::now()).is_ok() {}
+    });
+    receive
+}
+
+#[test]
+#[ignore = "requires Vulkan and ffmpeg"]
+fn cpu_stream_honours_pause() {
+    const TEST: &str = "preview::tests::cpu_stream_honours_pause";
+    if cpu_stream_child().is_some() {
+        return;
+    }
+    let mut stream = CpuStream::start(TEST, false);
+    stream.wait_frames(3);
+    stream.send(None, true);
+    stream.drain();
+    assert!(stream.holds(), "frames while paused");
+    stream.send(None, false);
+    stream.wait_frames(1);
+}
+
+#[test]
+#[ignore = "requires Vulkan and ffmpeg"]
+fn cpu_stream_starts_paused() {
+    const TEST: &str = "preview::tests::cpu_stream_starts_paused";
+    if cpu_stream_child().is_some() {
+        return;
+    }
+    let mut stream = CpuStream::start(TEST, true);
+    stream.wait_frames(1);
+    assert!(stream.holds(), "frames while paused");
+    stream.send(None, false);
+    stream.wait_frames(2);
+}
+
+#[test]
+#[ignore = "requires Vulkan and ffmpeg"]
+fn cpu_stream_resumes_paced() {
+    const TEST: &str = "preview::tests::cpu_stream_resumes_paced";
+    if cpu_stream_child().is_some() {
+        return;
+    }
+    let mut stream = CpuStream::start(TEST, false);
+    stream.wait_frames(3);
+    stream.send(None, true);
+    stream.drain();
+    std::thread::sleep(CPU_STREAM_HELD);
+    stream.send(None, false);
+    let frames = stream.wait_frames(CPU_STREAM_PACED_FRAMES);
+    let span = frames[CPU_STREAM_PACED_FRAMES - 1].duration_since(frames[0]);
+    let intervals = (CPU_STREAM_PACED_FRAMES - 1) as f64;
+    let floor = intervals / f64::from(CPU_STREAM_FPS) * CPU_STREAM_PACING_FLOOR;
+    assert!(span.as_secs_f64() >= floor, "resume burst {span:?}");
+}
+
+#[test]
+#[ignore = "requires Vulkan and ffmpeg"]
+fn cpu_stream_output_pause() {
+    const TEST: &str = "preview::tests::cpu_stream_output_pause";
+    if cpu_stream_child().is_some() {
+        return;
+    }
+    let mut stream = CpuStream::start(TEST, false);
+    stream.wait_frames(3);
+    stream.send(Some(CPU_STREAM_OTHER_OUTPUT), true);
+    stream.drain();
+    stream.wait_frames(3);
+    stream.send(Some(CPU_STREAM_OUTPUT), true);
+    stream.drain();
+    assert!(stream.holds(), "frames while output paused");
+    stream.send(Some(CPU_STREAM_OUTPUT), false);
+    stream.wait_frames(1);
+}

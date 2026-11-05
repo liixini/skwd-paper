@@ -8,6 +8,7 @@ authors.workspace = true
 description = "Fill-mode and aspect-placement geometry for skwd-paper renderers"
 
 [dependencies]
+image = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

@@ -94,14 +94,8 @@ fn probe_video(shared: &crate::shared::SharedDevice, path: &str) -> Vec<Attempt>
     let mut attempts = Vec::new();
 
     let (accepted, detail, samples) = time_it(|| {
-        crate::decode::open_decoder(
-            path,
-            Some(shared.hwdev),
-            shared.video_decode,
-            shared.render_node.as_deref(),
-            false,
-        )
-        .map(|_| ())
+        crate::decode::open_decoder(&crate::decode::HardwareDecode::shared(shared, path), false)
+            .map(|_| ())
     });
     attempts.push(Attempt { backend: "cascade", accepted, detail, samples });
 

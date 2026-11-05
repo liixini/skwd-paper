@@ -33,11 +33,25 @@ impl PropertySource {
         }
     }
 
+    pub(super) fn change(
+        &self,
+        directory: &str,
+        properties: &Properties,
+    ) -> paper_scene::effects::customshader::Change {
+        use paper_scene::effects::customshader::{self, Change};
+        if self.directory != directory || self.files.is_none() || self.files != stamps(directory) {
+            return Change::Reload;
+        }
+        paper_control::we_project::Project::resolve(std::path::Path::new(directory))
+            .map_or(Change::Reload, |project| {
+                customshader::change(&project.document, &self.properties, properties)
+            })
+    }
+
     fn accepts(&self, directory: &str, properties: &Properties) -> bool {
-        self.directory == directory
-            && self.properties != *properties
-            && self.files.is_some()
-            && self.files == stamps(directory)
+        self.properties != *properties
+            && self.change(directory, properties)
+                == paper_scene::effects::customshader::Change::Uniforms
     }
 }
 
@@ -67,15 +81,23 @@ impl Group {
         source: &mut PropertySource,
         directory: &str,
         properties: &Properties,
-        mut scene_sound: impl FnMut(&str, paper_audio::VoiceOp),
+        ctl: &mut crate::ctl::Ctl,
     ) -> bool {
+        if source.change(directory, properties)
+            == paper_scene::effects::customshader::Change::Unchanged
+        {
+            source.properties.clone_from(properties);
+            return true;
+        }
         if self.frozen
             || !self.baked_fx_outputs.is_empty()
             || !source.accepts(directory, properties)
         {
             return false;
         }
-        let Some(host) = self.scripts.as_mut().and_then(|s| s.host.as_mut()) else { return false };
+        self.sync_sound_states(ctl);
+        let Some(scripts) = self.scripts.as_mut() else { return false };
+        let Some(host) = scripts.host.as_mut() else { return false };
         let started = std::time::Instant::now();
         let effective = resolved(directory, properties);
         match host.update_properties(&effective) {
@@ -86,12 +108,13 @@ impl Group {
                 return false;
             }
         }
+        scripts.startup_compose = false;
         if let Err(error) = self.compose(self.composed_at, 0.0) {
             tracing::warn!("scene properties need a rebuild: {error:#}");
             return false;
         }
         for (id, op) in self.take_script_sounds() {
-            scene_sound(&id, op);
+            ctl.scene_sound(&id, op);
         }
         source.properties.clone_from(properties);
         tracing::info!(

@@ -5,13 +5,41 @@ fn assignment(outputs: &[&str], source: Source) -> Assignment {
 }
 
 #[test]
+fn drawing_ignores_normal_policy() {
+    for source in [
+        Source::static_file("/wall/image.png"),
+        Source::video("/wall/video.mp4"),
+        Source::wallpaper_engine("/wall/project.json"),
+    ] {
+        let mut target = assignment(&["DP-1"], source);
+        target.transition = Some(TransitionPolicy {
+            from: Some("/wall/previous.png".into()),
+            effect: Some(crate::DRAWING_EFFECT.into()),
+            drawing: Some(crate::DrawingTransition {
+                artifact: "/cache/drawing/manifest.json".into(),
+                colours: crate::DrawingColours::default(),
+                ink: crate::DrawingInk::Plain,
+            }),
+            drawing_source: Some("/cache/drawing/reference.png".into()),
+            ..Default::default()
+        });
+        let request = ApplyRequest {
+            assignments: vec![target],
+            replace_all: false,
+            policy: Some(RendererPolicy { transitions_enabled: Some(false), ..Default::default() }),
+        };
+        assert_eq!(request.validate(), Ok(()));
+    }
+}
+
+#[test]
 fn apply_golden_line() {
     let request = Request::new(
         7,
         RequestParams::Apply(ApplyRequest {
             assignments: vec![
                 assignment(&["DP-1"], Source::static_file("/wall/a.png")),
-                assignment(&["DP-2"], Source::video("/wall/b.mp4", Some(VideoEngine::Default))),
+                assignment(&["DP-2"], Source::video("/wall/b.mp4")),
                 assignment(&["HDMI-A-1"], Source::wallpaper_engine("/scene/forest")),
             ],
             replace_all: true,
@@ -21,7 +49,7 @@ fn apply_golden_line() {
     let golden = concat!(
         r#"{"id":7,"method":"paper.apply","params":{"assignments":["#,
         r#"{"outputs":["DP-1"],"source":{"kind":"static","path":"/wall/a.png"}},"#,
-        r#"{"outputs":["DP-2"],"source":{"kind":"video","path":"/wall/b.mp4","engine":"default"}},"#,
+        r#"{"outputs":["DP-2"],"source":{"kind":"video","path":"/wall/b.mp4"}},"#,
         r#"{"outputs":["HDMI-A-1"],"source":{"kind":"we","path":"/scene/forest"}}"#,
         r#"],"replace_all":true}}"#,
         "\n"
@@ -32,7 +60,7 @@ fn apply_golden_line() {
 }
 
 #[test]
-fn apply_defaults_and_engine() {
+fn apply_defaults() {
     let golden = concat!(
         r#"{"id":8,"method":"paper.apply","params":{"assignments":["#,
         r#"{"outputs":["DP-1"],"source":{"kind":"video","path":"/wall/a.mp4"}}"#,
@@ -48,73 +76,25 @@ fn apply_defaults_and_engine() {
     assert!(apply.assignments[0].mute);
     assert_eq!(apply.assignments[0].volume, 80);
     assert_eq!(apply.assignments[0].layer, Layer::Background);
-    assert_eq!(apply.assignments[0].source.effective_video_engine(), Some(VideoEngine::Default));
     assert_eq!(encode_ndjson(&request).unwrap(), golden);
-
-    for kind in [SourceKind::Static, SourceKind::WallpaperEngine] {
-        let source = Source {
-            kind,
-            path: "/wall/source".into(),
-            engine: Some(VideoEngine::Default),
-            frame_rate: None,
-            properties: None,
-        };
-        assert_eq!(source.validate(), Err(ValidationError::EngineNotAllowed(kind)));
-    }
-    let invalid_engine = concat!(
-        r#"{"id":9,"method":"paper.apply","params":{"assignments":["#,
-        r#"{"outputs":["DP-1"],"source":{"kind":"video","path":"/wall/a.mp4","engine":"fast"}}"#,
-        r#"]}}"#,
-        "\n"
-    );
-    assert!(matches!(decode_ndjson::<Request>(invalid_engine), Err(NdjsonError::Json(_))));
 }
 
 #[test]
-fn tinier_frame_rate_contract() {
-    let source = Source::tinier_video("/wall/loop.ivf", "30000/1001");
-    let request = Request::new(
-        16,
-        RequestParams::Apply(ApplyRequest {
-            assignments: vec![assignment(&["DP-1"], source)],
-            replace_all: false,
-            policy: None,
-        }),
-    );
-    let golden = concat!(
-        r#"{"id":16,"method":"paper.apply","params":{"assignments":["#,
-        r#"{"outputs":["DP-1"],"source":{"kind":"video","path":"/wall/loop.ivf","engine":"tinier","frame_rate":"30000/1001"}}]}}"#,
-        "\n"
-    );
-    assert_eq!(encode_ndjson(&request).unwrap(), golden);
-    assert_eq!(decode_ndjson::<Request>(golden).unwrap(), request);
-    assert_eq!(request.validate(), Ok(()));
-
-    for frame_rate in ["", "0", "240/0", "241", "30/1/1", "29.97"] {
-        let invalid = Source::tinier_video("/wall/loop.ivf", frame_rate);
-        assert!(invalid.validate().is_err(), "{frame_rate}");
-    }
+fn retired_engine_fields_ignored() {
+    let source: Source = serde_json::from_str(
+        r#"{"kind":"video","path":"/wall/loop.ivf","engine":"tinier","frame_rate":"30000/1001"}"#,
+    )
+    .unwrap();
+    assert_eq!(source, Source::video("/wall/loop.ivf"));
     assert_eq!(
-        Source::video("/wall/loop.ivf", Some(VideoEngine::Tinier)).validate(),
-        Err(ValidationError::TinierFrameRateRequired)
-    );
-    let wildcard = ApplyRequest {
-        assignments: vec![assignment(&["*"], Source::tinier_video("/wall/loop.ivf", "30"))],
-        replace_all: false,
-        policy: None,
-    };
-    assert_eq!(wildcard.validate(), Err(ValidationError::TinierWildcardNotSupported));
-    let mut audible = assignment(&["DP-1"], Source::tinier_video("/wall/loop.ivf", "30"));
-    audible.mute = false;
-    assert_eq!(
-        ApplyRequest { assignments: vec![audible], replace_all: false, policy: None }.validate(),
-        Err(ValidationError::TinierAudioNotSupported)
+        serde_json::to_string(&source).unwrap(),
+        r#"{"kind":"video","path":"/wall/loop.ivf"}"#
     );
 }
 
 #[test]
 fn assignment_options_golden() {
-    let mut configured = assignment(&["DP-1"], Source::video("/wall/a.mp4", None));
+    let mut configured = assignment(&["DP-1"], Source::video("/wall/a.mp4"));
     configured.fill_mode = FillMode::Fit;
     configured.mute = false;
     configured.volume = 55;
@@ -140,8 +120,10 @@ fn assignment_options_golden() {
 
 #[test]
 fn policy_golden_line() {
-    let mut configured = assignment(&["DP-1"], Source::video("/wall/b.mp4", None));
+    let mut configured = assignment(&["DP-1"], Source::video("/wall/b.mp4"));
     configured.transition = Some(TransitionPolicy {
+        drawing_source: None,
+        drawing: None,
         fps: None,
         from: Some("/wall/a.png".into()),
         effect: Some("sand-bloom".into()),
@@ -201,7 +183,7 @@ fn apply_rejects_overlaps() {
     let duplicate = ApplyRequest {
         assignments: vec![
             assignment(&["DP-1", "DP-2"], Source::static_file("/wall/a.png")),
-            assignment(&["DP-2"], Source::video("/wall/b.mp4", None)),
+            assignment(&["DP-2"], Source::video("/wall/b.mp4")),
         ],
         replace_all: false,
         policy: None,
@@ -211,7 +193,7 @@ fn apply_rejects_overlaps() {
     let mixed_wildcard = ApplyRequest {
         assignments: vec![
             assignment(&["*"], Source::static_file("/wall/a.png")),
-            assignment(&["DP-1"], Source::video("/wall/b.mp4", None)),
+            assignment(&["DP-1"], Source::video("/wall/b.mp4")),
         ],
         replace_all: false,
         policy: None,
@@ -245,13 +227,13 @@ fn apply_rejects_unsafe_args() {
     }
 
     let unsafe_path = ApplyRequest {
-        assignments: vec![assignment(&["DP-1"], Source::video("--scene", None))],
+        assignments: vec![assignment(&["DP-1"], Source::video("--scene"))],
         replace_all: false,
         policy: None,
     };
     assert_eq!(unsafe_path.validate(), Err(ValidationError::SourcePathStartsWithDash));
 
-    let mut loud = assignment(&["DP-1"], Source::video("/wall/a.mp4", None));
+    let mut loud = assignment(&["DP-1"], Source::video("/wall/a.mp4"));
     loud.volume = 101;
     assert_eq!(
         ApplyRequest { assignments: vec![loud.clone()], replace_all: false, policy: None }
@@ -283,20 +265,43 @@ fn rejects_unsafe_controls() {
     );
 
     for transition in [
-        TransitionPolicy { fps: None, from: Some(String::new()), effect: None, duration_ms: None },
-        TransitionPolicy { fps: None, from: Some("--old".into()), effect: None, duration_ms: None },
         TransitionPolicy {
+            drawing_source: None,
+            drawing: None,
+            fps: None,
+            from: Some(String::new()),
+            effect: None,
+            duration_ms: None,
+        },
+        TransitionPolicy {
+            drawing_source: None,
+            drawing: None,
+            fps: None,
+            from: Some("--old".into()),
+            effect: None,
+            duration_ms: None,
+        },
+        TransitionPolicy {
+            drawing_source: None,
+            drawing: None,
             fps: None,
             from: None,
             effect: Some("../fade".into()),
             duration_ms: None,
         },
-        TransitionPolicy { fps: None, from: None, effect: None, duration_ms: Some(49) },
+        TransitionPolicy {
+            drawing_source: None,
+            drawing: None,
+            fps: None,
+            from: None,
+            effect: None,
+            duration_ms: Some(49),
+        },
     ] {
         assert!(transition.validate().is_err());
     }
 
-    let mut video = assignment(&["DP-1"], Source::video("/wall/a.mp4", None));
+    let mut video = assignment(&["DP-1"], Source::video("/wall/a.mp4"));
     video.transition = Some(TransitionPolicy::default());
     assert_eq!(
         ApplyRequest {
@@ -314,7 +319,7 @@ fn rejects_unsafe_controls() {
 
     assert_eq!(AudioSetRequest::default().validate(), Err(ValidationError::MissingAudioChange));
     assert_eq!(
-        AudioSetRequest { outputs: vec![], mute: None, volume: Some(101) }.validate(),
+        AudioSetRequest { volume: Some(101), ..Default::default() }.validate(),
         Err(ValidationError::VolumeOutOfRange(101))
     );
     for policy in [
@@ -393,7 +398,14 @@ fn request_method_goldens() {
             "\n"
         )
     );
-    let pause = Request::new(13, RequestParams::Pause(PauseRequest { paused: true }));
+    let pause = Request::new(
+        13,
+        RequestParams::Pause(PauseRequest {
+            overrides: std::collections::BTreeMap::new(),
+            paused: true,
+            outputs: Vec::new(),
+        }),
+    );
     assert_eq!(
         encode_ndjson(&pause).unwrap(),
         "{\"id\":13,\"method\":\"paper.pause\",\"params\":{\"paused\":true}}\n"
@@ -401,9 +413,11 @@ fn request_method_goldens() {
     let audio = Request::new(
         14,
         RequestParams::AudioSet(AudioSetRequest {
+            duck: None,
             outputs: vec!["DP-1".into()],
             mute: Some(false),
             volume: Some(55),
+            system_audio: None,
         }),
     );
     assert_eq!(
@@ -418,7 +432,7 @@ fn request_method_goldens() {
 
 #[test]
 fn response_goldens() {
-    let assignment = assignment(&["DP-1"], Source::video("/wall/a.mp4", None));
+    let assignment = assignment(&["DP-1"], Source::video("/wall/a.mp4"));
     let status = AssignmentStatus::from_assignment(&assignment, 44, Some(321), true);
     let apply = ApplyResponse::success(
         7,
@@ -452,11 +466,10 @@ fn response_goldens() {
         concat!(
             r#"{"id":10,"result":{"protocol":"skwd-paper","version":1,"#,
             r#""source_kinds":["static","video","we"],"#,
-            r#""video_engines":["default","tinier"],"#,
             r#""fill_modes":["fill","fit","stretch","center","tile","span"],"#,
             r#""layers":["background","bottom","top","overlay"],"#,
-            r#""controls":{"mirror":true,"pause":true,"audio":true,"surface_effects":true},"#,
-            r#""transitions":{"startup_source_kinds":["video","we"],"#,
+            r#""controls":{"surface_kinds":["static","video","we"],"playback":["scoped_pause","duck"],"mirror":true,"pause":true,"audio":true,"surface_effects":true},"#,
+            r#""transitions":{"drawing":true,"drawing_max_duration_ms":20000,"startup_source_kinds":["video","we"],"#,
             r#""static_overlay":true,"default_effect":"fade","default_duration_ms":600,"#,
             r#""min_duration_ms":50,"max_duration_ms":10000},"#,
             r#""renderer_policy":{"surface":true,"idle":true,"sand":true,"scene":true,"output_fps":true},"#,
@@ -478,13 +491,12 @@ fn response_goldens() {
     assert!(result.policy.is_none());
     let phase_one_capabilities = concat!(
         r#"{"id":10,"result":{"protocol":"skwd-paper","version":1,"#,
-        r#""source_kinds":["static","video","we"],"video_engines":["regular","tiny"],"#,
+        r#""source_kinds":["static","video","we"],"#,
         r#""fill_modes":["fill"],"layers":["background"]}}"#,
         "\n"
     );
     let decoded = decode_ndjson::<CapabilitiesResponse>(phase_one_capabilities).unwrap();
     let ResponseBody::Success { result } = decoded.body else { panic!("expected success") };
-    assert_eq!(result.video_engines, vec![VideoEngine::Default, VideoEngine::Default]);
     assert_eq!(result.controls, ControlCapabilities::default());
     assert_eq!(result.wallpaper_engine, WallpaperEngineCapabilities::default());
     assert!(result.renderers.is_empty());
@@ -504,7 +516,6 @@ fn renderer_capability_wire_shape() {
     let renderer = RendererCapability {
         executable: "skwd-wall-vk".into(),
         source_kinds: vec![SourceKind::Video, SourceKind::WallpaperEngine],
-        video_engines: vec![VideoEngine::Default],
         path: Some("/usr/bin/skwd-wall-vk".into()),
         discovery: RendererDiscovery::Path,
         present: true,
@@ -521,7 +532,7 @@ fn renderer_capability_wire_shape() {
         encoded,
         concat!(
             r#"{"executable":"skwd-wall-vk","source_kinds":["video","we"],"#,
-            r#""video_engines":["default"],"path":"/usr/bin/skwd-wall-vk","#,
+            r#""path":"/usr/bin/skwd-wall-vk","#,
             r#""discovery":"path","present":true,"executable_file":true,"dependencies":[{"#,
             r#""name":"vulkan_loader","available":true,"detail":"libvulkan.so.1 is loadable"}]}"#
         )
@@ -560,13 +571,8 @@ fn scene_properties_bounded() {
         Ok(())
     );
     for kind in [SourceKind::Static, SourceKind::Video] {
-        let source = Source {
-            kind,
-            path: "/wall/source".into(),
-            engine: None,
-            frame_rate: None,
-            properties: Some(properties.clone()),
-        };
+        let source =
+            Source { kind, path: "/wall/source".into(), properties: Some(properties.clone()) };
         assert_eq!(source.validate(), Err(ValidationError::PropertiesNotAllowed(kind)));
     }
 
@@ -609,10 +615,7 @@ fn scene_properties_round_trip() {
 #[test]
 fn surface_policy_validates_effects_and_supported_backends() {
     let mut request = ApplyRequest {
-        assignments: vec![Assignment::new(
-            vec!["DP-1".into()],
-            Source::video("/wall/clip.mp4", None),
-        )],
+        assignments: vec![Assignment::new(vec!["DP-1".into()], Source::video("/wall/clip.mp4"))],
         replace_all: true,
         policy: Some(RendererPolicy {
             surface: Some(Box::new(SurfacePolicy {
@@ -629,9 +632,6 @@ fn surface_policy_validates_effects_and_supported_backends() {
     request.policy.as_mut().unwrap().surface.as_mut().unwrap().dim = 101;
     assert_eq!(request.validate(), Err(ValidationError::InvalidSurfacePolicy));
     request.policy.as_mut().unwrap().surface.as_mut().unwrap().dim = 30;
-    request.assignments[0].source = Source::tinier_video("/wall/clip.ivf", "30");
-    request.assignments[0].layer = Layer::Background;
-    assert_eq!(request.validate(), Err(ValidationError::InvalidSurfacePolicy));
     request.assignments[0].source = Source::wallpaper_engine("/wall/scene");
     assert!(request.validate().is_ok());
     request.policy.as_mut().unwrap().surface.as_mut().unwrap().namespace = "bad\nnamespace".into();
@@ -669,7 +669,11 @@ fn transition_fps_decodes_additively_and_validates() {
         assert_eq!(serde_json::to_value(&policy).unwrap()["fps"], fps);
     }
     for fps in [0, 1001] {
-        assert!(TransitionPolicy { fps: Some(fps), ..Default::default() }.validate().is_err());
+        assert!(
+            TransitionPolicy { drawing: None, fps: Some(fps), ..Default::default() }
+                .validate()
+                .is_err()
+        );
     }
     assert!(RendererPolicy { transition_fps: Some(0), ..Default::default() }.validate().is_ok());
     assert!(
@@ -746,4 +750,131 @@ fn mirror_request_contract() {
     assert!(
         crate::MirrorTarget { output: "DP-1".into(), socket: String::new() }.validate().is_ok()
     );
+}
+
+#[test]
+fn spectrum_source_request() {
+    let request: AudioSetRequest = serde_json::from_str(r#"{"system_audio":false}"#).unwrap();
+    assert_eq!(request.validate(), Ok(()));
+    assert_eq!(request.system_audio, Some(false));
+    assert_eq!(serde_json::to_value(&request).unwrap(), serde_json::json!({"system_audio":false}));
+    let mut assignment = Assignment::new(vec!["DP-1".into()], Source::wallpaper_engine("/scene"));
+    assignment.system_audio = Some(false);
+    let status = AssignmentStatus::from_assignment(&assignment, 1, None, false);
+    assert_eq!(status.system_audio, Some(false));
+}
+
+#[test]
+fn drawing_media_reference_contract() {
+    let mut transition: TransitionPolicy = serde_json::from_str(r#"{"effect":"drawing","drawing":{"artifact":"/cache/drawing.json","finish":"lens"},"drawing_source":"/cache/reference.png"}"#).unwrap();
+    for source in [Source::video("/wall/video.mp4"), Source::wallpaper_engine("/wall/scene")] {
+        let mut item = assignment(&["DP-1"], source);
+        item.transition = Some(transition.clone());
+        assert!(
+            ApplyRequest { assignments: vec![item], replace_all: false, policy: None }
+                .validate()
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(&transition).unwrap()["drawing_source"],
+        "/cache/reference.png"
+    );
+    transition.drawing_source = Some("relative.png".into());
+    assert!(transition.validate().is_err());
+    transition.drawing_source = Some("/cache/reference.png".into());
+    transition.drawing = None;
+    assert!(transition.validate().is_err());
+}
+
+#[test]
+fn playback_control_shapes() {
+    let pause: PauseRequest = serde_json::from_str(r#"{"paused":true}"#).unwrap();
+    assert!(pause.outputs.is_empty());
+    assert_eq!(serde_json::to_string(&pause).unwrap(), r#"{"paused":true}"#);
+    for value in [
+        serde_json::json!({"paused":false,"outputs":["DP-1"]}),
+        serde_json::json!({"paused":true,"outputs":["*"]}),
+    ] {
+        let pause: PauseRequest = serde_json::from_value(value.clone()).unwrap();
+        pause.validate().unwrap();
+        assert_eq!(serde_json::to_value(pause).unwrap(), value);
+    }
+    let duck = AudioSetRequest { duck: Some(true), ..Default::default() };
+    duck.validate().unwrap();
+    assert_eq!(serde_json::to_value(duck).unwrap(), serde_json::json!({"duck":true}));
+    assert!(
+        PauseRequest {
+            overrides: std::collections::BTreeMap::new(),
+            paused: true,
+            outputs: vec!["*".into(), "DP-1".into()]
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
+fn playback_methods_are_distinct() {
+    let pause = Request::new(
+        1,
+        RequestParams::PlaybackPause(PauseRequest {
+            paused: true,
+            outputs: vec!["*".into()],
+            overrides: [("DP-1".into(), false)].into(),
+        }),
+    );
+    let encoded = serde_json::to_value(&pause).unwrap();
+    assert_eq!(encoded["method"], "paper.playback.pause");
+    assert_eq!(encoded["params"]["overrides"], serde_json::json!({"DP-1":false}));
+    assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), pause);
+    let audio = Request::new(
+        2,
+        RequestParams::PlaybackAudio(AudioSetRequest { duck: Some(true), ..Default::default() }),
+    );
+    let encoded = serde_json::to_value(&audio).unwrap();
+    assert_eq!(encoded["method"], "paper.playback.audio");
+    assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), audio);
+    assert_eq!(
+        serde_json::to_value(crate::PlaybackState { paused: true, ducked: true }).unwrap(),
+        serde_json::json!({"paused":true,"ducked":true})
+    );
+}
+
+#[test]
+fn surface_overrides_wire() {
+    let mut overrides = SurfaceOverridesRequest {
+        surfaces: [(
+            SourceKind::Video,
+            SurfacePolicy { namespace: "stationary".into(), blur: 22, dim: 44 },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let request = Request::new(4, RequestParams::SurfaceOverrides(overrides.clone()));
+    request.validate().unwrap();
+    let wire = encode_ndjson(&request).unwrap();
+    assert!(wire.contains("paper.surface.overrides"));
+    assert_eq!(decode_ndjson::<Request>(&wire).unwrap(), request);
+    overrides
+        .surfaces
+        .insert(SourceKind::Static, SurfacePolicy { namespace: "other".into(), blur: 0, dim: 0 });
+    assert!(overrides.validate().is_err());
+    overrides.surfaces.remove(&SourceKind::Static);
+    overrides.surfaces.get_mut(&SourceKind::Video).unwrap().dim = 101;
+    assert!(overrides.validate().is_err());
+    assert!(SurfaceOverridesRequest::default().validate().is_ok());
+}
+
+#[test]
+fn widgets_request_round_trips() {
+    let scene: crate::WidgetScene = serde_json::from_str(
+        r#"{"widgets":[{"face":{"kind":"clock","style":"aperture"},"pin":{"anchor":[0.5,0.5],"offset":[0.0,0.0]},"output":"DP-1"}],"palette":{"text":[236,235,231],"accent":[90,110,200],"shade":[18,19,22]},"labels":{"days":["MON","TUE","WED","THU","FRI","SAT","SUN"],"day_names":["MONDAY","TUESDAY","WEDNESDAY","THURSDAY","FRIDAY","SATURDAY","SUNDAY"],"months":["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"],"month_names":["JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE","JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER"]}}"#,
+    )
+    .unwrap();
+    let request = Request::new(5, RequestParams::Widgets(Box::new(scene)));
+    assert!(request.validate().is_ok());
+    let line = encode_ndjson(&request).unwrap();
+    assert!(line.contains("paper.widgets"));
+    assert_eq!(decode_ndjson::<Request>(&line).unwrap(), request);
 }

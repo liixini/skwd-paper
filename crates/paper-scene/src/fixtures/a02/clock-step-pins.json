@@ -1,0 +1,22 @@
+{
+  "receipt": "/home/liixini/projects/skwd-personal/wc18b/rem20/a02/r7/native/captures/clock-step-20261020T223436-7c2f6f/receipt.json",
+  "receipt_sha256": "7ea495a5b9dd93eb2c049dc3f6c68cc9f1f872a134d9754f34bd1efd04c39d5c",
+  "source_package_sha256": "a9cc9cf8b6083c32c024b9f8ad82fa4a97abacb010f23c058102f14cc29b6fe7",
+  "entries": {
+    "scene.json": {
+      "file": "clock-step-scene.json",
+      "sha256": "ecdf95ecc1aac36b1970da4007affea5851d258c1f75819f040593df29ddbd54",
+      "bytes": 2680
+    },
+    "models/Plana 01.json": {
+      "file": "clock-step-model.json",
+      "sha256": "b5e84d683f12551fed8d8b5cf29ac51581fe20e81929987035598a8b2cb2b8c0",
+      "bytes": 151
+    },
+    "models/Plana 01_puppet.mdl": {
+      "file": "clock-step.mdl",
+      "sha256": "53e07c5907c84b86cc7a5a20765ebc3cfd035c231a5cf744e6bfd2a3433e81ee",
+      "bytes": 165117
+    }
+  }
+}

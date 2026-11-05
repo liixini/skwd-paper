@@ -8,7 +8,7 @@ apt-get install -y --no-install-recommends \
     libvulkan-dev \
     libasound2-dev libpulse-dev libxkbcommon-dev \
     libwayland-dev libegl1-mesa-dev \
-    libdav1d-dev libyuv-dev \
+    libdav1d-dev libyuv-dev libfreetype-dev \
     libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
     python3 ffmpeg procps
 rm -rf /var/lib/apt/lists/*

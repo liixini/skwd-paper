@@ -1,0 +1,18 @@
+[package]
+name = "paper-widgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Desktop widget drawing and depth layering for Paper renderers"
+
+[dependencies]
+image = { workspace = true }
+paper-control = { path = "../paper-control" }
+paper-geom = { path = "../paper-geom" }
+paper-text = { path = "../paper-text" }
+zeno = "0.3.3"
+
+[lints]
+workspace = true

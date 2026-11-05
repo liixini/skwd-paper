@@ -4,6 +4,7 @@ use ffmpeg_the_third as ff;
 pub(crate) mod still;
 pub(crate) mod thumbnail;
 
+const INVALID_VIDEO_SEEK: &str = "invalid video seek";
 const HW_THREAD_COUNT: i32 = 1;
 const CONSECUTIVE_PACKET_ERROR_LIMIT: usize = 16;
 const EMPTY_CONTAINER_WRAP_LIMIT: usize = 2;
@@ -740,6 +741,40 @@ impl std::ops::Deref for RenderFrame {
 }
 
 impl AnyDecoder {
+    pub fn duration(&self) -> f64 {
+        let input = match self {
+            Self::Vk(decoder) => &decoder.ictx,
+            Self::Vaapi(decoder) => &decoder.ictx,
+            Self::Sw(decoder) => &decoder.ictx,
+            Self::Still(_) => return 0.0,
+        };
+        (input.duration().max(0) as f64 / f64::from(ff::ffi::AV_TIME_BASE)).max(0.0)
+    }
+
+    pub fn seek(&mut self, seconds: f64) -> Result<()> {
+        anyhow::ensure!(seconds.is_finite(), INVALID_VIDEO_SEEK);
+        let (input, decoder, draining) = match self {
+            Self::Vk(decoder) => {
+                decoder.primed = None;
+                (&mut decoder.ictx, &mut decoder.decoder, &mut decoder.draining)
+            }
+            Self::Vaapi(decoder) => {
+                decoder.primed = None;
+                (&mut decoder.ictx, &mut decoder.decoder, &mut decoder.draining)
+            }
+            Self::Sw(decoder) => {
+                decoder.served = false;
+                (&mut decoder.ictx, &mut decoder.decoder, &mut decoder.draining)
+            }
+            Self::Still(_) => return Ok(()),
+        };
+        let timestamp = (seconds.max(0.0) * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
+        input.seek(timestamp, ..=timestamp).context("seek video")?;
+        decoder.flush();
+        *draining = false;
+        Ok(())
+    }
+
     pub fn dims(&self) -> (u32, u32) {
         match self {
             AnyDecoder::Vk(dec) => (dec.width, dec.height),
@@ -764,6 +799,12 @@ impl AnyDecoder {
             AnyDecoder::Vaapi(dec) => dec.next(),
             AnyDecoder::Sw(dec) => dec.next(),
             AnyDecoder::Still(dec) => dec.next().map(|(frame, pts)| (frame.frame, pts)),
+        }
+    }
+
+    pub fn transfer_frames(&mut self) {
+        if let AnyDecoder::Vaapi(dec) = self {
+            dec.drm_prime = false;
         }
     }
 
@@ -844,7 +885,7 @@ pub fn open_vulkan_decoder(
     vulkan_decode: bool,
 ) -> Option<VulkanDecoder> {
     if !vulkan_decode {
-        tracing::info!("skwd-wall-vk: Vulkan video decode queue unavailable, trying VAAPI");
+        tracing::info!("skwd-wall-vk: Vulkan decode not selected, trying VAAPI");
         return None;
     }
     match open_vulkan(path, hwdev) {
@@ -856,16 +897,58 @@ pub fn open_vulkan_decoder(
     }
 }
 
-pub fn open_decoder(
-    path: &str,
-    hwdev: Option<*mut ff::ffi::AVBufferRef>,
-    vulkan_decode: bool,
-    render_node: Option<&std::path::Path>,
-    force_software: bool,
-) -> Result<AnyDecoder> {
-    if decoder_requires_software(path, force_software) {
-        return Ok(AnyDecoder::Sw(SwDecoder::open(path)?));
+pub fn open_decoder(request: &HardwareDecode<'_>, force_software: bool) -> Result<AnyDecoder> {
+    if decoder_requires_software(request.logical, force_software) {
+        return Ok(AnyDecoder::Sw(SwDecoder::open(request.path)?));
     }
+    open_hardware(request)
+}
+
+pub(crate) struct HardwareDecode<'a> {
+    pub path: &'a str,
+    pub logical: &'a str,
+    pub hwdev: Option<*mut ff::ffi::AVBufferRef>,
+    pub vulkan_decode: bool,
+    pub render_node: Option<&'a std::path::Path>,
+}
+
+#[cfg(feature = "shared-device")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Clip {
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[cfg(feature = "shared-device")]
+impl Clip {
+    const PROTOCOL: &str = "subfile";
+
+    pub(crate) fn url(self, path: &str) -> String {
+        let (start, end) = (self.offset, self.offset.saturating_add(self.length));
+        format!("{},,start,{start},end,{end},,:{path}", Self::PROTOCOL)
+    }
+}
+
+impl<'a> HardwareDecode<'a> {
+    #[cfg(feature = "shared-device")]
+    pub(crate) fn shared(shared: &'a crate::shared::SharedDevice, path: &'a str) -> Self {
+        Self {
+            path,
+            logical: path,
+            hwdev: Some(shared.hwdev),
+            vulkan_decode: shared.video_decode,
+            render_node: shared.render_node.as_deref(),
+        }
+    }
+
+    pub(crate) fn local(path: &'a str) -> Self {
+        Self { path, logical: path, hwdev: None, vulkan_decode: true, render_node: None }
+    }
+}
+
+pub(crate) fn open_hardware(request: &HardwareDecode<'_>) -> Result<AnyDecoder> {
+    let &HardwareDecode { path, logical, hwdev, vulkan_decode, render_node } = request;
     if vaapi_decode_forced() {
         tracing::info!("skwd-wall-vk: VAAPI decode forced, skipping Vulkan video");
     } else if let Some(decoder) = open_vulkan_decoder(path, hwdev, vulkan_decode) {
@@ -875,7 +958,7 @@ pub fn open_decoder(
         Ok(decoder) => Ok(AnyDecoder::Vaapi(decoder)),
         Err(error) => {
             tracing::info!(
-                "skwd-wall-vk: VAAPI decode rejected {path} ({error:#}), software fallback"
+                "skwd-wall-vk: VAAPI decode rejected {logical} ({error:#}), software fallback"
             );
             Ok(AnyDecoder::Sw(SwDecoder::open(path)?))
         }
@@ -1043,4 +1126,4 @@ pub(crate) fn transfer_hardware_nv12(frame: &ff::frame::Video) -> Result<ff::fra
     Ok(output)
 }
 
-mod tests;
+pub(crate) mod tests;

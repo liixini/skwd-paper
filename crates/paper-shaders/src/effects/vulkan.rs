@@ -9,6 +9,10 @@ layout(push_constant) uniform PC {
     int u_rgba_b;
     vec4 u_uv_a;
     vec4 u_uv_b;
+    uint u_paper;
+    uint u_ink;
+    float u_clock;
+    int u_ink_style;
 };
 layout(set = 0, binding = 0) uniform sampler2D luma_a;
 layout(set = 0, binding = 1) uniform sampler2D chroma_a;
@@ -54,6 +58,16 @@ vec2 vk_hash2(vec2 p) {
 }
 ";
 
+const ENVIRONMENT_UNIFORM: &str = "uniform sampler2D u_studio_environment;";
+const VK_ENVIRONMENT_HEADER: &str = "
+layout(set = 2, binding = 0) uniform StudioPalette { vec4 studio_palette[4]; };
+layout(set = 2, binding = 1) uniform sampler2D u_studio_environment;
+#define u_studio_surface studio_palette[0].rgb
+#define u_studio_surface_variant studio_palette[1].rgb
+#define u_studio_primary_container studio_palette[2].rgb
+#define u_studio_secondary_container studio_palette[3].rgb
+";
+
 fn desin_hashes(body: &str) -> String {
     let two = regex_lite::Regex::new(
         r"fract\(sin\(vec2\(dot\((\w[\w.]*),\s*vec2\([\d.]+,\s*[\d.]+\)\),\s*dot\(\w[\w.]*,\s*vec2\([\d.]+,\s*[\d.]+\)\)\)\)\s*\*\s*[\d.]+\)",
@@ -96,6 +110,9 @@ pub fn effect_frag_vk(gl_src: &str) -> String {
         .replace("texture(u_tex_new,", "texB(")
         .replace("sample_thumb(idx, mrp)", "texB(mrp)")
         .replace("u_thumb_count", "0");
-    let body = desin_hashes(&body);
-    format!("{VK_EFFECT_HEADER}{body}")
+    let body = desin_hashes(&body)
+        .replace(crate::drawing::DRAWING_BUILD_MARKER, &crate::DRAWING_BUILD_END.to_string())
+        .replace(crate::drawing::DRAWING_PAPER_MARKER, &crate::DRAWING_PAPER_START.to_string());
+    let environment = if gl_src.contains(ENVIRONMENT_UNIFORM) { VK_ENVIRONMENT_HEADER } else { "" };
+    format!("{VK_EFFECT_HEADER}{environment}{body}")
 }

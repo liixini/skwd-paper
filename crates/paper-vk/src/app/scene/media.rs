@@ -14,6 +14,61 @@ use std::time::Duration;
 
 const PLAYER: &str = "org.mpris.MediaPlayer2.Player";
 const PATH: &str = "/org/mpris/MediaPlayer2";
+const CONTROL_TIMEOUT: Duration = Duration::from_millis(150);
+const CONTROL_BATCH: usize = 32;
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MEDIA_STATUS: &str = "mediaStatusChanged";
+const ENABLED_FIELD: &str = "enabled";
+const PEEK_FLAGS: libc::c_int = libc::MSG_PEEK | libc::MSG_DONTWAIT;
+
+enum BusState {
+    Starting,
+    Online,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Shortcut {
+    Play = 1,
+    Pause,
+    Toggle,
+    Next,
+    Previous,
+    Stop,
+}
+
+impl Shortcut {
+    pub(super) fn named(name: &str) -> Option<Self> {
+        const NAMES: &[(&str, Shortcut)] = &[
+            ("play", Shortcut::Play),
+            ("bplay", Shortcut::Play),
+            ("pause", Shortcut::Pause),
+            ("bpause", Shortcut::Pause),
+            ("playpause", Shortcut::Toggle),
+            ("toggle", Shortcut::Toggle),
+            ("next", Shortcut::Next),
+            ("bnext", Shortcut::Next),
+            ("previous", Shortcut::Previous),
+            ("prev", Shortcut::Previous),
+            ("bprev", Shortcut::Previous),
+            ("stop", Shortcut::Stop),
+        ];
+        NAMES.iter().find(|(alias, _)| name.eq_ignore_ascii_case(alias)).map(|(_, action)| *action)
+    }
+
+    fn method(byte: u8) -> Option<&'static str> {
+        const METHODS: &[(Shortcut, &str)] = &[
+            (Shortcut::Play, "Play"),
+            (Shortcut::Pause, "Pause"),
+            (Shortcut::Toggle, "PlayPause"),
+            (Shortcut::Next, "Next"),
+            (Shortcut::Previous, "Previous"),
+            (Shortcut::Stop, "Stop"),
+        ];
+        METHODS.iter().find(|(action, _)| *action as u8 == byte).map(|(_, method)| *method)
+    }
+}
+
 const LIMIT: u64 = 8 * 1024 * 1024;
 
 pub(super) struct Snapshot {
@@ -23,9 +78,11 @@ pub(super) struct Snapshot {
 }
 
 pub(super) struct Media {
+    pub(super) controls: bool,
     wake: UnixStream,
     thread: Option<JoinHandle<()>>,
     pending: Arc<Mutex<Option<Snapshot>>>,
+    state: Arc<Mutex<BusState>>,
 }
 
 impl Media {
@@ -35,12 +92,24 @@ impl Media {
         stop.set_nonblocking(true)?;
         let pending = Arc::new(Mutex::new(None));
         let output = pending.clone();
+        let state = Arc::new(Mutex::new(BusState::Starting));
+        let status = state.clone();
         let thread = std::thread::Builder::new().name("skwd-media".into()).spawn(move || {
-            if let Err(error) = watch(stop, output) {
-                tracing::warn!("Wallpaper media integration stopped: {error:#}");
+            if let Err(error) = supervise(&stop, &output, &status) {
+                tracing::warn!("media integration stopped: {error:#}");
             }
         })?;
-        Ok(Self { wake, thread: Some(thread), pending })
+        Ok(Self { controls: false, wake, thread: Some(thread), pending, state })
+    }
+
+    pub(super) fn control(&mut self, action: Shortcut) -> Result<()> {
+        let state = self.state.lock().map_err(|_| anyhow::anyhow!("media state poisoned"))?;
+        if matches!(*state, BusState::Offline) {
+            return Ok(());
+        }
+        (&self.wake).write_all(&[action as u8]).context("queue media shortcut")?;
+        self.controls = true;
+        Ok(())
     }
 
     pub fn take(&self) -> Option<Snapshot> {
@@ -134,11 +203,59 @@ fn current(
 }
 
 fn stopped(stop: &UnixStream) -> bool {
-    let mut fd = libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    unsafe { libc::poll(&mut fd, 1, 0) > 0 }
+    let mut byte = 0_u8;
+    unsafe { libc::recv(stop.as_raw_fd(), (&raw mut byte).cast(), 1, PEEK_FLAGS) == 0 }
 }
 
-fn watch(stop: UnixStream, output: Arc<Mutex<Option<Snapshot>>>) -> Result<()> {
+fn publish(output: &Mutex<Option<Snapshot>>, mut wake: &UnixStream, mut snapshot: Snapshot) {
+    if let Ok(mut pending) = output.lock() {
+        let notify = pending.is_none();
+        snapshot.art_changed |= pending.as_ref().is_some_and(|previous| previous.art_changed);
+        *pending = Some(snapshot);
+        if notify {
+            let _ = wake.write(&[1]);
+        }
+    }
+}
+
+fn supervise(
+    mut stop: &UnixStream,
+    output: &Mutex<Option<Snapshot>>,
+    state: &Mutex<BusState>,
+) -> Result<()> {
+    let mut offline = false;
+    loop {
+        if stopped(stop) {
+            return Ok(());
+        }
+        let result = connect().and_then(|connection| {
+            offline = false;
+            *state.lock().map_err(|_| anyhow::anyhow!("media state poisoned"))? = BusState::Online;
+            watch(&connection, stop, output)
+        });
+        let Err(error) = result else { return Ok(()) };
+        {
+            let mut status = state.lock().map_err(|_| anyhow::anyhow!("media state poisoned"))?;
+            *status = BusState::Offline;
+            let mut discarded = [0; CONTROL_BATCH];
+            while stop.read(&mut discarded).is_ok_and(|count| count > 0) {}
+        }
+        if !offline {
+            tracing::warn!(%error, "media bus unavailable");
+            let mut events = events(&PropMap::new());
+            events[MEDIA_STATUS][ENABLED_FIELD] = Value::Bool(false);
+            publish(output, stop, Snapshot { events, art: None, art_changed: true });
+            offline = true;
+        }
+        let mut poll = libc::pollfd { fd: stop.as_raw_fd(), events: 0, revents: 0 };
+        let result = unsafe { libc::poll(&raw mut poll, 1, RECONNECT_DELAY.as_millis() as i32) };
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+}
+
+fn connect() -> Result<Connection> {
     let mut channel = dbus::channel::Channel::get_private(dbus::channel::BusType::Session)?;
     channel.set_watch_enabled(true);
     let connection = Connection::from(channel);
@@ -149,15 +266,23 @@ fn watch(stop: UnixStream, output: Arc<Mutex<Option<Snapshot>>>) -> Result<()> {
     ] {
         connection.add_match_no_cb(rule)?;
     }
+    Ok(connection)
+}
+
+fn watch(
+    connection: &Connection,
+    stop: &UnixStream,
+    output: &Mutex<Option<Snapshot>>,
+) -> Result<()> {
     let mut previous = String::new();
     let mut art_url = String::new();
     let mut art = None;
-    let mut thumbnail = json!({"hasThumbnail":false});
+    let mut thumbnail = thumbnail_event(None);
     loop {
-        if stopped(&stop) {
+        if stopped(stop) {
             break;
         }
-        let (name, properties) = current(&connection, &previous, &stop)?;
+        let (name, properties) = current(connection, &previous, stop)?;
         previous = name;
         let url = prop_cast::<PropMap>(&properties, "Metadata")
             .map(|m| text(m, "mpris:artUrl"))
@@ -170,20 +295,13 @@ fn watch(stop: UnixStream, output: Arc<Mutex<Option<Snapshot>>>) -> Result<()> {
         }
         let mut events = events(&properties);
         events["mediaThumbnailChanged"] = thumbnail.clone();
-        if let Ok(mut pending) = output.lock() {
-            let notify = pending.is_none();
-            let changed = art_changed || pending.as_ref().is_some_and(|p| p.art_changed);
-            *pending = Some(Snapshot { events, art: art.clone(), art_changed: changed });
-            if notify {
-                let _ = (&stop).write(&[1]);
-            }
-        }
+        publish(output, stop, Snapshot { events, art: art.clone(), art_changed });
         loop {
             let mut changed = false;
             while let Some(message) = connection.channel().pop_message() {
                 changed |= message.msg_type() == dbus::MessageType::Signal;
             }
-            if changed || stopped(&stop) {
+            if changed || stopped(stop) {
                 break;
             }
             let watch = connection.channel().watch();
@@ -203,12 +321,33 @@ fn watch(stop: UnixStream, output: Arc<Mutex<Option<Snapshot>>>) -> Result<()> {
                 return Err(std::io::Error::last_os_error().into());
             }
             if fds[1].revents != 0 {
-                return Ok(());
+                if stopped(stop) {
+                    return Ok(());
+                }
+                dispatch(connection, &previous, stop)?;
+                break;
             }
             connection
                 .channel()
                 .read_write(Some(Duration::ZERO))
                 .map_err(|_| anyhow::anyhow!("media bus disconnected"))?;
+        }
+    }
+    Ok(())
+}
+
+fn dispatch(connection: &Connection, player: &str, mut control: &UnixStream) -> Result<()> {
+    let mut batch = [0; CONTROL_BATCH];
+    let count = control.read(&mut batch)?;
+    if player.is_empty() {
+        return Ok(());
+    }
+    let proxy = connection.with_proxy(player, PATH, CONTROL_TIMEOUT);
+    for byte in &batch[..count] {
+        if let Some(method) = Shortcut::method(*byte)
+            && let Err(error) = proxy.method_call::<(), _, _, _>(PLAYER, method, ())
+        {
+            tracing::warn!(method, %error, "media shortcut failed");
         }
     }
     Ok(())
@@ -274,6 +413,19 @@ mod tests;
 
 impl super::Group {
     pub(super) fn advance_media(&mut self) -> Result<()> {
+        let wanted = !self.media_slots.is_empty()
+            || self
+                .scripts
+                .as_ref()
+                .and_then(|scripts| scripts.host.as_ref())
+                .is_some_and(paper_scene::script::SceneScripts::needs_media)
+            || self.media.as_ref().is_some_and(|media| media.controls);
+        if wanted && self.media.is_none() {
+            self.media = Some(Media::start()?);
+        } else if !wanted {
+            self.media.take();
+            self.media_art.take();
+        }
         let Some(snapshot) = self.media.as_ref().and_then(Media::take) else {
             return Ok(());
         };
@@ -288,7 +440,7 @@ impl super::Group {
                     image.unwrap_or(&empty),
                     true,
                     false,
-                    false,
+                    crate::vk::MipSampling::Disabled,
                 )?;
                 let old = std::mem::replace(&mut self.textures[*slot], next);
                 self.renderer.destroy_scene_texture(old);

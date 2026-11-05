@@ -105,7 +105,14 @@ fn overview_and_default_controllers_coexist_in_either_start_order() {
         }
         let pause = serde_json::to_value(request(
             &sockets[0],
-            &Request::new(1, RequestParams::Pause(PauseRequest { paused: true })),
+            &Request::new(
+                1,
+                RequestParams::Pause(PauseRequest {
+                    overrides: std::collections::BTreeMap::new(),
+                    paused: true,
+                    outputs: Vec::new(),
+                }),
+            ),
         ))
         .unwrap();
         assert_eq!(pause["result"]["paused"], true);
@@ -208,7 +215,7 @@ fn status_and_capabilities_report_each_missing_renderer() {
         assert_eq!(status_renderers[index]["path"], missing.display().to_string());
         assert_eq!(status_renderers[usize::from(missing_vk)]["executable_file"], true);
         let source = if missing_vk {
-            Source::video("/wall/a.mp4", None)
+            Source::video("/wall/a.mp4")
         } else {
             Source::static_file("/wall/a.png")
         };
@@ -290,7 +297,7 @@ fn mixed_apply_lifecycle() {
         RequestParams::Apply(ApplyRequest {
             assignments: vec![
                 Assignment::new(vec!["DP-1".into()], Source::static_file("/wall/a.png")),
-                Assignment::new(vec!["DP-2".into()], Source::video("/wall/b.mp4", None)),
+                Assignment::new(vec!["DP-2".into()], Source::video("/wall/b.mp4")),
             ],
             replace_all: false,
             policy: Some(RendererPolicy { idle_seconds: Some(5), ..Default::default() }),
@@ -302,7 +309,14 @@ fn mixed_apply_lifecycle() {
     assert_eq!(apply["result"]["policy"]["idle_seconds"], 5);
     let pause = serde_json::to_value(request(
         &socket,
-        &Request::new(5, RequestParams::Pause(PauseRequest { paused: true })),
+        &Request::new(
+            5,
+            RequestParams::Pause(PauseRequest {
+                overrides: std::collections::BTreeMap::new(),
+                paused: true,
+                outputs: Vec::new(),
+            }),
+        ),
     ))
     .unwrap();
     assert_eq!(pause["result"]["paused"], true);
@@ -311,9 +325,11 @@ fn mixed_apply_lifecycle() {
         &Request::new(
             6,
             RequestParams::AudioSet(AudioSetRequest {
+                duck: None,
                 outputs: vec!["DP-1".into(), "DP-2".into()],
                 mute: Some(false),
                 volume: Some(35),
+                system_audio: None,
             }),
         ),
     ))
@@ -375,10 +391,7 @@ fn startup_failure_code() {
     let apply = Request::new(
         20,
         RequestParams::Apply(ApplyRequest {
-            assignments: vec![Assignment::new(
-                vec!["DP-1".into()],
-                Source::video("/wall/b.mp4", None),
-            )],
+            assignments: vec![Assignment::new(vec!["DP-1".into()], Source::video("/wall/b.mp4"))],
             replace_all: false,
             policy: None,
         }),

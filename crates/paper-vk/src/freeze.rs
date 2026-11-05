@@ -1,19 +1,25 @@
 use crate::ctl;
 use anyhow::{Context, Result, anyhow};
 use ffmpeg_the_third as ff;
+use paper_runtime::snapshot::{write_error, write_rgba as write_rgba_ppm};
 use std::io::Write;
 use std::path::Path;
 
 pub(crate) fn write_requested(ctl: &mut ctl::Ctl, frame: &ff::frame::Video) -> Result<bool> {
-    let Some(path) = ctl.take_freeze() else {
+    let Some((path, paused)) = ctl.take_freeze() else {
         return Ok(false);
     };
     if let Err(error) = write_frame(Path::new(&path), frame) {
         let message = format!("{error:#}");
         let _ = write_error(Path::new(&format!("{path}.error")), &message);
-        ctl.cancel_freeze();
+        if paused {
+            ctl.cancel_freeze();
+        }
         tracing::error!(path, error = %message, "skwd-wall-vk: freeze frame failed");
         return Ok(false);
+    }
+    if paused {
+        ctl.finish_freeze();
     }
     tracing::info!(path, "skwd-wall-vk: freeze frame ready");
     Ok(true)
@@ -36,27 +42,50 @@ pub(crate) fn write_rgba_requested(
     height: u32,
     pixels: &[u8],
 ) -> Result<bool> {
-    let Some(path) = ctl.take_freeze() else {
+    let Some((path, paused)) = ctl.take_freeze() else {
         return Ok(false);
     };
     if let Err(error) = write_rgba_ppm(Path::new(&path), width, height, pixels) {
         let message = format!("{error:#}");
         let _ = write_error(Path::new(&format!("{path}.error")), &message);
-        ctl.cancel_freeze();
+        if paused {
+            ctl.cancel_freeze();
+        }
         tracing::error!(path, error = %message, "skwd-wall-vk: scene freeze frame failed");
         return Ok(false);
+    }
+    if paused {
+        ctl.finish_freeze();
     }
     tracing::info!(path, "skwd-wall-vk: scene freeze frame ready");
     Ok(true)
 }
 
+pub(crate) fn write_view_requested(
+    ctl: &mut ctl::Ctl,
+    mut frame: image::RgbaImage,
+    size: (u32, u32),
+    crop: Option<[u32; 4]>,
+) -> Result<bool> {
+    if let Some([x, y, width, height]) = crop {
+        frame = image::imageops::crop_imm(&frame, x, y, width, height).to_image();
+    }
+    if frame.dimensions() != size {
+        frame =
+            image::imageops::resize(&frame, size.0, size.1, image::imageops::FilterType::Triangle);
+    }
+    write_rgba_requested(ctl, size.0, size.1, frame.as_raw())
+}
+
 pub(crate) fn fail_requested(ctl: &mut ctl::Ctl, error: &anyhow::Error) {
-    let Some(path) = ctl.take_freeze() else {
+    let Some((path, paused)) = ctl.take_freeze() else {
         return;
     };
     let message = format!("{error:#}");
     let _ = write_error(Path::new(&format!("{path}.error")), &message);
-    ctl.cancel_freeze();
+    if paused {
+        ctl.cancel_freeze();
+    }
     tracing::error!(path, error = %message, "skwd-wall-vk: scene freeze frame failed");
 }
 
@@ -119,37 +148,6 @@ fn write_rgb_ppm(path: &Path, width: u32, height: u32, pixels: &[u8], stride: us
     for y in 0..rows {
         temporary.write_all(&pixels[y * stride..y * stride + row])?;
     }
-    temporary.as_file_mut().sync_all()?;
-    temporary.persist_noclobber(path).map_err(|error| error.error)?;
-    Ok(())
-}
-
-fn write_rgba_ppm(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
-    let pixel_count = usize::try_from(width)?
-        .checked_mul(usize::try_from(height)?)
-        .ok_or_else(|| anyhow!("frame too large"))?;
-    let expected = pixel_count.checked_mul(4).ok_or_else(|| anyhow!("frame too large"))?;
-    if pixels.len() < expected {
-        return Err(anyhow!("freeze-frame RGBA payload is truncated"));
-    }
-    let parent = path.parent().ok_or_else(|| anyhow!("freeze-frame path has no parent"))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).context("create freeze frame")?;
-    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, temporary.as_file_mut());
-    write!(writer, "P6\n{width} {height}\n255\n")?;
-    for pixel in pixels[..expected].chunks_exact(4) {
-        writer.write_all(&pixel[..3])?;
-    }
-    writer.flush()?;
-    drop(writer);
-    temporary.as_file_mut().sync_all()?;
-    temporary.persist_noclobber(path).map_err(|error| error.error)?;
-    Ok(())
-}
-
-fn write_error(path: &Path, message: &str) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| anyhow!("freeze error path has no parent"))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(message.as_bytes())?;
     temporary.as_file_mut().sync_all()?;
     temporary.persist_noclobber(path).map_err(|error| error.error)?;
     Ok(())

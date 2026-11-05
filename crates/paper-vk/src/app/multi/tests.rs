@@ -62,3 +62,18 @@ fn targeted_commands_only_reach_matching_outputs() {
     assert!(routed_to(&outputs, &PaperCommand::audio_for(&["DP-2".to_string()], None, Some(10))));
     assert!(!routed_to(&outputs, &PaperCommand::audio_for(&["DP-3".to_string()], None, Some(10))));
 }
+
+#[test]
+fn retain_reaches_excluded_groups() {
+    let command = PaperCommand::retain_outputs(&["DP-2".into()]);
+    assert!(routed_to(&["DP-1".into()], &command));
+    assert!(routed_to(&["DP-2".into()], &command));
+    assert!(routed_to(&["DP-1".into(), "DP-2".into()], &command));
+}
+
+#[test]
+fn snapshot_routes_one_group() {
+    let command = PaperCommand::snapshot("/cache/current.ppm", "DP-1");
+    assert!(routed_to(&["DP-1".into(), "DP-2".into()], &command));
+    assert!(!routed_to(&["DP-3".into()], &command));
+}

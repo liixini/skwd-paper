@@ -9,7 +9,9 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     Connection, Proxy, QueueHandle,
-    protocol::{wl_callback::WlCallback, wl_output::WlOutput, wl_surface::WlSurface},
+    protocol::{
+        wl_callback::WlCallback, wl_output::WlOutput, wl_region::WlRegion, wl_surface::WlSurface,
+    },
 };
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
@@ -153,4 +155,5 @@ impl wayland_client::Dispatch<WlCallback, StartupSync> for App {
     }
 }
 
-paper_runtime::impl_empty_dispatch!(App, ZwlrLayerShellV1, WpViewporter, WpViewport);
+paper_runtime::impl_empty_dispatch!(App, ZwlrLayerShellV1, WpViewporter, WpViewport, WlRegion);
+smithay_client_toolkit::delegate_subcompositor!(App);

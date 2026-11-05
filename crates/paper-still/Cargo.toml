@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive"] }
 serde_json = { workspace = true }
 paper-control = { path = "../paper-control" }
 paper-geom = { path = "../paper-geom" }
+paper-widgets = { path = "../paper-widgets" }
 
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }

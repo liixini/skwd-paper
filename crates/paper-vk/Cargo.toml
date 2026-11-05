@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
 paper-log = { path = "../paper-log" }
 paper-runtime = { path = "../paper-runtime" }
 tracing = { workspace = true }
@@ -23,6 +25,7 @@ paper-scene = { path = "../paper-scene" }
 paper-shaders = { path = "../paper-shaders" }
 paper-geom = { path = "../paper-geom" }
 image = { workspace = true }
+webp = { workspace = true }
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
 ffmpeg-the-third = { version = "6", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 libc = "0.2"
@@ -43,7 +46,7 @@ pkg-config = "0.3"
 
 [features]
 default = ["shared-device"]
-shared-device = []
+shared-device = ["dep:serde", "dep:sha2"]
 
 [package.metadata.cargo-machete]
 ignored = ["cc", "pkg-config", "wayland-backend"]

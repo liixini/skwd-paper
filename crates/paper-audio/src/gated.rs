@@ -34,7 +34,7 @@ impl GatedAudio {
             player.set_volume(self.volume);
             return;
         }
-        if inaudible {
+        if inaudible || self.paused {
             return;
         }
         match AudioPlayer::new(&self.path, self.mute, self.volume) {
@@ -75,6 +75,9 @@ impl GatedAudio {
         self.paused = paused;
         if let Some(player) = &self.player {
             player.set_pause(paused);
+        }
+        if !paused {
+            self.sync();
         }
     }
 

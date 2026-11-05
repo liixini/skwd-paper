@@ -1,3 +1,19 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Background {
+    #[serde(default)]
+    pub color: [u8; 3],
+    #[serde(default)]
+    pub blur: bool,
+}
+
+impl Background {
+    pub fn rgba(self) -> [u8; 4] {
+        [self.color[0], self.color[1], self.color[2], 255]
+    }
+}
+
 pub fn blurred_background(
     source: &[u8],
     source_width: u32,

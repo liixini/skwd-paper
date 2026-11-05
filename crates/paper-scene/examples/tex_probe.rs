@@ -2,7 +2,7 @@ fn main() {
     let path = std::env::args().nth(1).expect("tex path");
     let bytes = std::fs::read(&path).expect("read");
     match paper_scene::model::load_texture_bytes(&bytes) {
-        Some(texture) => {
+        Ok(texture) => {
             println!(
                 "ok {}x{} img {}x{} format {:?} frames {} clamp {} nearest {}",
                 texture.width,
@@ -18,6 +18,6 @@ fn main() {
                 println!("  {frame:?}");
             }
         }
-        None => println!("undecodable"),
+        Err(reason) => println!("{reason}"),
     }
 }

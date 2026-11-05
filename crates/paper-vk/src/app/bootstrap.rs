@@ -12,6 +12,9 @@ use crate::{ctl, wayland};
 use anyhow::{Context, Result};
 use paper_geom::FillMode;
 
+#[cfg(feature = "shared-device")]
+const REAL_TIME_FLAG: &str = "--real-time";
+
 fn usage() -> ! {
     tracing::info!(
         "usage: skwd-wall-vk <output|*> <video> [--standalone] [--layer background|bottom|top|overlay] [-o mute=yes;volume=80]"
@@ -23,6 +26,13 @@ fn parse_flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|arg| arg == name).and_then(|idx| args.get(idx + 1)).map(String::as_str)
 }
 
+fn duration_flag(args: &[String], shader: &str) -> u64 {
+    parse_flag(args, "--duration-ms")
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| paper_control::transitions::transition_duration(shader))
+}
+
+#[cfg(feature = "shared-device")]
 fn parse_flags<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
     args.windows(2).filter(|pair| pair[0] == name).map(|pair| pair[1].as_str()).collect()
 }
@@ -118,19 +128,20 @@ pub(crate) fn run() -> Result<()> {
             .and_then(|text| text.parse::<FillMode>().ok())
             .unwrap_or_default();
         set_fill_mode(fill);
-        return super::scene::dump_scene(
-            &args[2],
-            &properties,
-            width,
-            height,
+        return super::scene::dump_scene(&super::scene::DumpSpec {
+            dir: &args[2],
+            properties: &properties,
+            size: (width, height),
             frames,
             warmup,
-            number("--dt", 1.0 / 30.0),
-            number("--time0", 0.0),
-            number("--daytime", 0.5),
-            &out,
-        );
+            real_time: opts.iter().any(|opt| opt == REAL_TIME_FLAG),
+            dt: number("--dt", 1.0 / 30.0),
+            time0: number("--time0", 0.0),
+            daytime: number("--daytime", 0.5),
+            out_dir: &out,
+        });
     }
+    #[cfg(feature = "shared-device")]
     if args.iter().any(|arg| arg == "--video-stream") {
         if args.len() < 3 {
             usage();
@@ -142,9 +153,7 @@ pub(crate) fn run() -> Result<()> {
             parse_flag(&args[3..], "--stream-fps").and_then(|text| text.parse().ok()).unwrap_or(30);
         let transition_from = parse_flag(&args[3..], "--transition-from");
         let shader = parse_flag(&args[3..], "--shader").unwrap_or("fade");
-        let duration_ms = parse_flag(&args[3..], "--duration-ms")
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(600);
+        let duration_ms = duration_flag(&args[3..], shader);
         let mute = parse_flag(&args[3..], "--mute").is_none_or(|value| value == "true");
         let volume = parse_flag(&args[3..], "--volume")
             .and_then(|text| text.parse::<u32>().ok())
@@ -163,7 +172,14 @@ pub(crate) fn run() -> Result<()> {
             return super::scene::stream_scene(&args[2], &properties, targets, mute, volume);
         }
         return if targets.is_empty() {
-            crate::preview::video_stream(&args[2], width, height, fps, write_header)
+            let stream = crate::preview::StreamTarget::single(
+                crate::preview::NO_SOCKET,
+                width,
+                height,
+                fps,
+                paused,
+            );
+            crate::preview::video_stream(&args[2], &stream, write_header)
         } else {
             crate::preview::dmabuf_video_stream(
                 &args[2],
@@ -184,9 +200,7 @@ pub(crate) fn run() -> Result<()> {
         }
         let from = parse_flag(&args[3..], "--transition-from").unwrap_or(&args[2]);
         let shader = parse_flag(&args[3..], "--shader").unwrap_or("fade");
-        let duration_ms = parse_flag(&args[3..], "--duration-ms")
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(600);
+        let duration_ms = duration_flag(&args[3..], shader);
         let frame_ms: u64 = parse_flag(&args[3..], "--preview-frame-ms")
             .and_then(|text| text.parse().ok())
             .unwrap_or(16);
@@ -204,33 +218,22 @@ pub(crate) fn run() -> Result<()> {
             .and_then(|text| text.parse::<FillMode>().ok())
             .unwrap_or_default();
         set_fill_mode(fill);
-        let (width, height) = crate::preview::parse_size(parse_flag(&args[3..], "--preview-size"));
+        let preview = crate::preview::Preview {
+            from,
+            to: &args[2],
+            shader,
+            size: crate::preview::parse_size(parse_flag(&args[3..], "--preview-size")),
+            duration_ms,
+            frame_interval,
+            drawing: preview_drawing(shader, std::env::var(paper_control::DRAWING_ENV).ok())?,
+        };
         if let Some(socket) =
             parse_flag(&args[3..], "--stream-fd").and_then(|value| value.parse().ok())
         {
             anyhow::ensure!(once, "GPU transition streams must be one-shot");
-            return crate::preview::gpu::stream(
-                from,
-                &args[2],
-                shader,
-                width,
-                height,
-                duration_ms,
-                frame_interval,
-                socket,
-            );
+            return crate::preview::gpu::stream(&preview, socket);
         }
-        return crate::preview::stream(
-            from,
-            &args[2],
-            shader,
-            width,
-            height,
-            duration_ms,
-            frame_interval,
-            write_header,
-            once,
-        );
+        return crate::preview::stream(&preview, write_header, once);
     }
     if args.len() < 3 {
         usage();
@@ -245,9 +248,8 @@ pub(crate) fn run() -> Result<()> {
         }
         let layer = parse_flag(&args[3..], "--layer");
         let shader = parse_flag(&args[3..], "--shader");
-        let duration_ms = parse_flag(&args[3..], "--duration-ms")
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(600);
+        let duration_ms =
+            duration_flag(&args[3..], shader.unwrap_or(paper_control::transitions::DEFAULT_EFFECT));
         let fill = parse_flag(&args[3..], "--fill-mode")
             .and_then(|text| text.parse::<FillMode>().ok())
             .unwrap_or_default();
@@ -271,12 +273,14 @@ pub(crate) fn run() -> Result<()> {
         volume = vol.min(100);
     }
     let persist = args[3..].iter().any(|arg| arg == "--persist");
+    let shader = parse_flag(&args[3..], "--shader");
     let start_fade = parse_flag(&args[3..], "--transition-from").map(|from| StartFade {
         from: from.to_string(),
-        shader: parse_flag(&args[3..], "--shader").map(String::from),
-        duration_ms: parse_flag(&args[3..], "--duration-ms")
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(600),
+        shader: shader.map(String::from),
+        duration_ms: duration_flag(
+            &args[3..],
+            shader.unwrap_or(paper_control::transitions::DEFAULT_EFFECT),
+        ),
         overlay: !persist,
         held: transition_hold_enabled(&args[3..]),
     });
@@ -288,11 +292,6 @@ pub(crate) fn run() -> Result<()> {
     tracing::info!(output = %output, video = %video, fill = ?fill, "starting skwd-wall-vk");
 
     let mut target = wayland::setup(output, layer).context("wayland setup")?;
-    if scene_dir.is_none() {
-        target.set_content_type(
-            wayland_protocols::wp::content_type::v1::client::wp_content_type_v1::Type::Video,
-        );
-    }
     for surf in &target.app.surfaces {
         tracing::info!(w = surf.width, h = surf.height, output = %surf.name, "vk surface");
     }
@@ -309,6 +308,9 @@ pub(crate) fn run() -> Result<()> {
         }
         return result;
     }
+    target.set_content_type(
+        wayland_protocols::wp::content_type::v1::client::wp_content_type_v1::Type::Video,
+    );
     let result = dispatch_path(&mut target, video, mute, volume, start_fade);
     if result.is_err()
         && let Some(perr) = target.conn.protocol_error()
@@ -322,6 +324,17 @@ pub(crate) fn run() -> Result<()> {
         );
     }
     result
+}
+
+#[cfg(feature = "shared-device")]
+fn preview_drawing(
+    shader: &str,
+    value: Option<String>,
+) -> Result<Option<paper_control::DrawingTransition>> {
+    if shader != paper_shaders::DRAWING_SHADER {
+        return Ok(None);
+    }
+    Ok(value.map(|value| serde_json::from_str(&value)).transpose()?)
 }
 
 fn dispatch_path(

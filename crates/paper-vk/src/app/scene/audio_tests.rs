@@ -41,7 +41,7 @@ fn audio_uniforms_follow_effect_layers_after_scene_target_sorting() {
     let mut model = paper_scene::model::load_with(&package, &assets).unwrap();
     model.layers.reverse();
     assert_eq!(model.layers.iter().map(|layer| layer.id.as_str()).collect::<Vec<_>>(), ["2", "1"]);
-    let shared = crate::shared::create(std::ptr::null_mut()).unwrap();
+    let shared = crate::shared::test_device();
     let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
     group.audio = None;
     assert_eq!(group.fx.iter().map(|fx| fx.layer_id.as_str()).collect::<Vec<_>>(), ["1", "2"]);

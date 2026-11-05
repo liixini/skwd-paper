@@ -4,7 +4,29 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+pub(crate) const GLSL_UINT: &str = "uint";
+const GLSL_MAT4X3: &str = "mat4x3";
+const SAMPLER_SOURCE: &str = "samplers";
+const SAMPLER_UNIFORM: &str = "uniform sampler";
+const SHADER_ENTRY: &str = "main";
+const LINE_BREAK: &str = "\n";
+const LINE_COMMENT: &str = "//";
+const UNIFORM_DECL: &str = "uniform ";
+const PRECISION_QUALIFIERS: [&str; 3] = ["lowp", "mediump", "highp"];
+const MATERIAL_NOTE_FIELD: &str = "material";
+const COMPONENTS_NOTE_FIELD: &str = "components";
+const COMBO_NOTE_FIELD: &str = "combo";
+const STD140_ARRAY_ALIGNMENT: usize = 16;
+pub(crate) const DEFINE_PREFIX: &str = "#define ";
+pub(crate) const UNDEF_PREFIX: &str = "#undef ";
+const UNDEF_DIRECTIVE: &str = "undef";
+const UNRESOLVED_UNIFORM_ARRAY: &str = "#error unresolved uniform array size\n";
+
 pub const PRELUDE: &str = r"#version 450
+#define CASTU(x) (uint(x))
+#define CASTI(x) (int(x))
+#define CASTF(x) (float(x))
+#define CAST4U(x) (uvec4(x))
 #define CAST2(x) (vec2(x))
 #define CAST3(x) (vec3(x))
 #define CAST4(x) (vec4(x))
@@ -26,14 +48,22 @@ pub const PRELUDE: &str = r"#version 450
 #define texSample2D(s, uv) texture(s, vec2(uv))
 #define texSample2DLod(s, uv, l) textureLod(s, vec2(uv), l)
 #define texSample2DGrad(s, uv, dx, dy) textureGrad(s, vec2(uv), dx, dy)
+#define texSample2DCompare(s, uv, depth) vec4(texture(s, vec3(uv, depth)))
+#define DECLARE_SAMPLER2D_PARAMETER(s) sampler2D s
+#define MAKE_SAMPLER2D_ARGUMENT(s) s
 #define mul(v, m) ((m) * (v))
+vec2 mix(vec2 before, vec2 after, bool select) { return select ? after : before; }
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
     Vertex,
+    Geometry,
     Fragment,
 }
+
+mod geometry;
+pub use geometry::{interfaces as geometry_interfaces, translate_geometry};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UniformKind {
@@ -43,7 +73,9 @@ pub enum UniformKind {
     Vec4,
     Mat3,
     Mat4,
+    Mat4x3,
     Int,
+    Uint,
 }
 
 impl UniformKind {
@@ -55,25 +87,27 @@ impl UniformKind {
             "vec4" => Self::Vec4,
             "mat3" => Self::Mat3,
             "mat4" => Self::Mat4,
+            GLSL_MAT4X3 => Self::Mat4x3,
             "int" | "bool" => Self::Int,
+            GLSL_UINT => Self::Uint,
             _ => return None,
         })
     }
 
     pub fn std140_size(&self) -> usize {
         match self {
-            Self::Float | Self::Int => 4,
+            Self::Float | Self::Int | Self::Uint => 4,
             Self::Vec2 => 8,
             Self::Vec3 => 12,
             Self::Vec4 => 16,
             Self::Mat3 => 48,
-            Self::Mat4 => 64,
+            Self::Mat4 | Self::Mat4x3 => 64,
         }
     }
 
     pub fn std140_align(&self) -> usize {
         match self {
-            Self::Float | Self::Int => 4,
+            Self::Float | Self::Int | Self::Uint => 4,
             Self::Vec2 => 8,
             _ => 16,
         }
@@ -87,7 +121,9 @@ impl UniformKind {
             Self::Vec4 => "vec4",
             Self::Mat3 => "mat3",
             Self::Mat4 => "mat4",
+            Self::Mat4x3 => GLSL_MAT4X3,
             Self::Int => "int",
+            Self::Uint => GLSL_UINT,
         }
     }
 }
@@ -105,8 +141,9 @@ pub struct Uniform {
 impl Uniform {
     #[must_use]
     pub fn std140_span(&self) -> usize {
-        if self.count > 1 {
-            let stride = self.kind.std140_size().div_ceil(16) * 16;
+        if self.name.contains('[') {
+            let stride =
+                self.kind.std140_size().div_ceil(STD140_ARRAY_ALIGNMENT) * STD140_ARRAY_ALIGNMENT;
             return stride * self.count;
         }
         self.kind.std140_size()
@@ -114,26 +151,19 @@ impl Uniform {
 
     #[must_use]
     pub fn std140_align(&self) -> usize {
-        if self.count > 1 { 16 } else { self.kind.std140_align() }
+        if self.name.contains('[') { STD140_ARRAY_ALIGNMENT } else { self.kind.std140_align() }
     }
-}
-
-fn array_count(name: &str) -> usize {
-    let Some(open) = name.find('[') else {
-        return 1;
-    };
-    let Some(close) = name[open..].find(']') else {
-        return 1;
-    };
-    name[open + 1..open + close].trim().parse::<usize>().unwrap_or(1).max(1)
 }
 
 #[derive(Clone, Debug)]
 pub struct Sampler {
+    pub comparison: bool,
+    pub material: Option<String>,
     pub name: String,
     pub index: u32,
     pub default: Option<String>,
     pub combo: Option<String>,
+    pub components: Vec<Option<String>>,
 }
 
 pub struct Translated {
@@ -151,6 +181,39 @@ fn annotation_default(line: &str) -> Option<serde_json::Value> {
     crate::json::parse(comment.as_bytes()).ok()
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct MaterialBinding {
+    pub uniform: String,
+    pub value: Option<Vec<f32>>,
+    pub width: usize,
+}
+
+pub(crate) fn material_bindings(source: &str) -> BTreeMap<String, MaterialBinding> {
+    let mut bindings = BTreeMap::new();
+    for line in source.lines() {
+        let code = line.trim_start().split(LINE_COMMENT).next().unwrap_or("").trim();
+        let Some(rest) = code.strip_prefix(UNIFORM_DECL) else { continue };
+        let mut words = rest.trim_end_matches(';').split_whitespace();
+        let (Some(kind), Some(name)) = (words.next(), words.next()) else { continue };
+        let Some(kind) = UniformKind::parse(kind) else { continue };
+        let name = name.trim_end_matches(';').trim();
+        let Some(note) = annotation_default(line) else { continue };
+        let Some(material) = note.get(MATERIAL_NOTE_FIELD).and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        bindings.insert(
+            material.to_string(),
+            MaterialBinding {
+                uniform: name.to_string(),
+                value: default_values(&kind, Some(&note)),
+                width: kind.std140_size() / size_of::<f32>(),
+            },
+        );
+    }
+    bindings
+}
+
 fn default_values(kind: &UniformKind, note: Option<&serde_json::Value>) -> Option<Vec<f32>> {
     let raw = note?.get("default")?;
     let mut out = Vec::new();
@@ -165,7 +228,7 @@ fn default_values(kind: &UniformKind, note: Option<&serde_json::Value>) -> Optio
         _ => return None,
     }
     let want = match kind {
-        UniformKind::Float | UniformKind::Int => 1,
+        UniformKind::Float | UniformKind::Int | UniformKind::Uint => 1,
         UniformKind::Vec2 => 2,
         UniformKind::Vec3 => 3,
         UniformKind::Vec4 => 4,
@@ -214,7 +277,12 @@ float greyscale(vec4 color) {
 }
 ";
 
-const LIGHTING_V1_STUB: &str = "vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewDir, vec3 specularTint, vec3 baseReflectance, float roughness, float metallic) { return CAST3(0.0); }\n";
+const LIGHTING_V1: &str = include_str!("shader/lighting.glsl");
+pub const SHADOW_TEXTURE: &str = "SHADOW_TEXTURE";
+const SHADOW_SAMPLER: &str = "g_Texture6";
+const SHADOW_BEGIN: &str = "#if SKWD_LIGHT_SHADOWS\n";
+const SHADOW_END: &str = "#endif\n";
+pub const SHADOW_SAMPLE: &str = include_str!("shader/shadow.glsl");
 
 pub fn resolve_includes(
     source: &str,
@@ -229,7 +297,10 @@ pub fn resolve_includes(
         let trimmed = line.trim_start();
         if let Some(module) = trimmed.strip_prefix("#require") {
             if module.trim() == "LightingV1" {
-                out.push_str(LIGHTING_V1_STUB);
+                out.push_str(SHADOW_BEGIN);
+                out.push_str(&SHADOW_SAMPLE.replace(SHADOW_TEXTURE, SHADOW_SAMPLER));
+                out.push_str(SHADOW_END);
+                out.push_str(LIGHTING_V1);
             }
             continue;
         }
@@ -260,6 +331,20 @@ pub fn resolve_includes(
 
 const RESERVED: [&str; 8] =
     ["sample", "filter", "input", "output", "active", "partition", "resource", "common"];
+
+pub(crate) fn rename_authored_mod(source: &str) -> String {
+    const MOD: &str = "mod";
+    const AUTHORED_MOD: &str = "skwd_authored_mod";
+    let declared = source.lines().any(|line| {
+        let code = line.split(LINE_COMMENT).next().unwrap_or_default();
+        code.split([';', '{', '}']).any(|statement| {
+            let Some((head, _)) = statement.split_once('(') else { return false };
+            let mut words = head.split_whitespace().rev();
+            words.next() == Some(MOD) && words.next().and_then(UniformKind::parse).is_some()
+        })
+    });
+    if declared { rename_word(source, MOD, AUTHORED_MOD) } else { source.to_owned() }
+}
 
 fn is_word_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
@@ -336,7 +421,7 @@ fn defined_symbols(source: &str) -> Vec<String> {
     source
         .lines()
         .filter_map(|line| {
-            let rest = line.trim_start().strip_prefix("#define ")?;
+            let rest = line.trim_start().strip_prefix(DEFINE_PREFIX)?;
             rest.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
                 .find(|word| !word.is_empty())
                 .map(String::from)
@@ -364,6 +449,42 @@ fn array_size(decl: &str, combos: &BTreeMap<String, i64>) -> Option<u32> {
     u32::try_from(value).ok().map(|count| count.max(1))
 }
 
+fn uniform_array_size(
+    decl: &str,
+    combos: &BTreeMap<String, i64>,
+    macros: &BTreeMap<String, Option<String>>,
+) -> Option<u32> {
+    let open = decl.find('[')?;
+    let close = open + decl[open..].find(']')?;
+    let mut text = decl[open + 1..close].trim();
+    let mut seen = Vec::new();
+    loop {
+        if let Ok(count) = text.parse::<u32>() {
+            return (count > 0).then_some(count);
+        }
+        if text.is_empty() || !text.bytes().all(is_word_char) || seen.contains(&text) {
+            return None;
+        }
+        seen.push(text);
+        match macros.get(text) {
+            Some(Some(value)) => text = value.trim(),
+            Some(None) => return None,
+            None => {
+                let count = u32::try_from(*combos.get(text)?).ok()?;
+                return (count > 0).then_some(count);
+            }
+        }
+    }
+}
+
+fn uniform_decl(uniform: &Uniform) -> String {
+    if uniform.name.contains('[') {
+        replace_array_size(&uniform.name, uniform.count as u32)
+    } else {
+        uniform.name.clone()
+    }
+}
+
 fn varying_locations(decl: &str, combos: &BTreeMap<String, i64>) -> u32 {
     if decl.contains('[') { array_size(decl, combos).unwrap_or(1).max(1) } else { 1 }
 }
@@ -371,12 +492,12 @@ fn varying_locations(decl: &str, combos: &BTreeMap<String, i64>) -> u32 {
 fn array_varying(decl: &str, combos: &BTreeMap<String, i64>) -> Option<(u32, u32)> {
     let count = array_size(decl, combos)?;
     let width = vector_width(decl.split_whitespace().next().unwrap_or(""));
-    (width == 1 || width == 2).then_some((width, count))
+    (width > 0 && width < PACKED_COMPONENTS).then_some((width, count))
 }
 
 fn packed_locations(decl: &str, combos: &BTreeMap<String, i64>) -> u32 {
     match array_varying(decl, combos) {
-        Some((width, count)) => (count * width).div_ceil(4),
+        Some((width, count)) => VaryingPack { width, count }.slots(),
         None => varying_locations(decl, combos),
     }
 }
@@ -481,6 +602,77 @@ fn fix_math_calls(source: &str) -> String {
         out.push_str(&args.join(","));
         out.push(')');
         idx = cursor + 1;
+    }
+    out
+}
+
+fn cast_conditions(source: &str) -> String {
+    const BLOCK_START: &[u8] = b"/*";
+    const BLOCK_END: &[u8] = b"*/";
+    const IF_KEYWORD: &[u8] = b"if";
+    const CAST_START: &str = "bool(";
+    const CAST_END: &str = "))";
+
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut idx = 0;
+    let mut line_start = 0;
+    while idx < bytes.len() {
+        if bytes[idx..].starts_with(LINE_COMMENT.as_bytes()) {
+            let end = bytes[idx..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |end| idx + end);
+            out.push_str(&source[idx..end]);
+            idx = end;
+            continue;
+        }
+        if bytes[idx..].starts_with(BLOCK_START) {
+            let end = bytes[idx + BLOCK_START.len()..]
+                .windows(BLOCK_END.len())
+                .position(|pair| pair == BLOCK_END)
+                .map_or(bytes.len(), |end| idx + end + BLOCK_START.len() + BLOCK_END.len());
+            out.push_str(&source[idx..end]);
+            line_start = source[..end].rfind('\n').map_or(line_start, |at| at + 1);
+            idx = end;
+            continue;
+        }
+        if bytes[idx..].starts_with(IF_KEYWORD)
+            && (idx == 0 || !is_word_char(bytes[idx - 1]))
+            && bytes.get(idx + IF_KEYWORD.len()).is_none_or(|byte| !is_word_char(*byte))
+            && !source[line_start..idx].trim_start().starts_with('#')
+        {
+            let open =
+                (idx + IF_KEYWORD.len()..bytes.len()).find(|at| !bytes[*at].is_ascii_whitespace());
+            if let Some(open) = open
+                && bytes[open] == b'('
+            {
+                let mut depth = 1;
+                let mut end = open + 1;
+                while end < bytes.len() && depth > 0 {
+                    match bytes[end] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                if depth == 0 {
+                    out.push_str(&source[idx..=open]);
+                    out.push_str(CAST_START);
+                    out.push_str(&source[open + 1..end - 1]);
+                    out.push_str(CAST_END);
+                    idx = end;
+                    continue;
+                }
+            }
+        }
+        let width = utf8_width(bytes[idx]);
+        out.push_str(&source[idx..idx + width]);
+        if bytes[idx] == b'\n' {
+            line_start = idx + 1;
+        }
+        idx += width;
     }
     out
 }
@@ -609,15 +801,22 @@ fn evaluate(expr: &str, symbols: &dyn Fn(&str) -> Option<i64>) -> bool {
 #[must_use]
 pub fn preprocess(source: &str, combos: &BTreeMap<String, i64>) -> String {
     let mut defines: BTreeMap<String, i64> = BTreeMap::new();
+    let mut undefined = std::collections::BTreeSet::new();
     let mut stack: Vec<(bool, bool)> = Vec::new();
     let mut out = String::with_capacity(source.len());
     for line in source.lines() {
         let active = stack.iter().all(|(taken, _)| *taken);
         let code = line.trim_start().split("//").next().unwrap_or("").trim_end();
         let directive = code.strip_prefix('#').map(str::trim_start);
-        let lookup = |name: &str| defines.get(name).or_else(|| combos.get(name)).copied();
+        let lookup = |name: &str| {
+            (!undefined.contains(name))
+                .then(|| defines.get(name).or_else(|| combos.get(name)).copied())
+                .flatten()
+        };
         if let Some(rest) = directive {
-            let (word, arg) = rest.split_once(|ch: char| ch.is_whitespace()).unwrap_or((rest, ""));
+            let end = rest.find(|ch: char| !ch.is_ascii_alphabetic()).unwrap_or(rest.len());
+            let (word, arg) = rest.split_at(end);
+            let arg = arg.trim_start();
             match word {
                 "if" => {
                     let taken = active && evaluate(arg, &lookup);
@@ -651,7 +850,14 @@ pub fn preprocess(source: &str, combos: &BTreeMap<String, i64>) -> String {
                         let name = name.split('(').next().unwrap_or(name);
                         let value =
                             parts.next().and_then(|raw| raw.parse::<i64>().ok()).unwrap_or(1);
+                        undefined.remove(name);
                         defines.insert(name.to_string(), value);
+                    }
+                }
+                UNDEF_DIRECTIVE if active => {
+                    if let Some(name) = arg.split_whitespace().next() {
+                        defines.remove(name);
+                        undefined.insert(name.to_string());
                     }
                 }
                 _ => {}
@@ -765,7 +971,7 @@ fn write_conditional(out: &mut String, conditions: &[(String, bool)], statement:
     }
     let _ = writeln!(out, "    {statement}");
     for _ in conditions {
-        out.push_str("#endif\n");
+        out.push_str(SHADOW_END);
     }
 }
 
@@ -778,16 +984,12 @@ struct PackedArray {
 
 impl PackedArray {
     fn slots(&self) -> u32 {
-        (self.count * self.width).div_ceil(4)
+        VaryingPack { width: self.width, count: self.count }.slots()
     }
 
     fn copies(&self, out: &mut String, stage: Stage) {
-        let per = 4 / self.width;
-        for index in 0..self.count {
-            let lane = ((index % per) * self.width) as usize;
-            let lanes = &"xyzw"[lane..lane + self.width as usize];
-            let io = format!("skwd_io_{}[{}].{lanes}", self.name, index / per);
-            let local = format!("{}[{index}]", self.name);
+        let pack = VaryingPack { width: self.width, count: self.count };
+        for (io, local) in pack.bindings(&self.name) {
             let statement = if stage == Stage::Vertex {
                 format!("{io} = {local};")
             } else {
@@ -797,6 +999,56 @@ impl PackedArray {
         }
     }
 }
+
+pub(crate) struct VaryingPack {
+    pub width: u32,
+    pub count: u32,
+}
+
+impl VaryingPack {
+    pub fn slots(&self) -> u32 {
+        (self.count * self.width).div_ceil(PACKED_COMPONENTS)
+    }
+
+    pub fn element(&self, index: u32) -> (u32, &'static str) {
+        match self.width {
+            1 => (index / PACKED_COMPONENTS, SCALAR_LANES[index as usize % SCALAR_LANES.len()]),
+            2 => (
+                index / VECTOR_LANES.len() as u32,
+                VECTOR_LANES[index as usize % VECTOR_LANES.len()],
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn bindings(&self, name: &str) -> Vec<(String, String)> {
+        let mut bindings = Vec::new();
+        for index in 0..self.count {
+            let start = index * self.width;
+            let end = start + self.width;
+            for slot in start / PACKED_COMPONENTS..end.div_ceil(PACKED_COMPONENTS) {
+                let offset = slot * PACKED_COMPONENTS;
+                let first = start.max(offset);
+                let last = end.min(offset + PACKED_COMPONENTS);
+                let lanes = &COMPONENT_LANES[(first - offset) as usize..(last - offset) as usize];
+                let io = format!("skwd_io_{name}[{slot}].{lanes}");
+                let local = if last - first == self.width {
+                    format!("{name}[{index}]")
+                } else {
+                    let lanes = &COMPONENT_LANES[(first - start) as usize..(last - start) as usize];
+                    format!("{name}[{index}].{lanes}")
+                };
+                bindings.push((io, local));
+            }
+        }
+        bindings
+    }
+}
+
+pub(crate) const PACKED_COMPONENTS: u32 = 4;
+const SCALAR_LANES: [&str; 4] = ["x", "y", "z", "w"];
+const VECTOR_LANES: [&str; 2] = ["xy", "zw"];
+const COMPONENT_LANES: &str = "xyzw";
 
 fn track_condition(stack: &mut Vec<(String, bool)>, code: &str) {
     if code.starts_with("#if") {
@@ -909,11 +1161,142 @@ pub fn close_non_void_functions(source: &str) -> String {
     out
 }
 
-fn words_of(text: &str) -> Vec<String> {
+pub(crate) fn reads_sampler(source: &str, combos: &BTreeMap<String, i64>, name: &str) -> bool {
+    preprocess(source, combos)
+        .lines()
+        .map(|line| line.split(LINE_COMMENT).next().unwrap_or(""))
+        .filter(|line| !line.contains(SAMPLER_UNIFORM))
+        .any(|line| words_of(line).iter().any(|word| word == name))
+}
+
+pub(crate) fn words_of(text: &str) -> Vec<String> {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|word| !word.is_empty() && !word.starts_with(|c: char| c.is_ascii_digit()))
         .map(str::to_string)
         .collect()
+}
+
+const COMPARISON_TYPES: [&str; 2] = ["sampler2DComparison", "sampler2DShadow"];
+const SAMPLER_TYPE: &str = "sampler2D";
+
+fn sampler_line(sampler: &Sampler) -> String {
+    let kind = if sampler.comparison { COMPARISON_TYPES[1] } else { SAMPLER_TYPE };
+    format!("layout(set = 0, binding = {}) uniform {kind} {};", sampler.index + 1, sampler.name)
+}
+
+const PRUNE_CACHE_LIMIT: usize = 256;
+
+type PrunedWords = std::rc::Rc<[String]>;
+
+thread_local! {
+    static PRUNE_WORDS: std::cell::RefCell<std::collections::HashMap<(bool, u64), (String, PrunedWords)>> =
+        std::cell::RefCell::default();
+}
+
+fn prune_words(code: &str, language: shaderc::SourceLanguage) -> Option<PrunedWords> {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(code, &mut hasher);
+    let key = (language == shaderc::SourceLanguage::HLSL, std::hash::Hasher::finish(&hasher));
+    let cached = PRUNE_WORDS.with_borrow(|cache| {
+        cache.get(&key).filter(|(source, _)| source == code).map(|(_, words)| words.clone())
+    });
+    if cached.is_some() {
+        return cached;
+    }
+    let compiler = shaderc::Compiler::new().ok()?;
+    let mut options = shaderc::CompileOptions::new().ok()?;
+    options.set_source_language(language);
+    let preprocessed = compiler
+        .preprocess(code, SAMPLER_SOURCE, SHADER_ENTRY, Some(&options))
+        .inspect_err(|err| tracing::debug!(%err, "shader: sampler pruning skipped"))
+        .ok()?;
+    let words: PrunedWords = words_of(&preprocessed.as_text()).into();
+    PRUNE_WORDS.with_borrow_mut(|cache| {
+        if cache.len() >= PRUNE_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, (code.to_owned(), words.clone()));
+    });
+    Some(words)
+}
+
+pub(crate) fn omit_unused_samplers(
+    translated: &mut Translated,
+    combos: &BTreeMap<String, i64>,
+    present: &[bool],
+    hlsl: Option<&str>,
+) {
+    let missing: Vec<_> = translated
+        .samplers
+        .iter()
+        .filter(|sampler| {
+            sampler.index != 0
+                && sampler
+                    .combo
+                    .as_ref()
+                    .is_some_and(|combo| combos.get(combo).copied().unwrap_or(0) == 0)
+                && !present.get(sampler.index as usize).copied().unwrap_or(false)
+        })
+        .map(|sampler| sampler.name.clone())
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let declarations: Vec<_> = translated.samplers.iter().map(sampler_line).collect();
+    let glsl = translated
+        .source
+        .lines()
+        .filter(|line| !declarations.iter().any(|declaration| *line == declaration))
+        .collect::<Vec<_>>()
+        .join(LINE_BREAK);
+    let Some(glsl_words) = prune_words(&glsl, shaderc::SourceLanguage::GLSL) else { return };
+    let hlsl_words = if let Some(source) = hlsl {
+        let mut code = crate::hlsl::PRELUDE.to_string();
+        for (name, value) in combos {
+            let _ = writeln!(code, "#define {name} {value}");
+        }
+        for line in source.lines() {
+            let declaration = line.split(LINE_COMMENT).next().unwrap_or("").trim();
+            if declaration.starts_with(SAMPLER_UNIFORM) && declaration.ends_with(';') {
+                continue;
+            }
+            if let Some(macro_name) = declaration
+                .strip_prefix(DEFINE_PREFIX)
+                .and_then(|rest| rest.split(|ch: char| ch == '(' || ch.is_whitespace()).next())
+            {
+                let _ = writeln!(code, "{UNDEF_PREFIX}{macro_name}");
+            }
+            code.push_str(line);
+            code.push('\n');
+        }
+        match prune_words(&code, shaderc::SourceLanguage::HLSL) {
+            Some(words) => words,
+            None => return,
+        }
+    } else {
+        PrunedWords::from([])
+    };
+    let omitted: Vec<_> = missing
+        .into_iter()
+        .filter(|name| !glsl_words.contains(name) && !hlsl_words.contains(name))
+        .collect();
+    if omitted.is_empty() {
+        return;
+    }
+    let omitted_lines: Vec<_> = translated
+        .samplers
+        .iter()
+        .filter(|sampler| omitted.contains(&sampler.name))
+        .map(sampler_line)
+        .collect();
+    translated.samplers.retain(|sampler| !omitted.contains(&sampler.name));
+    translated.source = translated
+        .source
+        .lines()
+        .filter(|line| !omitted_lines.iter().any(|declaration| *line == declaration))
+        .collect::<Vec<_>>()
+        .join(LINE_BREAK);
+    translated.source.push('\n');
 }
 
 fn dynamic_words(source: &str) -> std::collections::BTreeSet<String> {
@@ -921,13 +1304,13 @@ fn dynamic_words(source: &str) -> std::collections::BTreeSet<String> {
     let mut defines: Vec<(String, String)> = Vec::new();
     for line in source.lines() {
         let code = line.split("//").next().unwrap_or("").trim();
-        if let Some(rest) = code.strip_prefix("uniform ") {
+        if let Some(rest) = code.strip_prefix(UNIFORM_DECL) {
             let decl = rest.trim_end_matches(';');
             let name = decl.split(['[', '=']).next().unwrap_or(decl);
             if let Some(word) = name.split_whitespace().last() {
                 dynamic.insert(word.to_string());
             }
-        } else if let Some(rest) = code.strip_prefix("#define ") {
+        } else if let Some(rest) = code.strip_prefix(DEFINE_PREFIX) {
             let rest = rest.trim();
             let split = rest.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(rest.len());
             let (name, body) = rest.split_at(split);
@@ -1029,7 +1412,7 @@ pub fn translate_with(
     combos: &BTreeMap<String, i64>,
     varyings: Option<&BTreeMap<String, VaryingSlot>>,
 ) -> Translated {
-    let mut source = source.to_string();
+    let mut source = rename_authored_mod(source);
     for word in RESERVED {
         if source.contains(word) {
             source = rename_word(&source, word, &format!("skwd_{word}"));
@@ -1038,6 +1421,9 @@ pub fn translate_with(
     let source = fix_math_calls(&source);
     let source = source.as_str();
     let mut known_macros = defined_symbols(PRELUDE);
+    known_macros.extend(combos.keys().cloned());
+    let mut array_macros: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut unresolved_uniform = false;
     let mut body = String::new();
     let mut uniforms: Vec<Uniform> = Vec::new();
     let mut samplers: Vec<Sampler> = Vec::new();
@@ -1056,7 +1442,20 @@ pub fn translate_with(
         }
         let code = trimmed.split("//").next().unwrap_or("").trim();
         track_condition(&mut conditions, code);
-        if let Some(rest) = code.strip_prefix("#define ")
+        if let Some(rest) = code.strip_prefix(UNDEF_PREFIX)
+            && let Some(name) = rest.split_whitespace().next()
+        {
+            array_macros.insert(name.to_string(), None);
+        }
+        if let Some(rest) = code.strip_prefix(DEFINE_PREFIX) {
+            let (name, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            if !name.is_empty() {
+                let value = (!name.contains('(') && !value.trim().is_empty())
+                    .then(|| value.trim().to_string());
+                array_macros.insert(name.to_string(), value);
+            }
+        }
+        if let Some(rest) = code.strip_prefix(DEFINE_PREFIX)
             && let Some(name) =
                 rest.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).next()
             && !name.is_empty()
@@ -1070,7 +1469,10 @@ pub fn translate_with(
 
         if let Some(rest) = code.strip_prefix("uniform ") {
             let mut words = rest.trim_end_matches(';').split_whitespace();
-            let (Some(ty), Some(name_raw)) = (words.next(), words.next()) else {
+            let ty = words.next();
+            let ty =
+                ty.filter(|word| !PRECISION_QUALIFIERS.contains(word)).or_else(|| words.next());
+            let (Some(ty), Some(name_raw)) = (ty, words.next()) else {
                 body.push_str(line);
                 body.push('\n');
                 continue;
@@ -1083,13 +1485,33 @@ pub fn translate_with(
                     .and_then(|digits| digits.parse::<u32>().ok())
                     .unwrap_or(samplers.len() as u32);
                 samplers.push(Sampler {
+                    comparison: COMPARISON_TYPES.contains(&ty),
+                    material: note
+                        .as_ref()
+                        .and_then(|note| note.get(MATERIAL_NOTE_FIELD))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                     name: name.to_string(),
                     index,
                     combo: note
                         .as_ref()
-                        .and_then(|note| note.get("combo"))
+                        .and_then(|note| note.get(COMBO_NOTE_FIELD))
                         .and_then(|value| value.as_str())
                         .map(str::to_string),
+                    components: note
+                        .as_ref()
+                        .and_then(|note| note.get(COMPONENTS_NOTE_FIELD))
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .take(crate::tex::COMPONENT_COUNT)
+                        .map(|component| {
+                            component
+                                .get(COMBO_NOTE_FIELD)
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .collect(),
                     default: note
                         .as_ref()
                         .and_then(|note| note.get("default"))
@@ -1102,16 +1524,22 @@ pub fn translate_with(
                 let default = default_values(&kind, note.as_ref());
                 let material = note
                     .as_ref()
-                    .and_then(|note| note.get("material"))
+                    .and_then(|note| note.get(MATERIAL_NOTE_FIELD))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
+                let count = if name.contains('[') {
+                    uniform_array_size(name, combos, &array_macros)
+                } else {
+                    Some(1)
+                };
+                unresolved_uniform |= count.is_none();
                 uniforms.push(Uniform {
                     name: name.to_string(),
                     kind,
                     default,
                     material,
                     offset: 0,
-                    count: array_count(name),
+                    count: count.unwrap_or(1) as usize,
                 });
                 continue;
             }
@@ -1163,6 +1591,9 @@ pub fn translate_with(
             varying_loc = location + packed_locations(decl, combos);
             continue;
         }
+        if line.contains("gl_FragColor") {
+            uses_frag_color = true;
+        }
         if (!shadows.is_empty() || !packed.is_empty() || varyings.is_some())
             && let Some(at) = code.find("void main")
             && code[at + 9..].trim_start().starts_with('(')
@@ -1175,9 +1606,6 @@ pub fn translate_with(
             let _ = writeln!(body, "layout(location = {attribute_loc}) in {decl};");
             attribute_loc += 1;
             continue;
-        }
-        if line.contains("gl_FragColor") {
-            uses_frag_color = true;
         }
         body.push_str(line);
         body.push('\n');
@@ -1211,7 +1639,7 @@ pub fn translate_with(
         uniform.offset = offset;
         offset += uniform.std140_span();
     }
-    let block_size = offset.div_ceil(16) * 16;
+    let block_size = offset.div_ceil(STD140_ARRAY_ALIGNMENT) * STD140_ARRAY_ALIGNMENT;
 
     let mut out = String::with_capacity(source.len() + PRELUDE.len() + 512);
     out.push_str(PRELUDE);
@@ -1224,26 +1652,25 @@ pub fn translate_with(
             let _ = writeln!(out, "#define {symbol} 0");
         }
     }
+    if unresolved_uniform {
+        out.push_str(UNRESOLVED_UNIFORM_ARRAY);
+    }
     if !uniforms.is_empty() {
         out.push_str("layout(std140, set = 0, binding = 0) uniform SkwdParams {\n");
         for uniform in &uniforms {
-            let _ = writeln!(out, "    {} {};", uniform.kind.glsl(), uniform.name);
+            let _ = writeln!(out, "    {} {};", uniform.kind.glsl(), uniform_decl(uniform));
         }
         out.push_str("};\n");
     }
     for sampler in &samplers {
-        let _ = writeln!(
-            out,
-            "layout(set = 0, binding = {}) uniform sampler2D {};",
-            sampler.index + 1,
-            sampler.name
-        );
+        out.push_str(&sampler_line(sampler));
+        out.push('\n');
     }
     if stage == Stage::Fragment && uses_frag_color {
         out.push_str("layout(location = 0) out vec4 skwd_FragColor;\n");
         out.push_str("#define gl_FragColor skwd_FragColor\n");
     }
-    out.push_str(&body);
+    out.push_str(&cast_conditions(&body));
     if body.contains("void skwd_main") {
         out.push_str("void main() {\n");
         if stage == Stage::Fragment {
@@ -1275,7 +1702,7 @@ fn block_text(uniforms: &[Uniform]) -> String {
     }
     let mut out = String::from("layout(std140, set = 0, binding = 0) uniform SkwdParams {\n");
     for uniform in uniforms {
-        let _ = writeln!(out, "    {} {};", uniform.kind.glsl(), uniform.name);
+        let _ = writeln!(out, "    {} {};", uniform.kind.glsl(), uniform_decl(uniform));
     }
     out.push_str("};\n");
     out
@@ -1306,10 +1733,16 @@ fn replace_block(source: &str, block: &str) -> String {
 }
 
 pub fn unify_uniforms(vertex: &mut Translated, fragment: &mut Translated) {
-    let mut union: Vec<Uniform> = vertex.uniforms.clone();
-    for uniform in &fragment.uniforms {
-        if !union.iter().any(|known| known.name == uniform.name) {
-            union.push(uniform.clone());
+    unify_uniform_stages(&mut [vertex, fragment]);
+}
+
+pub fn unify_uniform_stages(stages: &mut [&mut Translated]) {
+    let mut union: Vec<Uniform> = Vec::new();
+    for stage in stages.iter() {
+        for uniform in &stage.uniforms {
+            if !union.iter().any(|known| known.name == uniform.name) {
+                union.push(uniform.clone());
+            }
         }
     }
     let mut offset = 0usize;
@@ -1319,53 +1752,66 @@ pub fn unify_uniforms(vertex: &mut Translated, fragment: &mut Translated) {
         uniform.offset = offset;
         offset += uniform.std140_span();
     }
-    let size = offset.div_ceil(16) * 16;
+    let size = offset.div_ceil(STD140_ARRAY_ALIGNMENT) * STD140_ARRAY_ALIGNMENT;
     let block = block_text(&union);
-    vertex.source = replace_block(&vertex.source, &block);
-    fragment.source = replace_block(&fragment.source, &block);
-    vertex.uniforms.clone_from(&union);
-    fragment.uniforms = union;
-    vertex.block_size = size.max(16);
-    fragment.block_size = size.max(16);
+    for stage in stages.iter_mut() {
+        stage.source = replace_block(&stage.source, &block);
+        stage.uniforms.clone_from(&union);
+        stage.block_size = size.max(16);
+    }
 }
 
 const IDENTITY4: [f32; 16] =
     [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+const SPLAT_LANES: usize = 4;
 const IDENTITY3_STD140: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
 
 pub fn pack_uniforms(uniforms: &[Uniform], values: &BTreeMap<String, Vec<f32>>) -> Vec<u8> {
+    pack_with(uniforms, |name| values.get(name).map(Vec::as_slice))
+}
+
+pub fn pack_with<'a>(
+    uniforms: &'a [Uniform],
+    lookup: impl Fn(&str) -> Option<&'a [f32]>,
+) -> Vec<u8> {
     let size =
         uniforms.iter().map(|uniform| uniform.offset + uniform.std140_span()).max().unwrap_or(16);
-    let mut out = vec![0u8; size.div_ceil(16) * 16];
-    let identity4 = IDENTITY4.to_vec();
-    let identity3 = IDENTITY3_STD140.to_vec();
+    let mut out = vec![0u8; size.div_ceil(STD140_ARRAY_ALIGNMENT) * STD140_ARRAY_ALIGNMENT];
     for uniform in uniforms {
-        let fallback = match uniform.kind {
-            UniformKind::Mat4 => Some(&identity4),
-            UniformKind::Mat3 => Some(&identity3),
+        let fallback: Option<&[f32]> = match uniform.kind {
+            UniformKind::Mat4 => Some(&IDENTITY4),
+            UniformKind::Mat3 => Some(&IDENTITY3_STD140),
             _ => None,
         };
-        let Some(data) = values.get(&uniform.name).or(uniform.default.as_ref()).or(fallback) else {
+        let Some(data) = lookup(&uniform.name).or(uniform.default.as_deref()).or(fallback) else {
             continue;
         };
         let lanes = uniform.kind.std140_size() / 4;
-        let stride =
-            if uniform.count > 1 { uniform.kind.std140_size().div_ceil(16) * 16 } else { 0 };
-        let splat;
+        let stride = if uniform.name.contains('[') {
+            uniform.kind.std140_size().div_ceil(STD140_ARRAY_ALIGNMENT) * STD140_ARRAY_ALIGNMENT
+        } else {
+            0
+        };
+        let splat: [f32; SPLAT_LANES];
         let data = if data.len() == 1
             && lanes > 1
             && uniform.count == 1
-            && !matches!(uniform.kind, UniformKind::Mat3 | UniformKind::Mat4)
+            && !matches!(uniform.kind, UniformKind::Mat3 | UniformKind::Mat4 | UniformKind::Mat4x3)
         {
-            splat = vec![data[0]; lanes];
-            &splat
+            splat = [data[0]; SPLAT_LANES];
+            &splat[..lanes]
         } else {
             data
         };
         for (idx, value) in data.iter().take(lanes * uniform.count).enumerate() {
             let at = uniform.offset + (idx / lanes) * stride + (idx % lanes) * 4;
             if at + 4 <= out.len() {
-                out[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                let word = if uniform.kind == UniformKind::Uint {
+                    (*value as u32).to_le_bytes()
+                } else {
+                    value.to_le_bytes()
+                };
+                out[at..at + 4].copy_from_slice(&word);
             }
         }
     }
@@ -1446,7 +1892,12 @@ impl CompilationSession {
 }
 
 pub fn compile(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>> {
-    let tag = if stage == Stage::Vertex { "vert" } else { "frag" };
+    const GEOMETRY_CACHE_TAG: &str = "geom";
+    let tag = match stage {
+        Stage::Vertex => "vert",
+        Stage::Geometry => GEOMETRY_CACHE_TAG,
+        Stage::Fragment => "frag",
+    };
     if let Some(words) = cached_spirv(source, tag) {
         return Ok(words);
     }
@@ -1457,6 +1908,7 @@ pub fn compile(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>> {
     options.set_optimization_level(shaderc::OptimizationLevel::Performance);
     let kind = match stage {
         Stage::Vertex => shaderc::ShaderKind::Vertex,
+        Stage::Geometry => shaderc::ShaderKind::Geometry,
         Stage::Fragment => shaderc::ShaderKind::Fragment,
     };
     let artifact = compiler
@@ -1469,3 +1921,30 @@ pub fn compile(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>> {
 
 #[cfg(test)]
 mod tests;
+
+const VERTEX_LAYOUT_PREFIX: &str = "layout(location = ";
+const VERTEX_INPUT_DELIMITER: &str = ") in ";
+
+pub struct VertexInput<'a> {
+    pub location: u32,
+    pub kind: &'a str,
+    pub name: &'a str,
+}
+
+pub fn vertex_inputs(source: &str) -> Result<Vec<VertexInput<'_>>, String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix(VERTEX_LAYOUT_PREFIX)
+                .and_then(|rest| rest.split_once(VERTEX_INPUT_DELIMITER))
+        })
+        .map(|(location, declaration)| {
+            let location = location.parse().map_err(|_| "mesh vertex location invalid")?;
+            let mut parts = declaration.trim_end_matches(';').split_whitespace();
+            let kind = parts.next().ok_or("mesh vertex declaration incomplete")?;
+            let name = parts.next().ok_or("mesh vertex name missing")?;
+            Ok(VertexInput { location, kind, name })
+        })
+        .collect()
+}

@@ -1,0 +1,41 @@
+{
+  "probe": "modeldata-contract",
+  "version": 1,
+  "methods": {
+    "create": "function",
+    "destroy": "function",
+    "IModelData": "function"
+  },
+  "vertexFormats": {
+    "POSITION": "position",
+    "NORMAL": "normal",
+    "UV": "uv"
+  },
+  "emptyShapes": {
+    "create": {
+      "ok": false,
+      "errorName": "SyntaxError",
+      "errorMessage": "Shapes missing."
+    }
+  },
+  "missingShapes": {
+    "create": {
+      "ok": false,
+      "errorName": "SyntaxError",
+      "errorMessage": "Vertex buffer missing."
+    }
+  },
+  "nullConfig": {
+    "create": {
+      "ok": true,
+      "returnType": "object",
+      "nullHandle": true,
+      "handleType": null
+    }
+  },
+  "invalidDestroy": {
+    "ok": true,
+    "returnType": "undefined",
+    "returnValue": "undefined"
+  }
+}

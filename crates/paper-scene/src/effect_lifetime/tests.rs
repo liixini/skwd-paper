@@ -10,7 +10,7 @@ fn named(slot: usize, name: &str) -> (usize, EffectBind) {
 
 #[test]
 fn ping_pong_scratch_lifetime() {
-    let plan = plan_targets(&[], &[None, None], &[vec![], vec![]], &[0, 0]).unwrap();
+    let plan = plan_targets(&[], &[None, None], &[vec![], vec![]], &[0, 1]).unwrap();
 
     assert_eq!(
         plan.passes,
@@ -121,16 +121,16 @@ fn named_fbo_feedback_rejected() {
 }
 
 #[test]
-fn ping_pong_feedback_rejected() {
-    let error = plan_targets(
+fn owner_input_avoids_feedback() {
+    let plan = plan_targets(
         &[],
         &[None, None, None],
         &[vec![], vec![], vec![(1, EffectBind::Previous)]],
         &[0, 1, 1],
     )
-    .unwrap_err();
-
-    assert_eq!(error, TargetPlanError::ReadWriteAlias { pass: 2, target: Target::Pong });
+    .unwrap();
+    assert_eq!(plan.passes[2].reads, [Target::Ping]);
+    assert_eq!(plan.passes[2].write, Target::Pong);
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn unique_fbos_resolve_within_their_owning_effect() {
         &owners,
         &[],
         &[Some("_rt_H".into()), Some("_rt_H".into()), None],
-        &[vec![], vec![named(1, "_rt_S")], vec![named(1, "_rt_H_19_41")]],
+        &[vec![], vec![named(1, "_rt_S")], vec![named(0, "_rt_H_19_41")]],
         &[0, 1, 1],
     )
     .unwrap();
@@ -213,4 +213,19 @@ fn swap_before_the_first_pass_applies_every_frame_start() {
     assert_eq!(plan.passes[0].write, Target::Fbo(1));
     assert!(plan.lifetimes[Target::Fbo(0).index()].loop_carried);
     assert!(plan.lifetimes[Target::Fbo(1).index()].loop_carried);
+}
+
+#[test]
+fn owner_input_survives_overrides() {
+    let plan = plan_targets(
+        &strings(&["local"]),
+        &[None, None, None],
+        &[vec![], vec![named(0, "local")], vec![]],
+        &[0, 0, 0],
+    )
+    .unwrap();
+    assert_eq!(plan.passes[0].reads, [Target::Pong]);
+    assert_eq!(plan.passes[1].reads, [Target::Fbo(0)]);
+    assert_eq!(plan.passes[2].reads, [Target::Pong]);
+    assert!(plan.passes.iter().all(|pass| pass.write == Target::Ping));
 }

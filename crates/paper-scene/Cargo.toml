@@ -9,20 +9,25 @@ description = "Wallpaper Engine scene format parsing and library audit"
 
 [dependencies]
 paper-control = { path = "../paper-control" }
+paper-runtime = { path = "../paper-runtime" }
+paper-text = { path = "../paper-text" }
 anyhow = { workspace = true }
 bitflags = { version = "2", features = ["std"] }
 image = { workspace = true }
+half = "2.7"
+bcdec_rs = "0.2"
 libc = "0.2"
-rquickjs = "0.12"
+libm = "0.2.16"
+rquickjs = "0.14"
 sha2 = "0.10"
 tracing = { workspace = true }
 shaderc = { version = "0.9", default-features = false }
+serde = { workspace = true }
 serde_json = { workspace = true }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
 texpresso = { workspace = true }
 hassle-rs = "0.12"
 swash = "0.2.10"
-read-fonts = "0.41"
 
 tempfile = { workspace = true }
 

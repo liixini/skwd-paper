@@ -5,9 +5,41 @@ use crate::{ctl, decode, vk, wayland};
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
+pub(super) fn resume_fade(
+    fade: &mut Option<FadeState>,
+    frozen_at: Option<Instant>,
+    ctl: &ctl::Ctl,
+) {
+    if let Some(started) = frozen_at
+        && ctl.frozen_at.is_none()
+        && let Some(active) = fade
+    {
+        active.t0 += started.elapsed();
+    }
+}
+
+pub(super) fn hold_transition(
+    ctl: &mut ctl::Ctl,
+    fade: &mut Option<FadeState>,
+    mut wait: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    ctl.set_paused(true);
+    let frozen_at = ctl.frozen_at;
+    while ctl.paused && !ctl.freeze_pending() && ctl.drawing_photo.is_none() {
+        if wait()? {
+            break;
+        }
+        let _ = ctl.poll();
+    }
+    resume_fade(fade, frozen_at, ctl);
+    Ok(())
+}
+
 pub(super) struct SendFrame(pub(super) decode::RenderFrame, pub(super) f64);
 
 pub(super) struct FadeState {
+    pub(super) drawing: Option<paper_control::DrawingTransition>,
+    pub(super) drawing_texture: Option<super::drawing::DrawingTexture>,
     pub(super) rx: std::sync::mpsc::Receiver<SendFrame>,
     pub(super) abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) worker: Option<std::thread::JoinHandle<()>>,
@@ -34,7 +66,10 @@ impl FadeState {
         }
     }
 
-    pub(super) fn progress(&mut self) -> f32 {
+    pub(super) fn progress(&mut self, frozen_mix: Option<f32>) -> f32 {
+        if let Some(mix) = frozen_mix {
+            return mix;
+        }
         if self.first_frame {
             return 0.0;
         }
@@ -60,9 +95,9 @@ impl FadeState {
         (self.t0.elapsed().as_millis() as f32 / self.dur_ms as f32).clamp(0.0, 1.0)
     }
 
-    pub(super) fn note_committed(&mut self) {
+    pub(super) fn note_committed(&mut self, presented_at: Instant) {
         if self.first_frame {
-            self.t0 = Instant::now();
+            self.t0 = presented_at;
             self.pts0 = self.cur.1;
         }
         self.first_frame = false;
@@ -110,7 +145,7 @@ pub(super) fn run_shared_vsync(
                 audio.set_pause(ctl.paused);
             }
         }
-        if (ctl.paused && !ctl.freeze_pending()) || idle_should_pause {
+        if (draws > 0 && ctl.paused && !ctl.freeze_pending()) || idle_should_pause {
             if idle_should_pause && !idle_paused {
                 idle_paused = true;
                 if let Some(audio) = &mut ctl.audio {
@@ -206,6 +241,10 @@ impl FrameSlot {
             FrameBacking::Upload(upload) => renderer.destroy_upload_path(upload),
             FrameBacking::Imported(frame) => renderer.destroy_frame(frame),
         }
+    }
+
+    pub(super) fn imported(&self) -> bool {
+        matches!(self.backing, FrameBacking::Imported(_))
     }
 
     fn source(&self) -> vk::Src<'_> {
@@ -482,6 +521,8 @@ mod transition_tests {
             uvs: Vec::new(),
             style: None,
             effect: None,
+            drawing: None,
+            drawing_texture: None,
             still_b: false,
             first_frame: true,
             path: String::new(),
@@ -489,9 +530,78 @@ mod transition_tests {
     }
 
     #[test]
+    fn frozen_mix_stays_fixed() {
+        let mut fade = state(Duration::from_secs(8));
+        fade.first_frame = false;
+        let started = fade.t0;
+        assert_eq!(fade.progress(Some(0.42)), 0.42);
+        assert_eq!(fade.t0, started);
+        assert_eq!(fade.cur.1, 0.0);
+        assert!(fade.queued.is_none());
+    }
+
+    #[test]
+    fn held_photo_keeps_clock() {
+        let mut fade = Some(state(Duration::from_secs(8)));
+        let started = fade.as_ref().unwrap().t0;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut ctl = ctl::Ctl::from_channel(receiver, None, "", true, 100, false);
+        ctl.frozen_at = Some(started);
+        let mut polls = 0;
+        hold_transition(&mut ctl, &mut fade, || {
+            polls += 1;
+            assert_eq!(polls, 1);
+            sender.send(paper_control::PaperCommand::drawing_photo("/cache/new.ppm")).unwrap();
+            sender.send(paper_control::PaperCommand::snapshot("/cache/ack.ppm", "DP-1")).unwrap();
+            Ok(false)
+        })
+        .unwrap();
+        assert!(ctl.paused);
+        assert!(ctl.freeze_pending());
+        assert_eq!(fade.as_ref().unwrap().t0, started);
+        assert_eq!(ctl.frozen_at, Some(started));
+        fade.as_mut().unwrap().note_committed(started);
+        ctl.set_paused(false);
+        resume_fade(&mut fade, Some(started), &ctl);
+        assert!(fade.as_mut().unwrap().progress(None) < 0.1);
+    }
+
+    #[test]
+    fn held_resume_preserves_progress() {
+        let held = Duration::from_secs(8);
+        let mut fade = Some(state(held));
+        fade.as_mut().unwrap().first_frame = false;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut ctl = ctl::Ctl::from_channel(receiver, None, "", true, 100, false);
+        ctl.frozen_at = Some(Instant::now().checked_sub(held).unwrap());
+        hold_transition(&mut ctl, &mut fade, || {
+            sender.send(paper_control::PaperCommand::pause(false)).unwrap();
+            Ok(false)
+        })
+        .unwrap();
+        assert!(!ctl.paused);
+        assert!(fade.as_mut().unwrap().progress(None) < 0.1);
+        let resumed = fade.as_ref().unwrap().t0;
+        resume_fade(&mut fade, ctl.frozen_at, &ctl);
+        assert_eq!(fade.as_ref().unwrap().t0, resumed);
+    }
+
+    #[test]
+    fn held_close_keeps_clock() {
+        let mut fade = Some(state(Duration::from_secs(8)));
+        let started = fade.as_ref().unwrap().t0;
+        let (_, receiver) = std::sync::mpsc::channel();
+        let mut ctl = ctl::Ctl::from_channel(receiver, None, "", true, 100, false);
+        ctl.frozen_at = Some(started);
+        hold_transition(&mut ctl, &mut fade, || Ok(true)).unwrap();
+        assert!(ctl.paused);
+        assert_eq!(fade.as_ref().unwrap().t0, started);
+    }
+
+    #[test]
     fn staged_time_does_not_advance_first_transition_frame() {
         let mut fade = state(Duration::from_secs(2));
-        assert_eq!(fade.progress(), 0.0);
+        assert_eq!(fade.progress(None), 0.0);
         assert_eq!(fade.cur.1, 0.0);
         assert!(fade.queued.is_none());
     }
@@ -499,11 +609,11 @@ mod transition_tests {
     #[test]
     fn first_commit_rebases_transition_and_video_clocks() {
         let mut fade = state(Duration::from_secs(2));
-        fade.note_committed();
+        fade.note_committed(Instant::now());
         assert!(!fade.first_frame);
         assert_eq!(fade.pts0, fade.cur.1);
         assert!(fade.t0.elapsed() < Duration::from_millis(100));
-        assert!(fade.progress() < 0.2);
+        assert!(fade.progress(None) < 0.2);
         assert_eq!(fade.cur.1, 0.0);
     }
 

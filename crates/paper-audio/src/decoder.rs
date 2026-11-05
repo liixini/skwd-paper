@@ -37,11 +37,7 @@ pub(super) fn decode_loop(
     wake: &(Mutex<()>, Condvar),
     repeat: Repeat,
 ) -> Result<bool> {
-    let mut input_options = ff::Dictionary::new();
-    input_options.set("probesize", "65536");
-    input_options.set("analyzeduration", "500000");
-    let mut input = ff::format::input_with_dictionary(path, input_options)
-        .with_context(|| format!("audio open: {path}"))?;
+    let mut input = open_input(path)?;
 
     let (audio_index, mut decoder, input_format, input_rate, input_channels): (
         usize,
@@ -56,13 +52,7 @@ pub(super) fn decode_loop(
             .ok_or_else(|| anyhow!("no audio stream"))?;
         let index = stream.index();
         let parameters = stream.parameters();
-        let mut context = ff::codec::context::Context::from_parameters(parameters)
-            .with_context(|| "audio decoder ctx")?;
-        context.set_threading(ff::codec::threading::Config {
-            kind: ff::codec::threading::Type::None,
-            count: 1,
-        });
-        let decoder = context.decoder().audio().with_context(|| "open audio decoder")?;
+        let decoder = open_decoder(parameters)?;
         let format = decoder.format();
         let rate = decoder.rate();
         let channels = decoder.ch_layout().channels();
@@ -72,7 +62,7 @@ pub(super) fn decode_loop(
     let input_layout = if decoder.ch_layout().order() == ff::ChannelOrder::Unspecified {
         ff::ChannelLayout::default_for_channels(input_channels)
     } else {
-        decoder.ch_layout()
+        ff::ChannelLayout::from(decoder.ch_layout().into_owned())
     };
     if input_layout.mask().is_none() {
         return Err(anyhow!("unsupported audio channel layout: {}", input_layout.description()));
@@ -84,15 +74,18 @@ pub(super) fn decode_loop(
         input_format,
         target_format,
     );
-    let mut resampler = ff::software::resampling::Context::get2(
-        input_format,
-        input_layout,
-        input_rate,
-        target_format,
-        target_layout,
-        TARGET_SAMPLE_RATE,
-    )
-    .map_err(|error| anyhow!("swr init: {error}"))?;
+    let make_resampler = || {
+        ff::software::resampling::Context::get2(
+            input_format,
+            input_layout.clone(),
+            input_rate,
+            target_format,
+            target_layout.clone(),
+            TARGET_SAMPLE_RATE,
+        )
+        .map_err(|error| anyhow!("swr init: {error}"))
+    };
+    let mut resampler = make_resampler()?;
 
     let mut decoded = ff::frame::Audio::empty();
     let mut resampled = ff::frame::Audio::empty();
@@ -118,34 +111,76 @@ pub(super) fn decode_loop(
             }
             continue;
         }
-        match read_audio_packet(&mut input, audio_index, stop) {
-            Some(packet) => decode_packet(
-                &mut decoder,
-                &packet,
-                &mut resampler,
-                &mut decoded,
-                &mut resampled,
-                producer,
-                &mut interleave_buffer,
-                &mut traced_pushes,
-                stop,
-                &gate,
-            ),
-            None => {
-                if repeat == Repeat::Once || input.seek(0, ..).is_err() {
-                    break;
-                }
-                decoder.flush();
-            }
+        let packet = read_audio_packet(&mut input, audio_index, stop);
+        if packet.is_none() && stop.load(Ordering::Relaxed) {
+            break;
         }
+        decode_packet(
+            &mut decoder,
+            packet.as_ref(),
+            &mut resampler,
+            &mut decoded,
+            &mut resampled,
+            producer,
+            &mut interleave_buffer,
+            &mut traced_pushes,
+            stop,
+            &gate,
+        );
+        if packet.is_some() {
+            continue;
+        }
+        drain_resampler(
+            &mut resampler,
+            &mut resampled,
+            producer,
+            &mut interleave_buffer,
+            &mut traced_pushes,
+            stop,
+            &gate,
+        );
+        if repeat == Repeat::Once
+            || interleave_buffer.is_empty()
+            || stop.load(Ordering::Relaxed)
+            || restart.load(Ordering::Relaxed)
+        {
+            break;
+        }
+        drop(resampler);
+        drop(decoder);
+        drop(input);
+        input = open_input(path)?;
+        let stream = input.stream(audio_index).ok_or_else(|| anyhow!("audio stream changed"))?;
+        decoder = open_decoder(stream.parameters())?;
+        resampler = make_resampler()?;
+        resampled = ff::frame::Audio::empty();
+        interleave_buffer.clear();
     }
     Ok(restart.load(Ordering::Relaxed))
+}
+
+fn open_input(path: &str) -> Result<ff::format::context::Input> {
+    let mut input_options = ff::Dictionary::new();
+    input_options.set("probesize", "65536");
+    input_options.set("analyzeduration", "500000");
+    ff::format::input_with_dictionary(path, input_options)
+        .with_context(|| format!("audio open: {path}"))
+}
+
+fn open_decoder(parameters: ff::codec::ParametersRef<'_>) -> Result<ff::codec::decoder::Audio> {
+    let mut context = ff::codec::context::Context::from_parameters(parameters)
+        .with_context(|| "audio decoder ctx")?;
+    context.set_threading(ff::codec::threading::Config {
+        kind: ff::codec::threading::Type::None,
+        count: 1,
+    });
+    context.decoder().audio().with_context(|| "open audio decoder")
 }
 
 #[allow(clippy::too_many_arguments)]
 fn decode_packet(
     decoder: &mut ff::codec::decoder::Audio,
-    packet: &ff::Packet,
+    packet: Option<&ff::Packet>,
     resampler: &mut ff::software::resampling::Context,
     decoded: &mut ff::frame::Audio,
     resampled: &mut ff::frame::Audio,
@@ -155,7 +190,11 @@ fn decode_packet(
     stop: &AtomicBool,
     gate: &ParkGate<'_>,
 ) {
-    if decoder.send_packet(packet).is_err() {
+    let sent = match packet {
+        Some(packet) => decoder.send_packet(packet),
+        None => decoder.send_eof(),
+    };
+    if sent.is_err() {
         return;
     }
     while !stop.load(Ordering::Relaxed) && decoder.receive_frame(decoded).is_ok() {
@@ -169,19 +208,9 @@ fn decode_packet(
         }
         trace_push(traced_pushes, resampled);
         push_to_ring(producer, resampled, interleave_buffer, stop, gate);
-        drain_resampler(
-            resampler,
-            resampled,
-            producer,
-            interleave_buffer,
-            traced_pushes,
-            stop,
-            gate,
-        );
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn drain_resampler(
     resampler: &mut ff::software::resampling::Context,
     resampled: &mut ff::frame::Audio,
@@ -191,7 +220,7 @@ fn drain_resampler(
     stop: &AtomicBool,
     gate: &ParkGate<'_>,
 ) {
-    while !stop.load(Ordering::Relaxed) && resampler.delay().is_some() {
+    while !stop.load(Ordering::Relaxed) && !gate.restart.load(Ordering::Relaxed) {
         if resampler.flush(resampled).is_err() || resampled.samples() == 0 {
             break;
         }

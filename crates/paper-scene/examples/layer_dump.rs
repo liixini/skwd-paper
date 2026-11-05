@@ -23,7 +23,7 @@ fn main() {
     for particle in &model.particles {
         let system = &particle.system;
         println!(
-            "PARTICLE order={} origin={:?} scale={:?} max={} start={} emitters={} inits={} ops={} texture={} pass={} blend={:?} persp={} rate_scale={} size_scale={} alpha={} tint={:?}",
+            "PARTICLE order={} origin={:?} scale={:?} max={} start={} emitters={} inits={} ops={} texture={} pass={} blend={:?} persp={} rate_scale={} size_scale={} alpha={} base_color={:?}",
             particle.scene_order,
             system.origin,
             system.scale3,
@@ -42,7 +42,7 @@ fn main() {
             system.rate_scale,
             system.size_scale,
             system.alpha,
-            system.tint
+            system.base_color
         );
     }
     println!("skipped: {:?}", model.skipped);

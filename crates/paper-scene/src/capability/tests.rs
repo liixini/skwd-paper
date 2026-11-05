@@ -9,7 +9,7 @@ fn plain_scene_is_native() {
         ..SceneFeatures::default()
     };
     features.effects.insert("blur".into());
-    assert!(assess_native(&features).full_fidelity());
+    assert!(assess_native(&features).has_no_known_gaps());
 }
 
 #[test]
@@ -36,11 +36,9 @@ fn gap_codes_stable() {
         assess_native(&features).reason_codes(),
         vec![
             "event-driven-sounds",
-            "light-objects",
             "text-objects",
             "other-objects",
             "puppet",
-            "animated-image-textures",
             "audio-reactive",
             "unknown-texture-formats",
             "texture-parse-failures",
@@ -53,10 +51,19 @@ fn gap_codes_stable() {
 #[test]
 fn event_sounds_only_gap() {
     let mixed = SceneFeatures { objects_sound: 6, ..SceneFeatures::default() };
-    assert!(assess_native(&mixed).full_fidelity());
+    assert!(assess_native(&mixed).has_no_known_gaps());
 
     let event =
         SceneFeatures { objects_sound: 6, objects_sound_event: 2, ..SceneFeatures::default() };
     assert_eq!(assess_native(&event).reason_codes(), vec!["event-driven-sounds"]);
     assert_eq!(assess_native(&event).gaps[0].instances(), 2);
+}
+
+#[test]
+fn atlas_incidence_is_supported() {
+    let features = SceneFeatures {
+        animated_image_textures: ["materials/animated".into()].into_iter().collect(),
+        ..SceneFeatures::default()
+    };
+    assert!(assess_native(&features).has_no_known_gaps());
 }

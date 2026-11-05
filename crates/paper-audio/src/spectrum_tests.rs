@@ -1,3 +1,4 @@
+use ringbuf::traits::Split;
 use std::ffi::OsStr;
 
 use super::{
@@ -181,4 +182,131 @@ fn bands_expose_one_lane_per_supported_resolution_and_decay_towards_silence() {
         bands.silence(0.05);
     }
     assert!(bands.slice(16, false).unwrap()[0] < 1e-3);
+}
+
+#[test]
+fn playback_source_selection() {
+    let analyser = Analyser::select(None, Some(OsStr::new("wallpaper")), |_, _| {
+        panic!("unexpected monitor capture")
+    })
+    .unwrap();
+    assert!(analyser.playback_tap().producer.lock().unwrap().is_some());
+    for mode in [None, Some(OsStr::new("system"))] {
+        let analyser = Analyser::select(None, mode, |source, _| {
+            assert_eq!(source, "@DEFAULT_MONITOR@");
+            Err(anyhow::anyhow!("unavailable"))
+        })
+        .unwrap();
+        assert!(analyser.playback_tap().producer.lock().unwrap().is_some());
+    }
+    for (source, mode) in
+        [(Some(OsStr::new("@DEFAULT_SOURCE@")), None), (None, Some(OsStr::new("microphone")))]
+    {
+        assert!(Analyser::select(source, mode, |_, _| panic!("unexpected capture")).is_err());
+    }
+}
+
+#[test]
+fn playback_stereo_spectrum() {
+    let mut analyser = Analyser::playback();
+    let tap = analyser.playback_tap();
+    let mut bands = Bands::default();
+    let samples: Vec<f32> = (0..WINDOW)
+        .flat_map(|index| [(std::f32::consts::TAU * index as f32 / 32.0).sin() * 0.5, 0.0])
+        .collect();
+    tap.write(&samples);
+    analyser.fill(&mut bands, 0.1);
+    assert!(bands.slice(64, false).unwrap().iter().any(|level| *level > 0.1));
+    assert!(bands.slice(64, true).unwrap().iter().all(|level| *level == 0.0));
+    let initial: f32 = bands.slice(64, false).unwrap().iter().sum();
+    for _ in 0..20 {
+        analyser.fill(&mut bands, 0.1);
+    }
+    let settled: f32 = bands.slice(64, false).unwrap().iter().sum();
+    assert!(settled < initial * 0.01);
+}
+
+#[test]
+fn tap_overflow_keeps_stereo() {
+    let mut analyser = Analyser::playback();
+    let tap = analyser.playback_tap();
+    let samples = [0.75, 0.25].repeat(WINDOW * super::BUFFER_WINDOWS + 1);
+    tap.write(&samples);
+    assert_eq!(analyser.drain(), WINDOW * super::BUFFER_WINDOWS);
+    assert!(analyser.left.iter().all(|value| *value == 0.75));
+    assert!(analyser.right.iter().all(|value| *value == 0.25));
+    assert_eq!(analyser.drain(), 0);
+    let guard = tap.producer.lock().unwrap();
+    tap.write(&samples);
+    drop(guard);
+    assert_eq!(analyser.drain(), 0);
+    tap.write(&[0.5, 0.125]);
+    assert_eq!(analyser.drain(), 1);
+}
+
+#[test]
+#[ignore = "requires isolated playback output"]
+fn live_playback_spectrum() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("tone.wav");
+    std::fs::write(&path, crate::test_pcm::pcm_wav(2, None)).unwrap();
+    let mut analyser = Analyser::playback();
+    let voice = crate::Voice {
+        id: "tone".into(),
+        name: "tone".into(),
+        clips: vec![path.to_string_lossy().into_owned()],
+        gain: 1.0,
+        mode: crate::VoiceMode::Loop,
+        min_gap: 0.0,
+        max_gap: 0.0,
+        autostart: true,
+    };
+    let mixer = crate::SceneMixer::new(
+        &[voice],
+        crate::SceneConfig { tap: Some(analyser.playback_tap()), ..crate::SceneConfig::default() },
+    )
+    .unwrap()
+    .unwrap();
+    let mut bands = Bands::default();
+    for audible in [true, false, true] {
+        analyser.set_system_capture(false).unwrap();
+        mixer.set_pause(!audible);
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            analyser.fill(&mut bands, 0.02);
+        }
+        let peak = bands.slice(64, false).unwrap().iter().copied().fold(0.0, f32::max);
+        if audible {
+            assert!(peak > 0.2, "silent playback");
+        } else {
+            assert!(peak < 0.01, "paused spectrum");
+        }
+    }
+    mixer.set_volume(0);
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        analyser.fill(&mut bands, 0.02);
+    }
+    assert!(bands.slice(64, false).unwrap().iter().all(|level| *level < 0.01));
+}
+
+#[test]
+fn source_change_keeps_tap() {
+    let mut analyser = Analyser::playback();
+    let tap = analyser.playback_tap();
+    tap.write(&[0.75, 0.25]);
+    analyser.replace(Analyser::playback());
+    assert_eq!(analyser.drain(), 0);
+    tap.write(&[0.5, 0.125]);
+    assert_eq!(analyser.drain(), 1);
+    assert_eq!((analyser.left[0], analyser.right[0]), (0.5, 0.125));
+    let (_, consumer) = ringbuf::HeapRb::<f32>::new(8).split();
+    analyser.replace(Analyser::with_capture(None, consumer, 48_000.0, 2));
+    tap.write(&[1.0, 1.0]);
+    assert_eq!(analyser.drain(), 0);
+    analyser.replace(Analyser::playback());
+    tap.write(&[0.25, 0.75]);
+    assert_eq!(analyser.drain(), 1);
+    assert_eq!((analyser.left[0], analyser.right[0]), (0.25, 0.75));
 }

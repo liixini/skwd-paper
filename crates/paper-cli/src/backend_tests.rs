@@ -9,6 +9,8 @@ fn executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+const TEST_DRAWING_ENV: &str = "SKWD_PAPER_TEST_DRAWING";
+
 fn command_parts(command: &std::process::Command) -> (String, Vec<String>) {
     (
         command.get_program().to_string_lossy().into_owned(),
@@ -21,12 +23,10 @@ fn plasma_presentation_uses_paper_backend_routing() {
     let temp = tempfile::tempdir().unwrap();
     let vk = temp.path().join("skwd-wall-vk");
     let still = temp.path().join("skwd-wall-still");
-    let tinier = temp.path().join("skwd-paper-tinier");
-    for path in [&vk, &still, &tinier] {
+    for path in [&vk, &still] {
         executable(path, "#!/bin/sh\nexit 0\n");
     }
-    let backends =
-        BackendPaths::from_executables_with_tinier(vk.clone(), still.clone(), tinier.clone());
+    let backends = BackendPaths::from_executables(vk.clone(), still.clone());
 
     let mut static_assignment =
         Assignment::new(vec!["DP-1".into()], Source::static_file("/wall/a.png"));
@@ -45,33 +45,7 @@ fn plasma_presentation_uses_paper_backend_routing() {
         ["*", "/wall/a.png", "--frame-stream", "1920x1080", "--fill-mode", "fit"]
     );
 
-    let tinier_assignment =
-        Assignment::new(vec!["DP-1".into()], Source::tinier_video("/wall/loop.ivf", "30000/1001"));
-    let command = super::plasma_command(
-        &backends,
-        &tinier_assignment,
-        &[stream(3, "1280x720", 60, true)],
-        true,
-    )
-    .unwrap();
-    let (program, arguments) = command_parts(&command);
-    assert_eq!(program, tinier.to_string_lossy());
-    assert_eq!(
-        arguments,
-        [
-            "--frame-stream",
-            "1280x720",
-            "--fill-mode",
-            "fill",
-            "--paused",
-            "/wall/loop.ivf",
-            "30000/1001",
-            "bt709",
-        ]
-    );
-
-    let video_assignment =
-        Assignment::new(vec!["DP-1".into()], Source::video("/wall/loop.mp4", None));
+    let video_assignment = Assignment::new(vec!["DP-1".into()], Source::video("/wall/loop.mp4"));
     let command = super::plasma_command(
         &backends,
         &video_assignment,
@@ -150,7 +124,7 @@ fn shared_plasma_presenter_lists_every_stream_in_order() {
     executable(&vk, "#!/bin/sh\nexit 0\n");
     executable(&still, "#!/bin/sh\nexit 0\n");
     let backends = BackendPaths::from_executables(vk.clone(), still);
-    let assignment = Assignment::new(vec!["DP-3".into()], Source::video("/wall/loop.mp4", None));
+    let assignment = Assignment::new(vec!["DP-3".into()], Source::video("/wall/loop.mp4"));
     let streams = [
         shared(3, -1, "1920x1080", 144, "DP-3", false),
         shared(4, -1, "1309x2327", 60, "DP-2", true),
@@ -232,6 +206,8 @@ fn plasma_transition_is_a_one_shot_paper_prelude() {
     let backends = BackendPaths::from_executables(vk.clone(), still.clone());
     let mut assignment = Assignment::new(vec!["DP-1".into()], Source::static_file("/wall/b.png"));
     assignment.transition = Some(paper_control::TransitionPolicy {
+        drawing_source: None,
+        drawing: None,
         fps: None,
         from: Some("/wall/a.png".into()),
         effect: Some("inkwell-drop".into()),
@@ -256,53 +232,48 @@ fn plasma_transition_is_a_one_shot_paper_prelude() {
 }
 
 #[test]
-fn tinier_worker_argv() {
+fn plasma_drawing_prelude() {
     let temp = tempfile::tempdir().unwrap();
-    let trace = temp.path().join("trace");
-    let worker = temp.path().join("skwd-paper-tinier");
-    executable(
-        &worker,
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' \"$SKWD_PAPER_GENERATION\" >> '{}'\nwhile IFS= read -r line; do :; done\n",
-            trace.display(),
-            trace.display()
-        ),
-    );
-    let backends = BackendPaths::from_executables_with_tinier(
-        temp.path().join("vk"),
-        temp.path().join("still"),
-        worker,
-    );
-    let assignment =
-        Assignment::new(vec!["DP-2".into()], Source::tinier_video("/wall/loop.ivf", "30000/1001"));
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let spawned = backends
-            .spawn(assignment, "DP-2".into(), Path::new("/tmp/paper.sock"), 91, None)
+    let vk = temp.path().join("skwd-wall-vk");
+    let still = temp.path().join("skwd-wall-still");
+    executable(&vk, "#!/bin/sh\nexit 0\n");
+    executable(&still, "#!/bin/sh\nexit 0\n");
+    let backends = BackendPaths::from_executables(vk, still);
+    let drawing = paper_control::DrawingTransition {
+        artifact: "/cache/drawing/manifest.json".into(),
+        colours: paper_control::DrawingColours::default(),
+        ink: paper_control::DrawingInk::Rainbow,
+    };
+    for (source, reference, expected) in [
+        (Source::static_file("/wall/a.png"), None, "/wall/a.png"),
+        (Source::video("/wall/b.mp4"), Some("/cache/reference.png"), "/cache/reference.png"),
+    ] {
+        let mut assignment = Assignment::new(vec!["DP-1".into()], source);
+        assignment.transition = Some(paper_control::TransitionPolicy {
+            drawing_source: reference.map(Into::into),
+            drawing: Some(drawing.clone()),
+            from: Some("/wall/a.png".into()),
+            effect: Some(paper_control::DRAWING_EFFECT.into()),
+            duration_ms: Some(6500),
+            ..Default::default()
+        });
+        let prelude = super::plasma_transition_command(&backends, &assignment, "2560x1440", 60)
+            .unwrap()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !trace.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        spawned.stop().await;
-    });
-    assert_eq!(
-        fs::read_to_string(trace).unwrap(),
-        "--output\nDP-2\n/wall/loop.ivf\n30000/1001\nbt709\n91\n"
-    );
-}
-
-#[test]
-fn tinier_worker_missing() {
-    let temp = tempfile::tempdir().unwrap();
-    let backends =
-        BackendPaths::from_executables(temp.path().join("vk"), temp.path().join("still"));
-    let assignment =
-        Assignment::new(vec!["DP-2".into()], Source::tinier_video("/wall/loop.ivf", "30"));
-    let error = backends
-        .spawn(assignment, "DP-2".into(), Path::new("/tmp/paper.sock"), 92, None)
-        .err()
+        let (_, arguments) = command_parts(&prelude);
+        assert!(arguments.windows(2).any(|pair| pair == ["--preview-stream", expected]));
+        assert!(arguments.windows(2).any(|pair| pair == ["--shader", "drawing"]));
+        let env: std::collections::BTreeMap<_, _> = prelude.get_envs().collect();
+        let sent: paper_control::DrawingTransition = serde_json::from_str(
+            env[std::ffi::OsStr::new(paper_control::DRAWING_ENV)].unwrap().to_str().unwrap(),
+        )
         .unwrap();
-    assert!(error.to_string().contains("tinier video media capability requires skwd-paper-tinier"));
+        assert_eq!(sent, drawing);
+        assert_eq!(
+            env[std::ffi::OsStr::new(paper_control::DRAWING_SOURCE_ENV)],
+            Some(std::ffi::OsStr::new(expected))
+        );
+    }
 }
 
 #[test]
@@ -317,7 +288,7 @@ fn still_package_works_without_vk_package() {
     assert!(capabilities[1].executable_file);
     let error = backends
         .spawn(
-            Assignment::new(vec!["DP-1".into()], Source::video("/wall/loop.mp4", None)),
+            Assignment::new(vec!["DP-1".into()], Source::video("/wall/loop.mp4")),
             "DP-1".into(),
             Path::new("/tmp/paper.sock"),
             93,
@@ -358,7 +329,7 @@ fn vk_package_works_without_still_package() {
         .unwrap();
     assert!(error.to_string().contains("static image media capability requires skwd-wall-still"));
     assert!(error.to_string().contains(&missing.display().to_string()));
-    let assignment = Assignment::new(vec!["DP-1".into()], Source::video("/wall/loop.mp4", None));
+    let assignment = Assignment::new(vec!["DP-1".into()], Source::video("/wall/loop.mp4"));
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let worker = backends
             .spawn(assignment, "DP-1".into(), Path::new("/tmp/paper.sock"), 96, None)
@@ -376,7 +347,6 @@ fn configured_override_is_authoritative() {
     let backend = super::select_backend(
         "skwd-wall-vk",
         &[SourceKind::Video],
-        &[VideoEngine::Default],
         Some(("SKWD_PAPER_VK_BIN".into(), configured.clone())),
         vec![(fallback, RendererDiscovery::Path)],
         Vec::new(),
@@ -398,7 +368,6 @@ fn discovery_uses_first_executable_candidate() {
     let backend = super::select_backend(
         "skwd-wall-still",
         &[SourceKind::Static],
-        &[],
         None,
         vec![(sibling.clone(), RendererDiscovery::Sibling), (path, RendererDiscovery::Path)],
         Vec::new(),
@@ -418,7 +387,6 @@ fn non_executable_candidate_is_reported_separately() {
     let backend = super::select_backend(
         "skwd-wall-still",
         &[SourceKind::Static],
-        &[],
         None,
         vec![(path.clone(), RendererDiscovery::Path)],
         Vec::new(),
@@ -434,12 +402,7 @@ fn missing_runtime_dependency_rejects_the_media_capability() {
     let temp = tempfile::tempdir().unwrap();
     let worker = temp.path().join("skwd-wall-vk");
     executable(&worker, "#!/bin/sh\nexit 0\n");
-    let mut backend = super::injected_backend(
-        "skwd-wall-vk",
-        worker,
-        &[SourceKind::Video],
-        &[VideoEngine::Default],
-    );
+    let mut backend = super::injected_backend("skwd-wall-vk", worker, &[SourceKind::Video]);
     backend.capability.dependencies.push(RuntimeDependencyStatus {
         name: "vulkan_loader".into(),
         available: false,
@@ -565,8 +528,10 @@ fn plasma_transition_rate_does_not_change_the_presenter_rate() {
     executable(&vk, "#!/bin/sh\nexit 0\n");
     executable(&still, "#!/bin/sh\nexit 0\n");
     let backends = BackendPaths::from_executables(vk, still);
-    let mut assignment = Assignment::new(vec!["DP-1".into()], Source::video("/wall/b.mp4", None));
+    let mut assignment = Assignment::new(vec!["DP-1".into()], Source::video("/wall/b.mp4"));
     assignment.transition = Some(paper_control::TransitionPolicy {
+        drawing_source: None,
+        drawing: None,
         fps: Some(120),
         from: Some("/wall/a.png".into()),
         ..Default::default()
@@ -584,20 +549,35 @@ fn plasma_transition_rate_does_not_change_the_presenter_rate() {
     assert!(command_parts(&legacy).1.windows(2).any(|pair| pair == ["--preview-fps", "24"]));
 }
 
-fn check_plasma_prelude_routing(test_name: &str, paused: &[bool], gpu: bool, still: bool) {
+struct Routing<'a> {
+    paused: &'a [bool],
+    gpu: bool,
+    still: bool,
+    drawing: bool,
+    failing: bool,
+}
+
+fn check_plasma_prelude_routing(test_name: &str, routing: &Routing) {
     use std::io::{Read, Seek};
     use std::os::unix::net::UnixStream;
+
+    let Routing { paused, gpu, still, drawing, failing } = *routing;
 
     if let Ok(specs) = std::env::var("SKWD_PAPER_TEST_STREAMS") {
         let streams: Vec<PlasmaStream> =
             specs.split(';').map(|spec| super::parse_plasma_stream(spec, false).unwrap()).collect();
-        let source = if still {
-            Source::static_file("/wall/b.png")
-        } else {
-            Source::video("/wall/b.mp4", None)
-        };
+        let source =
+            if still { Source::static_file("/wall/b.png") } else { Source::video("/wall/b.mp4") };
         let mut assignment = Assignment::new(vec!["DP-2".into()], source);
+        let drawing = std::env::var_os(TEST_DRAWING_ENV).is_some();
         assignment.transition = Some(paper_control::TransitionPolicy {
+            drawing_source: None,
+            drawing: drawing.then(|| paper_control::DrawingTransition {
+                artifact: "/cache/drawing.json".into(),
+                colours: paper_control::DrawingColours::default(),
+                ink: paper_control::DrawingInk::Plain,
+            }),
+            effect: drawing.then(|| paper_control::DRAWING_EFFECT.into()),
             from: Some("/wall/a.png".into()),
             duration_ms: Some(100),
             ..Default::default()
@@ -610,7 +590,10 @@ fn check_plasma_prelude_routing(test_name: &str, paused: &[bool], gpu: bool, sti
     let renderer = temp.path().join("renderer");
     executable(
         &renderer,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SKWD_PAPER_TEST_TRACE/args-$$\"\nprintf 'epoch=%s\\n' \"$SKWD_PAPER_STREAM_EPOCH\" >> \"$SKWD_PAPER_TEST_TRACE/args-$$\"\n",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SKWD_PAPER_TEST_TRACE/args-$$\"\nprintf 'epoch=%s\\n' \"$SKWD_PAPER_STREAM_EPOCH\" >> \"$SKWD_PAPER_TEST_TRACE/args-$$\"\n{}",
+            if failing { "if [ \"$1\" = --preview-stream ]; then exit 3; fi\n" } else { "" }
+        ),
     );
     let mut peers = Vec::new();
     let mut inherited = Vec::new();
@@ -657,6 +640,7 @@ fn check_plasma_prelude_routing(test_name: &str, paused: &[bool], gpu: bool, sti
         .env("SKWD_PAPER_STILL_BIN", &renderer)
         .env("SKWD_PAPER_PLASMA_GPU_STREAM", if gpu { "1" } else { "0" })
         .env_remove("SKWD_PAPER_STREAM_EPOCH")
+        .env_remove(TEST_DRAWING_ENV)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     unsafe {
@@ -668,6 +652,9 @@ fn check_plasma_prelude_routing(test_name: &str, paused: &[bool], gpu: bool, sti
             }
             Ok(())
         });
+    }
+    if drawing {
+        command.env(TEST_DRAWING_ENV, "1");
     }
     let child = command.spawn().unwrap();
     drop(retained);
@@ -681,7 +668,7 @@ fn check_plasma_prelude_routing(test_name: &str, paused: &[bool], gpu: bool, sti
         .collect();
     let preludes: Vec<&String> =
         traces.iter().filter(|trace| trace.starts_with("--preview-stream\n")).collect();
-    let expected_preludes = paused.iter().filter(|paused| !gpu || !**paused).count();
+    let expected_preludes = paused.iter().filter(|paused| !(gpu || drawing) || !**paused).count();
     assert_eq!(preludes.len(), expected_preludes);
     assert_eq!(traces.len(), expected_preludes + 1);
     let presenter = traces.iter().find(|trace| !trace.starts_with("--preview-stream\n")).unwrap();
@@ -713,9 +700,13 @@ fn check_plasma_prelude_routing(test_name: &str, paused: &[bool], gpu: bool, sti
 fn mixed_gpu_video_streams_skip_only_the_paused_prelude() {
     check_plasma_prelude_routing(
         "backend::tests::mixed_gpu_video_streams_skip_only_the_paused_prelude",
-        &[false, true],
-        true,
-        false,
+        &Routing {
+            paused: &[false, true],
+            gpu: true,
+            still: false,
+            drawing: false,
+            failing: false,
+        },
     );
 }
 
@@ -723,9 +714,7 @@ fn mixed_gpu_video_streams_skip_only_the_paused_prelude() {
 fn all_paused_gpu_video_streams_start_without_preludes() {
     check_plasma_prelude_routing(
         "backend::tests::all_paused_gpu_video_streams_start_without_preludes",
-        &[true, true],
-        true,
-        false,
+        &Routing { paused: &[true, true], gpu: true, still: false, drawing: false, failing: false },
     );
 }
 
@@ -733,9 +722,7 @@ fn all_paused_gpu_video_streams_start_without_preludes() {
 fn mixed_gpu_still_streams_rebase_together_after_one_prelude() {
     check_plasma_prelude_routing(
         "backend::tests::mixed_gpu_still_streams_rebase_together_after_one_prelude",
-        &[false, true],
-        true,
-        true,
+        &Routing { paused: &[false, true], gpu: true, still: true, drawing: false, failing: false },
     );
 }
 
@@ -743,8 +730,58 @@ fn mixed_gpu_still_streams_rebase_together_after_one_prelude() {
 fn paused_cpu_still_streams_keep_their_preludes_and_headers() {
     check_plasma_prelude_routing(
         "backend::tests::paused_cpu_still_streams_keep_their_preludes_and_headers",
-        &[true, true],
-        false,
-        true,
+        &Routing { paused: &[true, true], gpu: false, still: true, drawing: false, failing: false },
     );
+}
+
+#[test]
+fn hidden_drawing_headers() {
+    check_plasma_prelude_routing(
+        "backend::tests::hidden_drawing_headers",
+        &Routing { paused: &[false, true], gpu: false, still: true, drawing: true, failing: false },
+    );
+}
+
+#[test]
+fn hidden_drawings_skip() {
+    check_plasma_prelude_routing(
+        "backend::tests::hidden_drawings_skip",
+        &Routing { paused: &[true, true], gpu: false, still: true, drawing: true, failing: false },
+    );
+}
+
+#[test]
+fn failed_drawing_presents() {
+    check_plasma_prelude_routing(
+        "backend::tests::failed_drawing_presents",
+        &Routing { paused: &[false], gpu: true, still: true, drawing: true, failing: true },
+    );
+}
+
+#[test]
+fn drawing_replays_current_source() {
+    let mut assignment = Assignment::new(vec!["DP-1".into()], Source::static_file("/wall/a.png"));
+    assignment.transition = Some(paper_control::TransitionPolicy {
+        drawing_source: None,
+        drawing: Some(paper_control::DrawingTransition {
+            artifact: "/cache/drawing.json".into(),
+            colours: paper_control::DrawingColours::default(),
+            ink: paper_control::DrawingInk::Plain,
+        }),
+        from: Some("/wall/a.png".into()),
+        effect: Some(paper_control::DRAWING_EFFECT.into()),
+        ..Default::default()
+    });
+    assert!(static_transition(&assignment));
+    assignment.transition.as_mut().unwrap().drawing = None;
+    assert!(!static_transition(&assignment));
+}
+
+#[test]
+fn drawing_source_fallback() {
+    let assignment = Assignment::new(vec!["DP-1".into()], Source::static_file("/wall/a.png"));
+    let mut transition = paper_control::TransitionPolicy::default();
+    assert_eq!(drawing_source(&transition, &assignment), Path::new("/wall/a.png"));
+    transition.drawing_source = Some("/cache/reference.png".into());
+    assert_eq!(drawing_source(&transition, &assignment), Path::new("/cache/reference.png"));
 }

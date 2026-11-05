@@ -44,68 +44,120 @@ pub struct UploadPath {
     chroma_size: (u32, u32),
 }
 
-impl Renderer {
-    pub fn create_upload_path(&self, video_w: u32, video_h: u32) -> Result<UploadPath> {
-        unsafe {
-            let (cw, ch) = (video_w.div_ceil(2), video_h.div_ceil(2));
-            let make_img = |format: vk::Format,
-                            w: u32,
-                            h: u32|
-             -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
-                let img = self.device.create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(format)
-                        .extent(vk::Extent3D { width: w, height: h, depth: 1 })
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    None,
-                )?;
-                let reqs = self.device.get_image_memory_requirements(img);
-                let mem_props = self.instance.get_physical_device_memory_properties(self.phys);
-                let idx = (0..mem_props.memory_type_count)
-                    .find(|&i| {
-                        reqs.memory_type_bits & (1 << i) != 0
-                            && mem_props.memory_types[i as usize]
-                                .property_flags
-                                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                    })
-                    .ok_or_else(|| anyhow!("no device-local memory type"))?;
-                let mem = self.device.allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(reqs.size)
-                        .memory_type_index(idx),
-                    None,
-                )?;
-                self.device.bind_image_memory(img, mem, 0)?;
-                let view = self.device.create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(img)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(format)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        }),
-                    None,
-                )?;
-                Ok((img, mem, view))
-            };
-            let (luma_img, luma_mem, luma_view) = make_img(vk::Format::R8_UNORM, video_w, video_h)?;
-            let (chroma_img, chroma_mem, chroma_view) = make_img(vk::Format::R8G8_UNORM, cw, ch)?;
+pub struct FrameStream {
+    device: Option<ash::Device>,
+    staging: vk::Buffer,
+    staging_mem: vk::DeviceMemory,
+    staging_ptr: *mut u8,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub extent: vk::Extent2D,
+}
 
-            let staging_size = (video_w as u64 * video_h as u64) + (cw as u64 * ch as u64 * 2);
+const RGBA_BYTES: u64 = 4;
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_STREAMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_UPLOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LIVE_IMPORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl FrameStream {
+    #[cfg(test)]
+    pub fn live_allocations() -> usize {
+        LIVE_STREAMS.get()
+    }
+}
+
+impl UploadPath {
+    #[cfg(test)]
+    pub fn live_allocations() -> usize {
+        LIVE_UPLOADS.get()
+    }
+}
+
+impl FrameImages {
+    #[cfg(test)]
+    pub fn live_allocations() -> usize {
+        LIVE_IMPORTS.get()
+    }
+}
+
+impl Drop for FrameStream {
+    fn drop(&mut self) {
+        let Some(device) = self.device.take() else { return };
+        let _ = crate::shared::wait_idle(&device);
+        unsafe {
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+            device.destroy_buffer(self.staging, None);
+            device.free_memory(self.staging_mem, None);
+        }
+        #[cfg(test)]
+        LIVE_STREAMS.set(LIVE_STREAMS.get() - 1);
+    }
+}
+const CHROMA_BYTES: u64 = 2;
+
+impl Renderer {
+    unsafe fn upload_image(
+        &self,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+    ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+        unsafe {
+            let img = self.device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(vk::Extent3D { width, height, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )?;
+            let reqs = self.device.get_image_memory_requirements(img);
+            let mem_props = self.instance.get_physical_device_memory_properties(self.phys);
+            let idx = (0..mem_props.memory_type_count)
+                .find(|&i| {
+                    reqs.memory_type_bits & (1 << i) != 0
+                        && mem_props.memory_types[i as usize]
+                            .property_flags
+                            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                })
+                .ok_or_else(|| anyhow!("no device-local memory type"))?;
+            let mem = self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(reqs.size)
+                    .memory_type_index(idx),
+                None,
+            )?;
+            self.device.bind_image_memory(img, mem, 0)?;
+            let view = self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(img)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(super::images::color_range(0, 1)),
+                None,
+            )?;
+            Ok((img, mem, view))
+        }
+    }
+
+    unsafe fn upload_staging(&self, size: u64) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
+        unsafe {
             let staging = self.device.create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(staging_size)
+                    .size(size)
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
@@ -132,7 +184,22 @@ impl Renderer {
                 .device
                 .map_memory(staging_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
                 .cast();
+            Ok((staging, staging_mem, staging_ptr))
+        }
+    }
 
+    pub fn create_upload_path(&self, video_w: u32, video_h: u32) -> Result<UploadPath> {
+        unsafe {
+            let (cw, ch) = (video_w.div_ceil(2), video_h.div_ceil(2));
+            let (luma_img, luma_mem, luma_view) =
+                self.upload_image(vk::Format::R8_UNORM, video_w, video_h)?;
+            let (chroma_img, chroma_mem, chroma_view) =
+                self.upload_image(vk::Format::R8G8_UNORM, cw, ch)?;
+            let staging_size = (u64::from(video_w) * u64::from(video_h))
+                + (u64::from(cw) * u64::from(ch) * CHROMA_BYTES);
+            let (staging, staging_mem, staging_ptr) = self.upload_staging(staging_size)?;
+            #[cfg(test)]
+            LIVE_UPLOADS.set(LIVE_UPLOADS.get() + 1);
             Ok(UploadPath {
                 staging,
                 staging_mem,
@@ -150,8 +217,10 @@ impl Renderer {
     }
 
     pub fn destroy_upload_path(&self, up: UploadPath) {
+        #[cfg(test)]
+        LIVE_UPLOADS.set(LIVE_UPLOADS.get() - 1);
+        let _ = crate::shared::wait_idle(&self.device);
         unsafe {
-            let _ = self.device.device_wait_idle();
             self.device.destroy_image_view(up.luma_view, None);
             self.device.destroy_image_view(up.chroma_view, None);
             self.device.destroy_image(up.luma_img, None);
@@ -160,6 +229,42 @@ impl Renderer {
             self.device.free_memory(up.chroma_mem, None);
             self.device.destroy_buffer(up.staging, None);
             self.device.free_memory(up.staging_mem, None);
+        }
+    }
+
+    pub fn create_frame_stream(&self, width: u32, height: u32) -> Result<FrameStream> {
+        unsafe {
+            let (image, memory, view) =
+                self.upload_image(vk::Format::R8G8B8A8_UNORM, width, height)?;
+            let (staging, staging_mem, staging_ptr) =
+                self.upload_staging(u64::from(width) * u64::from(height) * RGBA_BYTES)?;
+            #[cfg(test)]
+            LIVE_STREAMS.set(LIVE_STREAMS.get() + 1);
+            Ok(FrameStream {
+                device: Some(self.device.clone()),
+                staging,
+                staging_mem,
+                staging_ptr,
+                image,
+                memory,
+                view,
+                extent: vk::Extent2D { width, height },
+            })
+        }
+    }
+
+    pub fn upload_frame(&self, stream: &FrameStream, rgba: &[u8]) -> Result<()> {
+        let vk::Extent2D { width, height } = stream.extent;
+        let size = u64::from(width) * u64::from(height) * RGBA_BYTES;
+        if rgba.len() as u64 != size {
+            return Err(anyhow!("frame holds {} of {size} bytes", rgba.len()));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(rgba.as_ptr(), stream.staging_ptr, rgba.len());
+            self.submit_copies(
+                stream.staging,
+                &[(stream.image, 0, vk::Extent3D { width, height, depth: 1 })],
+            )
         }
     }
 
@@ -193,29 +298,43 @@ impl Renderer {
                 );
                 dst = dst.add(cw as usize * 2);
             }
+            self.submit_copies(
+                up.staging,
+                &[
+                    (up.luma_img, 0, vk::Extent3D { width: lw, height: lh, depth: 1 }),
+                    (
+                        up.chroma_img,
+                        u64::from(lw * lh),
+                        vk::Extent3D { width: cw, height: ch, depth: 1 },
+                    ),
+                ],
+            )
+        }
+    }
 
-            self.device.begin_command_buffer(
-                self.cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-            let to_dst = [up.luma_img, up.chroma_img].map(|img| {
-                vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(img)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
+    unsafe fn submit_copies(
+        &self,
+        staging: vk::Buffer,
+        copies: &[(vk::Image, u64, vk::Extent3D)],
+    ) -> Result<()> {
+        self.begin_frame_cmd()?;
+        unsafe {
+            let transition = |old, new, src, dst| -> Vec<_> {
+                copies
+                    .iter()
+                    .map(|(img, _, _)| {
+                        vk::ImageMemoryBarrier::default()
+                            .src_access_mask(src)
+                            .dst_access_mask(dst)
+                            .old_layout(old)
+                            .new_layout(new)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(*img)
+                            .subresource_range(super::images::color_range(0, 1))
                     })
-            });
+                    .collect()
+            };
             self.device.cmd_pipeline_barrier(
                 self.cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -223,59 +342,29 @@ impl Renderer {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &to_dst,
+                &transition(
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                ),
             );
-            let sub = vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-            self.device.cmd_copy_buffer_to_image(
-                self.cmd,
-                up.staging,
-                up.luma_img,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::BufferImageCopy {
-                    buffer_offset: 0,
-                    buffer_row_length: 0,
-                    buffer_image_height: 0,
-                    image_subresource: sub,
-                    image_offset: vk::Offset3D::default(),
-                    image_extent: vk::Extent3D { width: lw, height: lh, depth: 1 },
-                }],
-            );
-            self.device.cmd_copy_buffer_to_image(
-                self.cmd,
-                up.staging,
-                up.chroma_img,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::BufferImageCopy {
-                    buffer_offset: (lw * lh) as u64,
-                    buffer_row_length: 0,
-                    buffer_image_height: 0,
-                    image_subresource: sub,
-                    image_offset: vk::Offset3D::default(),
-                    image_extent: vk::Extent3D { width: cw, height: ch, depth: 1 },
-                }],
-            );
-            let to_read = [up.luma_img, up.chroma_img].map(|img| {
-                vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(img)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-            });
+            for (img, offset, extent) in copies {
+                self.device.cmd_copy_buffer_to_image(
+                    self.cmd,
+                    staging,
+                    *img,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::BufferImageCopy {
+                        buffer_offset: *offset,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: super::images::color_layers(0),
+                        image_offset: vk::Offset3D::default(),
+                        image_extent: *extent,
+                    }],
+                );
+            }
             self.device.cmd_pipeline_barrier(
                 self.cmd,
                 vk::PipelineStageFlags::TRANSFER,
@@ -283,20 +372,17 @@ impl Renderer {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &to_read,
+                &transition(
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                ),
             );
             self.device.end_command_buffer(self.cmd)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-            self.device.reset_fences(&[self.fence])?;
             let cmds = [self.cmd];
-            let guard = self.queue_guard();
-            self.device.queue_submit(
-                self.queue,
-                &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                self.fence,
-            )?;
-            drop(guard);
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.submit_fenced(&[vk::SubmitInfo::default().command_buffers(&cmds)])?;
+            self.wait_render()?;
             Ok(())
         }
     }
@@ -355,6 +441,8 @@ impl Renderer {
                 return Err(error);
             }
         };
+        #[cfg(test)]
+        LIVE_IMPORTS.set(LIVE_IMPORTS.get() + 1);
         Ok(FrameImages {
             luma_img,
             luma_mem,
@@ -483,6 +571,8 @@ impl Renderer {
     }
 
     pub fn destroy_frame(&self, f: FrameImages) {
+        #[cfg(test)]
+        LIVE_IMPORTS.set(LIVE_IMPORTS.get() - 1);
         unsafe {
             self.device.destroy_image_view(f.luma_view, None);
             self.device.destroy_image_view(f.chroma_view, None);

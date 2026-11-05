@@ -28,7 +28,7 @@ impl App {
             BufferSet::new(&self.shm, &self.qh, bw, bh, self.surfaces.len(), |canvas, format| {
                 pack_pixels(canvas, &pixels, format);
             })?;
-        Ok(ReadyBuffer { buffer, for_w: sw, for_h: sh })
+        Ok(ReadyBuffer { buffer, image: (rw, rh), for_w: sw, for_h: sh })
     }
 
     pub(super) fn do_preload(&mut self, paths: &[String]) {
@@ -120,6 +120,7 @@ impl App {
             surf.surface.commit();
             surf.show(&ready.buffer, super::mirror::full(w, h));
         }
+        (self.raw_w, self.raw_h) = ready.image;
         self.retire_current();
         self.path = path.to_string();
         self.raw_pixels = Vec::new();
@@ -281,10 +282,17 @@ impl App {
             self.set_mirror(target);
             return;
         }
+        if let Some(scene) = &cmd.widgets {
+            self.set_widgets(scene.clone());
+        }
         if let Some(surface) = &cmd.surface
             && let Err(error) = self.set_surface_effects(surface)
         {
             tracing::warn!(%error, "surface effects failed");
+        }
+        if let Some(snapshot) = &cmd.snapshot {
+            self.snapshot(snapshot);
+            return;
         }
         if !cmd.path.is_empty() {
             self.effect_cache = None;

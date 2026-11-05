@@ -1,5 +1,18 @@
 use super::*;
 
+#[test]
+fn history_is_temporal() {
+    let history = [vec![(0, EffectBind::SceneHistory)]];
+    let plain = [vec![]];
+    let nodes = [node("consumer", 0, &[], &history, false), node("later", 1, &[], &plain, false)];
+    let plan = plan_scene_targets(&nodes, &[]).unwrap();
+    assert_eq!(plan.order, [0, 1]);
+    assert_eq!(plan.dynamic, [true, false]);
+    assert_eq!(plan.snapshots, [false, false]);
+    assert!(plan.dependencies.is_empty());
+    assert_eq!(plan.shadow_targets, 0);
+}
+
 fn foreign(slot: usize, layer: &str, buffer: CompositeBuffer) -> (usize, EffectBind) {
     (slot, EffectBind::LayerComposite { layer: layer.into(), buffer })
 }
@@ -192,4 +205,20 @@ fn scene_under_layer_binds_snapshot_the_prefix() {
 
     assert_eq!(plan.snapshots, [false, true]);
     assert_eq!(plan.shadow_targets, 1);
+}
+
+#[test]
+fn reflection_consumers_are_global() {
+    let binds = [vec![(0, EffectBind::Reflection), (1, EffectBind::Reflection)]];
+    let plain = [vec![]];
+    let nodes = [
+        node("first", 0, &[], &binds, false),
+        node("source", 1, &[], &plain, false),
+        node("last", 2, &[], &binds, false),
+    ];
+    let plan = plan_scene_targets(&nodes, &[]).unwrap();
+    assert_eq!(plan.reflection_consumers, [0, 2]);
+    assert_eq!(plan.order, [0, 1, 2]);
+    assert_eq!(plan.snapshots, [false, false, false]);
+    assert_eq!(plan.dynamic, [false, false, false]);
 }

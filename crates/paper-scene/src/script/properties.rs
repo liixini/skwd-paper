@@ -4,6 +4,9 @@ use crate::model::Properties;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
+const SCHEME_COLOR_PROPERTY: &str = "schemecolor";
+const SCHEME_COLOR_PATH: &str = "/general/properties/schemecolor";
+
 pub(super) struct PropertyBindings {
     defaults: Properties,
     declarations: Map<String, Value>,
@@ -35,6 +38,10 @@ impl PropertyBindings {
             })
             .collect();
         supported.retain(|name| !blocked.contains(name));
+        if project.pointer(SCHEME_COLOR_PATH).is_some() && !blocked.contains(SCHEME_COLOR_PROPERTY)
+        {
+            supported.insert(SCHEME_COLOR_PROPERTY.into());
+        }
         values.retain(|(path, _, _)| !path.contains("/scriptproperties/"));
         Self {
             defaults: crate::effects::parse_properties(project),
@@ -50,8 +57,9 @@ impl PropertyBindings {
     }
 
     pub fn restrict_package(&mut self, package: &crate::pkg::Package) {
+        let scene = package.scene_entry().ok().map(|entry| entry.path.as_str());
         for entry in package.entries() {
-            if entry.path == "scene.json" || !entry.path.ends_with(".json") {
+            if scene == Some(entry.path.as_str()) || !entry.path.ends_with(".json") {
                 continue;
             }
             let Ok(value) = crate::json::parse(package.read(entry)) else {
@@ -180,7 +188,7 @@ impl PropertyBindings {
 fn collect(value: &Value, path: &str, out: &mut Vec<(String, Value, BTreeSet<String>)>) {
     match value {
         Value::Object(map) => {
-            if map.contains_key("user") {
+            if map.contains_key("user") || map.contains_key(crate::effects::USER_SHADER_VALUES) {
                 out.push((path.to_owned(), value.clone(), dependencies(value)));
             }
             for (key, child) in map {

@@ -5,6 +5,14 @@ use anyhow::{Context, Result, anyhow, ensure};
 use paper_control::{SceneThumbnailRequest, SceneThumbnailResponse};
 
 const SIZE: (u32, u32) = (1280, 720);
+const REFERENCE_SIZE: (u32, u32) = (2560, 2560);
+const VIDEO_SECONDS: f64 = 1.0;
+const REFERENCE_SECONDS: f64 = 0.0;
+const SCENE_FRAMES: u32 = 60;
+const SCENE_FPS: f32 = 30.0;
+const ALPHA: usize = 3;
+const OPAQUE_ALPHA: u8 = 250;
+const REFERENCE_QUALITY: f32 = 90.0;
 
 pub(in crate::app) fn run() -> Result<()> {
     let mut input = std::io::stdin().lock();
@@ -36,16 +44,27 @@ fn capture(
     request: &SceneThumbnailRequest,
 ) -> Result<()> {
     ensure!(Path::new(&request.source).is_absolute(), "thumbnail source must be absolute");
-    let destination = Path::new(&request.destination);
-    ensure!(destination.is_absolute(), "thumbnail destination must be absolute");
+    ensure!(
+        Path::new(&request.destination).is_absolute(),
+        "thumbnail destination must be absolute"
+    );
     if let Some(video) = video_source(Path::new(&request.source))? {
-        let image = crate::decode::thumbnail::rgba_near(&video.to_string_lossy(), 1.0, SIZE)?;
-        return write_png(destination, &image);
+        let seconds = if request.reference { REFERENCE_SECONDS } else { VIDEO_SECONDS };
+        let image = crate::decode::thumbnail::rgba_near(
+            &video.to_string_lossy(),
+            seconds,
+            capture_size(request),
+        )?;
+        return write_capture(request, &image);
     }
     if shared.is_none() {
         *shared = Some(crate::shared::create(std::ptr::null_mut())?);
     }
     capture_scene(shared.as_ref().expect("device initialized"), request)
+}
+
+fn capture_size(request: &SceneThumbnailRequest) -> (u32, u32) {
+    if request.reference { REFERENCE_SIZE } else { SIZE }
 }
 
 fn video_source(source: &Path) -> Result<Option<PathBuf>> {
@@ -81,30 +100,47 @@ fn capture_scene(
         !model.layers.is_empty() || !model.particles.is_empty(),
         "scene has no renderable layers"
     );
-    let mut group =
-        super::build_group(shared, &mut model, strict, &[SIZE], paper_geom::FillMode::Fit)?;
+    let mut group = super::build_group(
+        shared,
+        &mut model,
+        strict,
+        &[capture_size(request)],
+        paper_geom::FillMode::Fit,
+    )?;
     drop(model);
     let result = (|| {
-        for frame in 0..60 {
-            group.compose(frame as f32 / 30.0, 1.0 / 30.0)?;
+        for frame in 0..SCENE_FRAMES {
+            group.compose(frame as f32 / SCENE_FPS, 1.0 / SCENE_FPS)?;
         }
         let (width, height, rgba) = group.read_canvas()?;
         let image = image::RgbaImage::from_raw(width, height, rgba)
             .ok_or_else(|| anyhow!("thumbnail frame size mismatch"))?;
-        write_png(Path::new(&request.destination), &image)
+        write_capture(request, &image)
     })();
     group.destroy();
     result
 }
 
-fn write_png(destination: &Path, image: &image::RgbaImage) -> Result<()> {
-    let output = std::fs::File::create(destination)?;
+fn write_capture(request: &SceneThumbnailRequest, image: &image::RgbaImage) -> Result<()> {
+    let mut output = std::io::BufWriter::new(std::fs::File::create(&request.destination)?);
+    let rgb = || image::buffer::ConvertBuffer::<image::RgbImage>::convert(image);
+    let opaque = image.pixels().all(|pixel| pixel[ALPHA] >= OPAQUE_ALPHA);
+    if request.reference {
+        let (width, height) = image.dimensions();
+        let encoded = if opaque {
+            webp::Encoder::from_rgb(rgb().as_raw(), width, height).encode(REFERENCE_QUALITY)
+        } else {
+            webp::Encoder::from_rgba(image.as_raw(), width, height).encode_lossless()
+        };
+        return output.write_all(&encoded).context("write drawing reference");
+    }
     let encoder = image::codecs::png::PngEncoder::new_with_quality(
         output,
-        image::codecs::png::CompressionType::Fast,
-        image::codecs::png::FilterType::NoFilter,
+        image::codecs::png::CompressionType::Default,
+        image::codecs::png::FilterType::Adaptive,
     );
-    image.write_with_encoder(encoder).context("write captured thumbnail")
+    if opaque { rgb().write_with_encoder(encoder) } else { image.write_with_encoder(encoder) }
+        .context("write captured thumbnail")
 }
 
 #[cfg(test)]

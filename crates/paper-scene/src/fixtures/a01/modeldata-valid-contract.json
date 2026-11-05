@@ -1,0 +1,54 @@
+{
+  "probe": "modeldata-valid-contract",
+  "version": 1,
+  "methods": {
+    "create": "function",
+    "destroy": "function",
+    "createLayer": "function",
+    "destroyLayer": "function"
+  },
+  "vertexFloats": 24,
+  "create": {
+    "returnType": "object",
+    "returnedHandle": true
+  },
+  "createLayer": {
+    "returnType": "object",
+    "returnedLayer": true
+  },
+  "lookupWhileAlive": {
+    "ok": true,
+    "found": true,
+    "index": 3
+  },
+  "destroyWhileLayerAlive": {
+    "ok": true,
+    "returnType": "undefined",
+    "returnValue": "undefined"
+  },
+  "lookupAfterModelDestroy": {
+    "ok": true,
+    "found": true,
+    "index": 3
+  },
+  "destroyLayer": {
+    "ok": true,
+    "returnType": "boolean",
+    "returnValue": true
+  },
+  "lookupAfterLayerDestroy": {
+    "ok": true,
+    "found": false,
+    "index": null
+  },
+  "secondDestroy": {
+    "ok": true,
+    "returnType": "undefined",
+    "returnValue": "undefined"
+  },
+  "finalLookup": {
+    "ok": true,
+    "found": false,
+    "index": null
+  }
+}

@@ -12,21 +12,6 @@ const COLOR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     layer_count: 1,
 };
 
-struct QueueLock(u32);
-
-impl QueueLock {
-    fn acquire(family: u32) -> Self {
-        crate::shared::lock_queue_family(family);
-        Self(family)
-    }
-}
-
-impl Drop for QueueLock {
-    fn drop(&mut self) {
-        crate::shared::unlock_queue_family(self.0);
-    }
-}
-
 pub struct Nv12Presenter {
     instance: ash::Instance,
     device: ash::Device,
@@ -356,8 +341,13 @@ impl Nv12Presenter {
                 .signal_semaphores(&semaphores)
                 .command_buffers(&commands);
             self.device.reset_fences(&[self.fence])?;
-            let _lock = QueueLock::acquire(self.queue_family);
-            self.device.queue_submit(self.queue, &[submit], self.fence)?;
+            crate::shared::submit(
+                &self.device,
+                self.queue,
+                self.queue_family,
+                &[submit],
+                self.fence,
+            )?;
         }
         self.in_flight.set(true);
         frame.commit(
