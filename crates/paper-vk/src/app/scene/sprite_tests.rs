@@ -108,7 +108,7 @@ fn scripted_frames_present_immediately_with_original_object_identity() {
             let offset = ((32 * width + 32) * 4) as usize;
             [bytes[offset], bytes[offset + 1], bytes[offset + 2]]
         };
-        assert_eq!(pixel(&mut group), [255, 0, 0]);
+        assert_eq!(pixel(&mut group), [0, 255, 0]);
         group.compose(0.0625, 0.0625).unwrap();
         assert_eq!(pixel(&mut group), [0, 255, 0]);
         let directory = root.path().to_string_lossy();

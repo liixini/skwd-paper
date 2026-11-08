@@ -3,6 +3,7 @@ mod model;
 mod pointer;
 mod protocol;
 mod target;
+mod widgets;
 
 pub(crate) use mirror::request as request_mirror;
 #[cfg(feature = "shared-device")]

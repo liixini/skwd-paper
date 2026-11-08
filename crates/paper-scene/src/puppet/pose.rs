@@ -75,7 +75,8 @@ pub(super) fn rest_world<'a>(
     world: &mut Vec<Mat4>,
     mut locals: Option<&mut Vec<Mat4>>,
 ) -> Option<()> {
-    let active = layers.clone().next().is_some()
+    let active = !mesh.spatial
+        && layers.clone().next().is_some()
         && layers.clone().all(|layer| {
             mesh.animations.iter().find(|animation| animation.id == layer.id).is_some_and(
                 |animation| {

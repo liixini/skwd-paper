@@ -21,12 +21,12 @@ pub(super) fn resume_fade(
 pub(super) fn hold_transition(
     ctl: &mut ctl::Ctl,
     fade: &mut Option<FadeState>,
-    mut wait: impl FnMut() -> Result<bool>,
+    mut wait: impl FnMut(&mut ctl::Ctl) -> Result<bool>,
 ) -> Result<()> {
     ctl.set_paused(true);
     let frozen_at = ctl.frozen_at;
     while ctl.paused && !ctl.freeze_pending() && ctl.drawing_photo.is_none() {
-        if wait()? {
+        if wait(ctl)? {
             break;
         }
         let _ = ctl.poll();
@@ -137,6 +137,7 @@ pub(super) fn run_shared_vsync(
             return Ok(());
         }
         poll_ignoring_swap(&mut ctl);
+        target.sync_widgets(&mut ctl);
         crate::freeze::write_last_requested(&mut ctl, Some(current.0.video()))?;
         let idle_should_pause = target.app.idle && draws > 0;
         if !idle_should_pause && idle_paused {
@@ -548,7 +549,7 @@ mod transition_tests {
         let mut ctl = ctl::Ctl::from_channel(receiver, None, "", true, 100, false);
         ctl.frozen_at = Some(started);
         let mut polls = 0;
-        hold_transition(&mut ctl, &mut fade, || {
+        hold_transition(&mut ctl, &mut fade, |_| {
             polls += 1;
             assert_eq!(polls, 1);
             sender.send(paper_control::PaperCommand::drawing_photo("/cache/new.ppm")).unwrap();
@@ -574,7 +575,7 @@ mod transition_tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut ctl = ctl::Ctl::from_channel(receiver, None, "", true, 100, false);
         ctl.frozen_at = Some(Instant::now().checked_sub(held).unwrap());
-        hold_transition(&mut ctl, &mut fade, || {
+        hold_transition(&mut ctl, &mut fade, |_| {
             sender.send(paper_control::PaperCommand::pause(false)).unwrap();
             Ok(false)
         })
@@ -593,7 +594,7 @@ mod transition_tests {
         let (_, receiver) = std::sync::mpsc::channel();
         let mut ctl = ctl::Ctl::from_channel(receiver, None, "", true, 100, false);
         ctl.frozen_at = Some(started);
-        hold_transition(&mut ctl, &mut fade, || Ok(true)).unwrap();
+        hold_transition(&mut ctl, &mut fade, |_| Ok(true)).unwrap();
         assert!(ctl.paused);
         assert_eq!(fade.as_ref().unwrap().t0, started);
     }

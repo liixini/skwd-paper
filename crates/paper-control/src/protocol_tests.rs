@@ -131,6 +131,7 @@ fn policy_golden_line() {
     });
     let policy = RendererPolicy {
         transition_fps: None,
+        shared_outputs: None,
         load_timeout_ms: None,
         surface: None,
         idle_seconds: Some(45),
@@ -472,7 +473,7 @@ fn response_goldens() {
             r#""transitions":{"drawing":true,"drawing_max_duration_ms":20000,"startup_source_kinds":["video","we"],"#,
             r#""static_overlay":true,"default_effect":"fade","default_duration_ms":600,"#,
             r#""min_duration_ms":50,"max_duration_ms":10000},"#,
-            r#""renderer_policy":{"surface":true,"idle":true,"sand":true,"scene":true,"output_fps":true},"#,
+            r#""renderer_policy":{"shared_outputs":true,"surface":true,"idle":true,"sand":true,"scene":true,"output_fps":true},"#,
             r#""wallpaper_engine":{"project_types":["scene","video"],"#,
             r#""rejected_project_types":["web","application"],"scene":{"#,
             r#""renderer":"native-vulkan","supported":["image-layers","effect-chains","cross-layer-render-targets","particles","puppet-skeletons","scene-audio-mixing","user-properties"],"#,

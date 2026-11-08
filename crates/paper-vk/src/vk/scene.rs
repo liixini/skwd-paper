@@ -4,6 +4,8 @@ use ash::vk;
 use paper_scene::tex::{PixelFormat, Pixels};
 
 pub(super) mod clip;
+#[cfg(feature = "shared-device")]
+pub(crate) mod overlay;
 pub(super) mod text;
 
 const SCENE_POOL_SETS: u32 = 64;
@@ -1296,7 +1298,12 @@ impl Renderer {
 
     pub fn configure_scene(&mut self, config: SceneConfig) -> Result<()> {
         let format = config.format;
-        if !matches!(format, vk::Format::R8G8B8A8_UNORM | vk::Format::R16G16B16A16_SFLOAT) {
+        if !matches!(
+            format,
+            vk::Format::R8G8B8A8_UNORM
+                | vk::Format::B8G8R8A8_UNORM
+                | vk::Format::R16G16B16A16_SFLOAT
+        ) {
             return Err(anyhow!("unsupported scene format {}", format.as_raw()));
         }
         if self.scene_config != config && self.raster_pipelines[0].is_some() {
@@ -1350,22 +1357,6 @@ impl Renderer {
         LIVE_MESHES.get()
     }
 
-    pub fn scene_target_allocation_size(
-        &self,
-        width: u32,
-        height: u32,
-        format: vk::Format,
-    ) -> Result<u64> {
-        let color = scene_target_spec(width, height, format, vk::SampleCountFlags::TYPE_1)
-            .allocation_size(self)?;
-        let depth = if self.scene_config.depth.is_some() {
-            super::depth::spec(width, height, vk::SampleCountFlags::TYPE_1).allocation_size(self)?
-        } else {
-            0
-        };
-        color.checked_add(depth).context("scene target allocation overflow")
-    }
-
     pub fn create_scene_target_fmt(
         &mut self,
         width: u32,
@@ -1382,7 +1373,21 @@ impl Renderer {
         })
     }
 
+    #[cfg(test)]
+    pub fn fail_scene_target_after(created: Option<usize>) {
+        TARGET_FAILURE_AFTER.set(created);
+    }
+
+    #[cfg(test)]
+    pub fn scene_target_failure_pending() -> bool {
+        TARGET_FAILURE_AFTER.get().is_some()
+    }
+
     pub fn create_scene_target_opts(&mut self, spec: SceneTargetSpec) -> Result<SceneTarget> {
+        #[cfg(test)]
+        if injected_target_failure() {
+            return Err(anyhow::anyhow!("injected scene target allocation failure"));
+        }
         let SceneTargetSpec { extent, format, repeat, samples, depth_attachment } = spec;
         let (width, height) = (extent.width, extent.height);
         if samples == vk::SampleCountFlags::TYPE_4 {
@@ -2291,6 +2296,22 @@ thread_local! {
     static LIVE_TEXTURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_TARGETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_MESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TARGET_FAILURE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn injected_target_failure() -> bool {
+    match TARGET_FAILURE_AFTER.get() {
+        Some(0) => {
+            TARGET_FAILURE_AFTER.set(None);
+            true
+        }
+        Some(remaining) => {
+            TARGET_FAILURE_AFTER.set(Some(remaining - 1));
+            false
+        }
+        None => false,
+    }
 }
 
 impl SceneTarget {

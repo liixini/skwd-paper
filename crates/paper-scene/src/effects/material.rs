@@ -31,8 +31,6 @@ const GENERIC4: &str = "genericimage4";
 pub(super) const PASSTHROUGH: &str = "passthrough";
 const COMPOSE: &str = "composelayer";
 const FLAT: &str = "flat";
-const FLAT_VERTEX: &str = "attribute vec3 a_Position;\nuniform mat4 g_ModelViewProjectionMatrix;\nvoid main(){gl_Position=g_ModelViewProjectionMatrix*vec4(a_Position,1.0);}";
-const FLAT_FRAGMENT: &str = "uniform vec3 g_Color;\nuniform float g_Alpha;\nvoid main(){gl_FragColor=vec4(g_Color,g_Alpha);}";
 const VERSION: &str = "VERSION";
 const TEXTURE_FORMAT: &str = "TEX0FORMAT";
 const SIMPLE_COMBOS: [&str; 6] = [
@@ -58,7 +56,6 @@ const MAX_BASE_PASSES: usize = 2;
 
 pub(crate) struct Options {
     pub source_texture: bool,
-    pub force: bool,
     pub effects: bool,
     pub blend: Option<PassBlend>,
 }
@@ -338,7 +335,7 @@ pub(crate) fn load(
     mut puppet: Option<&mut crate::model::Puppet>,
     options: &Options,
 ) -> Result<Option<Material>, String> {
-    let Options { source_texture, force, effects, blend } = *options;
+    let Options { source_texture, effects, blend } = *options;
     let Some(Image { model, material, path }) = Image::load(pkg, assets, object)? else {
         return Ok(None);
     };
@@ -352,8 +349,6 @@ pub(crate) fn load(
         return Err(format!("base material {path} pass is not an object"));
     }
     let state = ImageState::parse(first, path)?;
-    let force_flat =
-        force && simple(pkg, &model, first, false) && first[SHADER].as_str() == Some(FLAT);
     let own_id = object.get(crate::model::ID_FIELD).and_then(crate::model::id_of);
     let scene_input = first
         .get(TEXTURES)
@@ -361,9 +356,8 @@ pub(crate) fn load(
         .and_then(|slots| slots.first())
         .and_then(Value::as_str)
         .map(|name| super::EffectBind::parse(name, own_id.as_deref()));
-    let plain = !force
-        && (!scene_input.as_ref().is_some_and(bound_input)
-            || model[PASSTHROUGH].as_bool() == Some(true));
+    let plain = !scene_input.as_ref().is_some_and(bound_input)
+        || model[PASSTHROUGH].as_bool() == Some(true);
     let generic = simple(pkg, &model, first, true);
     let texture_copy = generic && first[SHADER].as_str() != Some(FLAT);
     if let Some(puppet) = puppet.as_deref_mut() {
@@ -427,7 +421,7 @@ pub(crate) fn load(
         let mut lit = combos.clone();
         lit.insert(PRELIGHTING.into(), 1);
         if let (Some(frame), Some(puppet)) = (&frame, puppet.as_deref()) {
-            let pass = build.pass(&first, lit, false)?;
+            let pass = build.pass(&first, lit)?;
             puppet::validate(&pass, texture, frame.bones.len())?;
             prelit = Some(Prelit {
                 pass,
@@ -442,7 +436,7 @@ pub(crate) fn load(
     if puppet.as_ref().is_some_and(|puppet| puppet.mesh.alpha) {
         combos.insert(crate::puppet::alpha::COMBO.into(), 1);
     }
-    let pass = build.pass(&first, combos, force_flat)?;
+    let pass = build.pass(&first, combos)?;
     if let Some(frame) = &frame {
         puppet::validate(&pass, texture, frame.bones.len())?;
     }
@@ -489,7 +483,6 @@ impl PassBuild<'_> {
         &self,
         first: &Value,
         mut combos: std::collections::BTreeMap<String, i64>,
-        force_flat: bool,
     ) -> Result<EffectPass, String> {
         let path = self.path;
         combos.insert(TEXTURE_FORMAT.into(), self.texture.we_format());
@@ -510,22 +503,6 @@ impl PassBuild<'_> {
         )
         .and_then(|mut passes| passes.pop())
         .ok_or_else(|| format!("base material {path} shader unavailable"))?;
-        if force_flat {
-            let mut vertex = crate::shader::translate(
-                FLAT_VERTEX,
-                crate::shader::Stage::Vertex,
-                &std::collections::BTreeMap::new(),
-            );
-            let mut fragment = crate::shader::translate(
-                FLAT_FRAGMENT,
-                crate::shader::Stage::Fragment,
-                &std::collections::BTreeMap::new(),
-            );
-            crate::shader::unify_uniforms(&mut vertex, &mut fragment);
-            pass.vertex = vertex;
-            pass.fragment = fragment;
-            pass.hlsl = None;
-        }
         if let Some(morph) = self.morph {
             pass.textures.resize_with(crate::puppet::morph::TEXTURE_SLOT + 1, || None);
             pass.textures[crate::puppet::morph::TEXTURE_SLOT] =

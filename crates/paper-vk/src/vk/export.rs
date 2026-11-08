@@ -191,6 +191,22 @@ impl Drop for ExternalSemaphore {
     }
 }
 
+#[cfg(feature = "shared-device")]
+impl Renderer {
+    pub(crate) fn scene_output(&self, scene: &super::SceneTarget) -> (RenderTarget, ExportImage) {
+        let mut target = RenderTarget::empty(&self.device, false);
+        target.image = scene.image;
+        target.view = scene.view;
+        target.framebuffer = scene.framebuffer;
+        target.released = true;
+        let mut export = ExportImage::empty(&self.device);
+        export.image = scene.image;
+        export.direct_render = true;
+        export.released = true;
+        (target, export)
+    }
+}
+
 impl ExportImage {
     fn empty(device: &ash::Device) -> Self {
         Self {

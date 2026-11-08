@@ -1,3 +1,5 @@
+const STREAM_ARGUMENT_START: usize = 3;
+const STREAM_OUTPUT: &str = "--stream-output";
 use super::model::StartFade;
 use super::upload::run_upload;
 #[cfg(feature = "shared-device")]
@@ -41,7 +43,9 @@ fn parse_flags<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
 pub(super) fn stream_targets(args: &[String], paused: bool) -> Vec<crate::preview::StreamTarget> {
     let sizes = parse_flags(args, "--stream-size");
     let rates = parse_flags(args, "--stream-fps");
-    let outputs = parse_flags(args, "--stream-output");
+    let outputs = parse_flags(args, STREAM_OUTPUT);
+    let connectors = parse_flags(args, paper_control::stream::CONNECTOR);
+    let logical = parse_flags(args, paper_control::stream::LOGICAL);
     let paused_outputs = parse_flags(args, "--stream-paused");
     parse_flags(args, "--stream-fd")
         .iter()
@@ -54,6 +58,11 @@ pub(super) fn stream_targets(args: &[String], paused: bool) -> Vec<crate::previe
                 rates.get(index).or(rates.first()).and_then(|text| text.parse().ok()).unwrap_or(30);
             let output = outputs.get(index).copied().unwrap_or_default().to_string();
             Some(crate::preview::StreamTarget {
+                connector: connectors.get(index).copied().unwrap_or(&output).to_owned(),
+                logical: logical.get(index).map_or([width, height], |size| {
+                    let (w, h) = crate::preview::parse_size(Some(size));
+                    [w, h]
+                }),
                 socket,
                 width,
                 height,
@@ -172,12 +181,24 @@ pub(crate) fn run() -> Result<()> {
             return super::scene::stream_scene(&args[2], &properties, targets, mute, volume);
         }
         return if targets.is_empty() {
-            let stream = crate::preview::StreamTarget::single(
+            let mut stream = crate::preview::StreamTarget::single(
                 crate::preview::NO_SOCKET,
                 width,
                 height,
                 fps,
                 paused,
+            );
+            let stream_args = &args[STREAM_ARGUMENT_START..];
+            parse_flag(stream_args, paper_control::stream::CONNECTOR)
+                .or_else(|| parse_flag(stream_args, STREAM_OUTPUT))
+                .unwrap_or_default()
+                .clone_into(&mut stream.connector);
+            stream.logical = parse_flag(stream_args, paper_control::stream::LOGICAL).map_or(
+                [width, height],
+                |size| {
+                    let (w, h) = crate::preview::parse_size(Some(size));
+                    [w, h]
+                },
             );
             crate::preview::video_stream(&args[2], &stream, write_header)
         } else {

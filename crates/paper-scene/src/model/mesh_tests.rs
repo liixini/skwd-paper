@@ -600,3 +600,49 @@ fn morph_section_reported() {
     bare.extend(b"MDMP");
     assert!(parse(&bare).is_err());
 }
+
+const BIND_AFTER_SKELETON: usize = 30;
+
+fn scaled_bind() -> crate::matrix::Mat4 {
+    crate::matrix::model_matrix([-0.0293, 42.161_38, 0.0], [1.0, 1.5, 1.0], [0.0, 0.0, 0.1674])
+}
+
+fn scaled_rig() -> crate::puppet::Mesh {
+    let mut data = skeletal(NO_CONSTRAINT);
+    let at = data.windows(9).position(|window| window == b"MDLS0004\0").unwrap();
+    let bind = &mut data[at + BIND_AFTER_SKELETON..][..size_of::<crate::matrix::Mat4>()];
+    for (bytes, value) in bind.chunks_exact_mut(size_of::<f32>()).zip(scaled_bind()) {
+        bytes.copy_from_slice(&value.to_le_bytes());
+    }
+    std::rc::Rc::into_inner(parse(&data).unwrap().rig.unwrap()).unwrap()
+}
+
+#[test]
+fn model_zero_blend_raw() {
+    let mut rig = crate::puppet::sampler::Sampler::new(std::rc::Rc::new(scaled_rig())).unwrap();
+    let rest = rig.sample(&[], 0.0).unwrap().matrices.to_vec();
+    let identity = crate::matrix::model_matrix([0.0; 3], [1.0; 3], [0.0; 3]);
+    assert!(rest[0].iter().zip(identity).all(|(value, expected)| (value - expected).abs() < 1e-5));
+    for additive in [false, true] {
+        let layer =
+            crate::puppet::AnimationLayer { visible: true, id: 1, rate: 0.0, blend: 0.0, additive };
+        assert_eq!(rig.sample(&[(layer, 0.0)], 0.0).unwrap().matrices, rest, "{additive}");
+    }
+}
+
+#[test]
+fn model_snapshot_raw() {
+    let mut playback =
+        crate::puppet::playback::Playback::new(vec![crate::puppet::playback::Clip {
+            slot: 0,
+            object: "rig".into(),
+            name: "move".into(),
+            animation: 1,
+            fps: 30.0,
+            length: 2.0,
+            rate: 0.0,
+        }]);
+    playback.install_rig(0, "rig".into(), scaled_rig());
+    playback.blend(0, Some(0.0));
+    assert_eq!(playback.bone_matrix(0, 0, true), Some(scaled_bind()));
+}

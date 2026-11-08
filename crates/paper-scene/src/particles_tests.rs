@@ -3676,6 +3676,143 @@ fn color_override_follows_version() {
     }
 }
 
+fn assert_colorchange(flags: u32, version: u32, expected: [[f32; 3]; 3]) {
+    let definition = serde_json::json!({
+        "flags":flags,
+        "initializer":[{"name":"lifetimerandom","min":1,"max":1}],
+        "operator":[{"name":"colorchange","startvalue":"1 0 0","endvalue":"0 1 0","endtime":0.5}]
+    });
+    let system = tint_system(&definition, &serde_json::json!({"colorn":"0 0 1"}), version);
+    let mut sim = spawn_one(&system);
+    for (step, expected) in [0.0, 0.25, 0.5].into_iter().zip(expected) {
+        sim.step(&system, step);
+        assert_color(sim.particles[0].color, expected);
+    }
+}
+
+#[test]
+fn colorchange_recolored() {
+    assert_colorchange(0, 5, [[0.0, 0.0, 1.0], [0.5, 0.0, 0.5], [1.0, 0.0, 0.0]]);
+}
+
+#[test]
+fn colorchange_recolor_disabled() {
+    assert_colorchange(8, 5, [[1.0, 0.0, 0.0], [0.5, 0.5, 0.0], [0.0, 1.0, 0.0]]);
+}
+
+#[test]
+fn colorchange_legacy_tints() {
+    assert_colorchange(0, 4, [[0.0, 0.0, 1.0], [0.0, 0.0, 0.5], [0.0; 3]]);
+}
+
+#[test]
+fn both_sources_recolor() {
+    let definition = serde_json::json!({
+        "initializer":[{"name":"colorrandom","min":"255 255 0","max":"255 255 0"}],
+        "operator":[{"name":"colorchange","startvalue":"1 0 0","endvalue":"1 0 0"}]
+    });
+    let system = tint_system(&definition, &serde_json::json!({"colorn":"0 0 1"}), 5);
+    assert_color(spawn_one(&system).particles[0].color, [0.0, 0.0, 1.0]);
+}
+
+const SAMPLE_SEEDS: u32 = 16;
+const SEED_STRIDE: u32 = 2_654_435_761;
+
+fn near(actual: [f32; 3], expected: [f32; 3]) -> bool {
+    actual.into_iter().zip(expected).all(|(actual, expected)| (actual - expected).abs() < 0.0001)
+}
+
+fn sampled_colors(system: &ParticleSystem) -> Vec<[f32; 3]> {
+    (0..SAMPLE_SEEDS)
+        .flat_map(|seed| {
+            let mut sim = Sim::new(seed.wrapping_mul(SEED_STRIDE));
+            sim.pending = 1.0;
+            sim.step(system, 0.0001);
+            let spawned = sim.particles[0].color;
+            sim.step(system, 0.5);
+            [spawned, sim.particles[0].color]
+        })
+        .collect()
+}
+
+fn assert_palette(system: &ParticleSystem, palette: &[[f32; 3]]) {
+    let mut seen = vec![false; palette.len()];
+    for color in sampled_colors(system) {
+        let slot = palette.iter().position(|expected| near(color, *expected));
+        seen[slot.unwrap_or_else(|| panic!("stray colour {color:?}"))] = true;
+    }
+    assert!(seen.iter().all(|hit| *hit), "{seen:?}");
+}
+
+fn hsv_system(entry: &Value) -> ParticleSystem {
+    let definition = serde_json::json!({"initializer":[
+        {"name":"lifetimerandom","min":10,"max":10},
+        entry
+    ]});
+    tint_system(&definition, &serde_json::json!({"colorn":"1 0.5 0"}), 5)
+}
+
+#[test]
+fn hsv_random_recenters() {
+    let definition = serde_json::json!({"initializer":[{
+        "name":"hsvcolorrandom","huemin":0,"huemax":0,"huesteps":1,
+        "saturationmin":1,"saturationmax":1,"valuemin":0.5,"valuemax":0.5
+    }]});
+    let system = tint_system(&definition, &serde_json::json!({"colorn":"0 0 1"}), 5);
+    assert_color(spawn_one(&system).particles[0].color, [0.0, 0.0, 1.0]);
+}
+
+#[test]
+fn hsv_recenter_bounds() {
+    let system = hsv_system(&serde_json::json!({
+        "name":"hsvcolorrandom","huemin":0,"huemax":0.5,"huesteps":3,
+        "saturationmin":0.5,"saturationmax":1,"valuemin":0.25,"valuemax":0.75
+    }));
+    let Some(Initializer::HsvColor(hsv)) = system.initializers.last() else {
+        panic!("missing HSV initializer");
+    };
+    assert_color([hsv.hue_min, hsv.hue_span, hsv.hue_step], [1.0 / 12.0 - 0.25, 0.5, 0.25]);
+    assert_color([hsv.saturation.0, hsv.saturation.1, hsv.value.0], [0.75, 1.0, 0.75]);
+    assert_eq!(hsv.value.1, 1.0);
+}
+
+#[test]
+fn hsv_recenter_samples() {
+    let system = hsv_system(&serde_json::json!({
+        "name":"hsvcolorrandom","huemin":0,"huemax":0.5,"huesteps":3,
+        "saturationmin":1,"saturationmax":1,"valuemin":1,"valuemax":1
+    }));
+    let palette = [[0.0; 3], [1.0, 0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.5, 1.0]];
+    assert_palette(&system, &palette);
+}
+
+#[test]
+fn color_list_shifts() {
+    let definition = serde_json::json!({
+        "initializer":[{"name":"colorlist","colors":["1 1 0","1 0 0"]}]
+    });
+    let system = tint_system(&definition, &serde_json::json!({"colorn":"0 0 1"}), 5);
+    assert_palette(&system, &[[0.0, 0.0, 1.0], [0.0, 1.0, 1.0]]);
+}
+
+#[test]
+fn color_list_wraps() {
+    let definition = serde_json::json!({
+        "initializer":[{"name":"colorlist","colors":["1 0 0.6","1 0.6 0"]}]
+    });
+    let system = tint_system(&definition, &serde_json::json!({"colorn":"0 1 1"}), 5);
+    assert_palette(&system, &[[0.0, 1.0, 1.0], [0.2, 0.0, 1.0]]);
+}
+
+#[test]
+fn color_list_clamps() {
+    let definition = serde_json::json!({
+        "initializer":[{"name":"colorlist","colors":["0.5 0.25 0.25","1 0 0"]}]
+    });
+    let system = tint_system(&definition, &serde_json::json!({"colorn":"0 0 1"}), 5);
+    assert_palette(&system, &[[0.0, 0.0, 1.0]]);
+}
+
 #[test]
 fn uncolored_override_both_versions() {
     let overrides = serde_json::json!({"colorn":"1 0.5019608 1"});

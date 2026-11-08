@@ -4,6 +4,7 @@ mod clip;
 mod cookie;
 mod fx_builder;
 mod fx_chain;
+mod fx_pool;
 mod material;
 mod media;
 mod mesh;
@@ -15,21 +16,24 @@ mod sampling;
 mod script;
 mod shadow;
 mod sprite_stream;
+mod stream_frame;
+use stream_frame::{FrameStatus, StreamFrame};
 mod text;
 mod video;
 mod volume;
 
 use self::fx_builder::{FxBuilder, FxInput};
+use self::fx_pool::{FxPool, Lease, Starvation};
 use super::dmabuf_helpers::{create_buffers, init_free_buffers, monotonic_ns};
 use super::model::StartFade;
 use super::readiness::{signal_ready, signal_swap_failure};
 use crate::dmabuf::{DRM_MOD_INVALID, DRM_MOD_LINEAR, xr24_export_modifiers};
 use crate::fill::{fill_mode, mode_uv};
 use crate::{ctl, decode, shared, vk, wayland};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 use paper_geom::FillMode;
 use paper_scene::effect_lifetime::{self as lifetime, Target as FxTargetId, TargetPlan};
-use paper_scene::effects::{CompositeBuffer, EffectBind};
+use paper_scene::effects::{CompositeBuffer, EffectBind, FBO_MAX_EXTENT};
 use paper_scene::matrix::{Mat4, mat4_mul};
 use paper_scene::model::{Camera, SceneModel};
 use paper_scene::scene_targets::{
@@ -47,7 +51,7 @@ const SCENE_FRAME_DT_MIN: f32 = 1.0 / 240.0;
 const SCENE_FRAME_DT_MAX: f32 = paper_scene::puppet::spring::MAX_STEP_SECONDS;
 const PARTICLE_PIPELINES_KEY: &str = "particle_shader_pipelines";
 const ORTHOGRAPHIC_EYE_Z: f32 = 2000.0;
-const HISTORY_BUDGET_GAP: &str = "scene-history-budget";
+const EFFECT_MIN_EXTENT: u32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SceneFadeStep {
@@ -56,11 +60,11 @@ struct SceneFadeStep {
     finish_after_commit: bool,
 }
 
-fn scene_fade_step(ratio: Option<f32>, first_frame: bool) -> SceneFadeStep {
+fn scene_fade_step(ratio: Option<f32>, first_frame: bool, paused: bool) -> SceneFadeStep {
     let Some(ratio) = ratio else {
         return SceneFadeStep { mix: 1.0, render_transition: false, finish_after_commit: false };
     };
-    if first_frame {
+    if first_frame || paused {
         return SceneFadeStep { mix: 0.0, render_transition: true, finish_after_commit: false };
     }
     let mix = ratio.clamp(0.0, 1.0);
@@ -139,7 +143,6 @@ struct LayerFx {
     binds: Vec<Vec<(usize, EffectBind)>>,
     owner: Vec<usize>,
     effects: Vec<paper_scene::effects::EffectState>,
-    visibility_dynamic: bool,
     swap_owners: Vec<usize>,
     passes: Vec<paper_scene::effects::PassMeta>,
     material_values: Vec<BTreeMap<String, Vec<f32>>>,
@@ -151,6 +154,8 @@ struct LayerFx {
     source_pointer: bool,
     dependency_dynamic: bool,
     retain_targets: bool,
+    starved: Option<Starvation>,
+    parked: Option<[f32; 4]>,
     snapshot: bool,
     passthrough: bool,
     copy_background: bool,
@@ -431,32 +436,52 @@ fn flat_slot(puppets: &[PuppetGroup], layer: usize, slots: &[usize]) -> usize {
     layer_puppet(puppets, layer).map_or(slots[layer], |puppet| puppet.texture)
 }
 
+struct PooledTarget {
+    class: FxTargetClass,
+    lease: Option<Lease>,
+}
+
 enum FxTargetStorage {
     Owned(vk::SceneTarget),
-    Shared(usize),
+    Pooled(PooledTarget),
     Released,
 }
 
 impl FxTargetStorage {
-    fn get<'a>(&'a self, shared: &'a [vk::SceneTarget]) -> &'a vk::SceneTarget {
+    fn get<'a>(&'a self, pool: &'a FxPool) -> &'a vk::SceneTarget {
+        self.leased(pool).expect("effect target unavailable")
+    }
+
+    fn leased<'a>(&'a self, pool: &'a FxPool) -> Option<&'a vk::SceneTarget> {
         match self {
-            Self::Owned(target) => target,
-            Self::Shared(index) => &shared[*index],
-            Self::Released => panic!("released effect target accessed"),
+            Self::Owned(target) => Some(target),
+            Self::Pooled(pooled) => pool.target(pooled.lease?),
+            Self::Released => None,
+        }
+    }
+
+    fn pooled(&self) -> Option<&PooledTarget> {
+        match self {
+            Self::Pooled(pooled) => Some(pooled),
+            Self::Owned(_) | Self::Released => None,
         }
     }
 
     fn owned(&self) -> Option<&vk::SceneTarget> {
         match self {
             Self::Owned(target) => Some(target),
-            Self::Shared(_) | Self::Released => None,
+            Self::Pooled(_) | Self::Released => None,
         }
+    }
+
+    fn lease(&self) -> Option<Lease> {
+        self.pooled()?.lease
     }
 
     fn take_owned(&mut self) -> Option<vk::SceneTarget> {
         match std::mem::replace(self, Self::Released) {
             Self::Owned(target) => Some(target),
-            storage @ (Self::Shared(_) | Self::Released) => {
+            storage @ (Self::Pooled(_) | Self::Released) => {
                 *self = storage;
                 None
             }
@@ -464,23 +489,12 @@ impl FxTargetStorage {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FxTargetClass {
     width: u32,
     height: u32,
     repeat: bool,
     format: i32,
-}
-
-impl FxTargetClass {
-    fn of(target: &vk::SceneTarget) -> Self {
-        Self {
-            width: target.extent.width,
-            height: target.extent.height,
-            repeat: target.repeat,
-            format: target.format.as_raw(),
-        }
-    }
 }
 
 fn vk_format(format: paper_scene::effects::FboFormat) -> ash::vk::Format {
@@ -508,68 +522,6 @@ struct EffectBakeReport {
     retained_bytes: u64,
     transient_bytes: u64,
     released_transient_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct EffectAliasReport {
-    planned_layers: usize,
-    fallback_layers: usize,
-    logical_scratch_targets: usize,
-    physical_scratch_targets: usize,
-    scratch_bytes: u64,
-    released_bytes: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ScratchLayout {
-    assignments: Vec<Vec<usize>>,
-    physical_classes: Vec<FxTargetClass>,
-}
-
-fn plan_scratch_layout(layers: &[Vec<FxTargetClass>]) -> ScratchLayout {
-    let mut slots_by_class: HashMap<FxTargetClass, Vec<usize>> = HashMap::new();
-    let mut layout = ScratchLayout::default();
-    for layer in layers {
-        let mut used_by_class: HashMap<FxTargetClass, usize> = HashMap::new();
-        let mut assignments = Vec::with_capacity(layer.len());
-        for class in layer {
-            let ordinal = used_by_class.entry(*class).or_default();
-            let slots = slots_by_class.entry(*class).or_default();
-            let slot = if let Some(slot) = slots.get(*ordinal) {
-                *slot
-            } else {
-                let slot = layout.physical_classes.len();
-                layout.physical_classes.push(*class);
-                slots.push(slot);
-                slot
-            };
-            *ordinal += 1;
-            assignments.push(slot);
-        }
-        layout.assignments.push(assignments);
-    }
-    layout
-}
-
-fn classify_effect_target_bytes(
-    allocations: &[u64],
-    output: FxTargetId,
-) -> Option<EffectTargetBytes> {
-    let retained = *allocations.get(output.index())?;
-    Some(EffectTargetBytes {
-        retained,
-        transient: allocations.iter().copied().sum::<u64>().saturating_sub(retained),
-    })
-}
-
-fn scratch_candidate(
-    plan: &TargetPlan,
-    sampled: &BTreeSet<CompositeBuffer>,
-    target: FxTargetId,
-) -> bool {
-    let scene_sampled = (target == plan.output && sampled.contains(&CompositeBuffer::A))
-        || (target == FxTargetId::Pong && sampled.contains(&CompositeBuffer::B));
-    plan.lifetimes[target.index()].scratch_eligible() && !scene_sampled
 }
 
 fn clear_function_targets<'a>(
@@ -614,36 +566,119 @@ impl LayerFx {
     }
 
     fn target_bytes(&self) -> Option<EffectTargetBytes> {
-        let mut allocations = Vec::with_capacity(self.fbos.len() + 2);
-        allocations
-            .extend([self.ping.owned()?.allocation_bytes, self.pong.owned()?.allocation_bytes]);
-        allocations.extend(
-            self.fbos
-                .iter()
-                .map(|(_, target)| target.owned().map(|target| target.allocation_bytes))
-                .collect::<Option<Vec<_>>>()?,
-        );
-        if let Some(crop) = &self.crop {
-            allocations.push(crop.owned()?.allocation_bytes);
-        }
         let output = self.output?;
-        let mut bytes = classify_effect_target_bytes(&allocations, output)?;
-        for target in &self.presentation_inputs {
-            if *target != output {
-                let allocation = self.target_storage(*target).owned()?.allocation_bytes;
-                bytes.retained += allocation;
-                bytes.transient -= allocation;
+        if matches!(self.target_storage(output), FxTargetStorage::Released) {
+            return None;
+        }
+        let mut bytes = EffectTargetBytes::default();
+        for id in self.target_ids() {
+            let Some(target) = self.target_storage(id).owned() else {
+                continue;
+            };
+            if id == output || self.presentation_inputs.contains(&id) {
+                bytes.retained += target.allocation_bytes;
+            } else {
+                bytes.transient += target.allocation_bytes;
             }
         }
+        bytes.transient += self
+            .crop
+            .as_ref()
+            .and_then(FxTargetStorage::owned)
+            .map_or(0, |crop| crop.allocation_bytes);
         Some(bytes)
+    }
+
+    fn detach(&mut self, textures: &mut [vk::SceneTexture]) {
+        textures[self.slot].effect = None;
+        self.presentation = None;
+        self.presentation_inputs.clear();
+        self.output = None;
+    }
+
+    fn bypass(&mut self, quads: &mut [vk::SceneQuad], textures: &mut [vk::SceneTexture]) {
+        let quad = &mut quads[self.quad];
+        self.parked.get_or_insert(quad.tint);
+        quad.texture = self.base_quad.texture;
+        quad.tint = self.fallback_tint;
+        self.detach(textures);
+    }
+
+    fn starve(
+        &mut self,
+        mirror: bool,
+        quads: &mut [vk::SceneQuad],
+        textures: &mut [vk::SceneTexture],
+    ) {
+        if mirror {
+            self.detach(textures);
+            return;
+        }
+        self.bypass(quads, textures);
+        if let Some(blend) = chainless_blend(self.base_blend, self.bare_blend) {
+            quads[self.quad].blend = blend;
+        }
+    }
+
+    fn resume(&mut self, quad: &mut vk::SceneQuad, scripted: bool) -> bool {
+        let Some(tint) = self.parked.take() else { return false };
+        if !scripted {
+            quad.tint = tint;
+        }
+        true
+    }
+
+    fn storages(&self) -> impl Iterator<Item = &FxTargetStorage> {
+        [&self.ping, &self.pong]
+            .into_iter()
+            .chain(self.crop.as_ref())
+            .chain(self.fbos.iter().map(|(_, storage)| storage))
+    }
+
+    fn pooled_classes(&self) -> Vec<FxTargetClass> {
+        self.storages().filter_map(FxTargetStorage::pooled).map(|pooled| pooled.class).collect()
+    }
+
+    fn pooled_mut(&mut self) -> impl Iterator<Item = &mut PooledTarget> {
+        [&mut self.ping, &mut self.pong]
+            .into_iter()
+            .chain(self.crop.as_mut())
+            .chain(self.fbos.iter_mut().map(|(_, storage)| storage))
+            .filter_map(|storage| match storage {
+                FxTargetStorage::Pooled(pooled) => Some(pooled),
+                FxTargetStorage::Owned(_) | FxTargetStorage::Released => None,
+            })
+    }
+
+    fn unleased(&self) -> bool {
+        let mut pooled = self.storages().filter_map(FxTargetStorage::pooled).peekable();
+        pooled.peek().is_some() && pooled.all(|pooled| pooled.lease.is_none())
+    }
+
+    fn held(&self, id: FxTargetId) -> bool {
+        self.mesh_blend.is_some()
+            || self.output == Some(id)
+            || self.presentation_inputs.contains(&id)
+            || (id == FxTargetId::Pong && self.sampled_targets.contains(&CompositeBuffer::B))
+    }
+
+    fn settle(&self, pool: &mut FxPool) {
+        for id in self.target_ids() {
+            if let Some(lease) = self.target_storage(id).lease() {
+                pool.settle(lease, self.held(id));
+            }
+        }
+        if let Some(lease) = self.crop.as_ref().and_then(FxTargetStorage::lease) {
+            pool.settle(lease, self.mesh_blend.is_some());
+        }
     }
 
     fn fbo_names(&self) -> Vec<String> {
         self.fbos.iter().map(|(name, _)| name.clone()).collect()
     }
 
-    fn target<'a>(&'a self, id: FxTargetId, shared: &'a [vk::SceneTarget]) -> &'a vk::SceneTarget {
-        self.target_storage(id).get(shared)
+    fn target<'a>(&'a self, id: FxTargetId, pool: &'a FxPool) -> &'a vk::SceneTarget {
+        self.target_storage(id).get(pool)
     }
 
     fn target_storage(&self, id: FxTargetId) -> &FxTargetStorage {
@@ -2091,8 +2126,6 @@ struct Group {
     layer_poses: HashMap<usize, LayerPose>,
     reflection_excluded: BTreeSet<usize>,
     unreflected: BTreeSet<String>,
-    history_budget: u64,
-    effect_budget: u64,
     #[cfg(test)]
     replay_snapshots: bool,
     #[cfg(test)]
@@ -2101,6 +2134,7 @@ struct Group {
     resize_inputs_static: bool,
     composed_at: f32,
     from: Option<FadeSource>,
+    output_from: BTreeMap<String, FadeSource>,
     quads: Vec<vk::SceneQuad>,
     quad_scene_order: Vec<usize>,
     textures: Vec<vk::SceneTexture>,
@@ -2126,7 +2160,7 @@ struct Group {
     unavailable_effects: Vec<(String, paper_scene::effects::EffectState)>,
     puppets: Vec<PuppetGroup>,
     clip_planes: Option<vk::ClipPlanes>,
-    fx_scratch: Vec<vk::SceneTarget>,
+    fx_pool: FxPool,
     ndc_quad: Option<vk::QuadBuffer>,
     ndc_quad_d3d: Option<vk::QuadBuffer>,
     particles: Vec<ParticleGroup>,
@@ -2170,21 +2204,13 @@ struct Presenter {
 struct SceneRing {
     ptrs: Vec<*mut u8>,
     stride: u32,
-    bytes: usize,
+    _mapping: super::dmabuf_helpers::ShmMapping,
 }
 
 struct ScenePresentationBuffers {
     rbs: Vec<vk::ReadbackBuf>,
     buffers: Vec<Vec<wayland_client::protocol::wl_buffer::WlBuffer>>,
     rings: Vec<SceneRing>,
-}
-
-impl Drop for SceneRing {
-    fn drop(&mut self) {
-        if let Some(&base) = self.ptrs.first() {
-            unsafe { libc::munmap(base.cast(), self.bytes) };
-        }
-    }
 }
 
 struct RetiredScenePresentation {
@@ -2278,6 +2304,7 @@ impl Presenter {
     fn present(&mut self, target: &vk::SceneTarget, buffer_index: usize) -> Result<()> {
         let uv = mode_uv(target.extent.width, target.extent.height, self.width, self.height);
         if self.direct_scene_copy
+            && !self.renderer.has_overlay()
             && target.extent.width == self.width
             && target.extent.height == self.height
             && uv == [1.0, 1.0, 0.0, 0.0]
@@ -2301,78 +2328,53 @@ impl Presenter {
         buffer_index: usize,
         progress: f32,
         style: TransitionStyle,
+        output: &str,
     ) -> Result<()> {
-        let Some(source) = &group.from else {
+        let source = group.fade_source(output);
+        let Some(source) = source else {
             return self.present(&group.target, buffer_index);
         };
-        if progress <= 0.0 {
+        if progress >= 1.0 {
+            self.renderer.clear_transition()?;
+            return self.present(&group.target, buffer_index);
+        }
+        if progress <= 0.0
+            && let FadeFrom::Scene(target) = &source.source
+        {
             if let TransitionStyle::Effect(effect) = style {
                 self.renderer.prepare_transition(effect)?;
             } else {
                 self.renderer.clear_transition()?;
             }
-            return match &source.source {
-                FadeFrom::Scene(target) => self.present(target, buffer_index),
-                FadeFrom::Nv12(up) => {
-                    self.ensure_render_targets()?;
-                    let rt_index =
-                        if self.exports[buffer_index].direct_render { buffer_index } else { 0 };
-                    let export = &mut self.exports[buffer_index];
-                    let from = vk::Src::Views(up.luma_view, up.chroma_view);
-                    let from_uv = mode_uv(source.width, source.height, self.width, self.height);
-                    self.renderer.render_to(&self.rts[rt_index], export, &from, from_uv)
-                }
-            };
-        }
-        if progress >= 1.0 {
-            self.renderer.clear_transition()?;
-            return self.present(&group.target, buffer_index);
+            return self.present(target, buffer_index);
         }
         self.ensure_render_targets()?;
         let rt_index = if self.exports[buffer_index].direct_render { buffer_index } else { 0 };
-        let export = &mut self.exports[buffer_index];
-        let from = match &source.source {
-            FadeFrom::Nv12(up) => vk::Src::Views(up.luma_view, up.chroma_view),
-            FadeFrom::Scene(rt) => vk::Src::Rgba(rt.view),
-        };
-        let from_uv = mode_uv(source.width, source.height, self.width, self.height);
-        let to_uv =
-            mode_uv(group.target.extent.width, group.target.extent.height, self.width, self.height);
-        let to = vk::Src::Rgba(group.target.view);
-        match style {
-            TransitionStyle::Sand(style) => self.renderer.render_sand_to(
-                &self.rts[rt_index],
-                export,
-                &from,
-                from_uv,
-                &to,
-                to_uv,
-                progress,
-                style,
-            ),
-            TransitionStyle::Effect(effect) => self.renderer.render_effect_to(
-                &self.rts[rt_index],
-                export,
-                &from,
-                from_uv,
-                &to,
-                to_uv,
-                progress,
-                effect,
-            ),
-            TransitionStyle::Fade => {
-                let mix = progress * progress * (3.0 - 2.0 * progress);
-                self.renderer.render_fade_to(
-                    &self.rts[rt_index],
-                    export,
-                    &from,
-                    from_uv,
-                    &to,
-                    to_uv,
-                    mix,
-                )
-            }
+        SceneFade { group, source: Some(source), progress, style, size: [self.width, self.height] }
+            .render(&mut self.renderer, &self.rts[rt_index], &mut self.exports[buffer_index])
+    }
+
+    fn freeze(
+        &mut self,
+        group: &Group,
+        progress: f32,
+        style: TransitionStyle,
+    ) -> Result<vk::SceneTarget> {
+        let frozen = self.renderer.output_target()?;
+        let (target, mut export) = self.renderer.scene_output(&frozen);
+        let overlay = self.renderer.take_overlay();
+        let rendered = SceneFade {
+            group,
+            source: group.from.as_ref(),
+            progress,
+            style,
+            size: [self.width, self.height],
         }
+        .render(&mut self.renderer, &target, &mut export);
+        self.renderer.restore_overlay(overlay);
+        rendered?;
+        self.renderer.sample_output(&frozen)?;
+        Ok(frozen)
     }
 
     fn read_export_to(&mut self, buffer_index: usize, rb: &vk::ReadbackBuf) -> Result<()> {
@@ -2381,6 +2383,62 @@ impl Presenter {
 
     fn wait_render(&self) -> Result<()> {
         self.renderer.wait_render()
+    }
+}
+
+const SCENE_FADE_EASE: [f32; 2] = [3.0, -2.0];
+
+struct SceneFade<'a> {
+    group: &'a Group,
+    source: Option<&'a FadeSource>,
+    progress: f32,
+    style: TransitionStyle,
+    size: [u32; 2],
+}
+
+impl SceneFade<'_> {
+    fn render(
+        self,
+        renderer: &mut vk::Renderer,
+        target: &vk::RenderTarget,
+        export: &mut vk::ExportImage,
+    ) -> Result<()> {
+        let Self { group, source, progress, style, size: [width, height] } = self;
+        let to_uv = mode_uv(group.target.extent.width, group.target.extent.height, width, height);
+        let to = vk::Src::Rgba(group.target.view);
+        let Some(source) = source.filter(|_| progress < 1.0) else {
+            renderer.clear_transition()?;
+            return renderer.render_to(target, export, &to, to_uv);
+        };
+        let from = match &source.source {
+            FadeFrom::Nv12(upload) => vk::Src::Views(upload.luma_view, upload.chroma_view),
+            FadeFrom::Scene(target) => vk::Src::Rgba(target.view),
+        };
+        let from_uv = mode_uv(source.width, source.height, width, height);
+        if progress <= 0.0 {
+            if let TransitionStyle::Effect(effect) = style {
+                renderer.prepare_transition(effect)?;
+            } else {
+                renderer.clear_transition()?;
+            }
+            return renderer.render_to(target, export, &from, from_uv);
+        }
+        match style {
+            TransitionStyle::Sand(style) => {
+                renderer.render_sand_to(target, export, &from, from_uv, &to, to_uv, progress, style)
+            }
+            TransitionStyle::Effect(effect) => renderer
+                .render_effect_to(target, export, &from, from_uv, &to, to_uv, progress, effect),
+            TransitionStyle::Fade => renderer.render_fade_to(
+                target,
+                export,
+                &from,
+                from_uv,
+                &to,
+                to_uv,
+                progress * progress * (SCENE_FADE_EASE[0] + SCENE_FADE_EASE[1] * progress),
+            ),
+        }
     }
 }
 
@@ -2818,15 +2876,7 @@ impl Group {
                 .flatten()
                 .any(|(_, binding)| matches!(binding, EffectBind::SceneHistory));
         if history_needed && self.scene_history.is_none() {
-            let history = self.renderer.create_scene_history(self.target.extent)?;
-            if history.allocation_bytes() > self.history_budget {
-                let bytes = history.allocation_bytes();
-                return Err(anyhow!(
-                    "[native-scene-gap:{HISTORY_BUDGET_GAP}] history needs {bytes} bytes; remaining budget {}",
-                    self.history_budget
-                ));
-            }
-            self.scene_history = Some(history);
+            self.scene_history = Some(self.renderer.create_scene_history(self.target.extent)?);
         }
         if self.scene_history.is_some() {
             for fx in &mut self.fx {
@@ -2898,7 +2948,7 @@ impl Group {
                             if let Some(blend) = chainless_blend(fx.base_blend, fx.bare_blend) {
                                 self.quads[fx.quad].blend = blend;
                             }
-                            self.destroy_layer_fx(fx);
+                            self.discard_layer_fx(fx);
                         }
                     }
                 }
@@ -3785,6 +3835,12 @@ impl Group {
             scene_targets.insert((layer.layer_id.clone(), CompositeBuffer::B), sample);
         }
         let readers = self.reflection_readers();
+        self.fx_pool.release_all();
+        if let Some((order, split)) = &readers {
+            for &index in &order[*split..] {
+                self.fx[index].settle(&mut self.fx_pool);
+            }
+        }
         let frame = reflection::ReflectionFrame {
             canvas: logical_canvas,
             clock,
@@ -3816,6 +3872,9 @@ impl Group {
                     && self.quads[self.fx[fx_index].quad].tint[3] <= 0.0
                     && self.fx[fx_index].sampled_targets.is_empty()
                 {
+                    let fx = &mut self.fx[fx_index];
+                    self.quads[fx.quad].texture = fx.base_quad.texture;
+                    fx.detach(&mut self.textures);
                     continue;
                 }
                 if self
@@ -3823,13 +3882,7 @@ impl Group {
                     .iter()
                     .any(|material| material.bypasses_effects(&self.fx[fx_index]))
                 {
-                    let fx = &mut self.fx[fx_index];
-                    self.quads[fx.quad].texture = fx.base_quad.texture;
-                    self.quads[fx.quad].tint = fx.fallback_tint;
-                    self.textures[fx.slot].effect = None;
-                    fx.presentation = None;
-                    fx.presentation_inputs.clear();
-                    fx.output = None;
+                    self.fx[fx_index].bypass(&mut self.quads, &mut self.textures);
                     continue;
                 }
                 let hidden_text = {
@@ -3843,12 +3896,7 @@ impl Group {
                 }
                 if hidden_text {
                     let fx = &mut self.fx[fx_index];
-                    self.quads[fx.quad].texture = fx.base_quad.texture;
-                    self.quads[fx.quad].tint = fx.fallback_tint;
-                    self.textures[fx.slot].effect = None;
-                    fx.presentation = None;
-                    fx.presentation_inputs.clear();
-                    fx.output = None;
+                    fx.bypass(&mut self.quads, &mut self.textures);
                     if fx.sampled_targets.is_empty() {
                         continue;
                     }
@@ -3867,20 +3915,25 @@ impl Group {
                         .scene_snapshot
                         .as_ref()
                         .context("scene target plan requires a shadow snapshot")?;
-                    let prefix = ordered_scene_quads(
+                    let mut prefix = ordered_scene_quads(
                         &self.view_quads(),
                         &self.quad_scene_order,
                         &particle_quads,
                         from,
                         Some(scene_order),
                     );
-                    let batches = particle_batches(
+                    let mut batches = particle_batches(
                         &self.particles,
                         &self.quad_scene_order,
                         &particle_quads,
                         &particle_draws,
                         ParticleBatches { from, before: Some(scene_order), mirrored: false },
                         self.scene_grab.as_ref(),
+                    );
+                    drop_snapshot_quads(
+                        &mut prefix,
+                        batches.iter_mut().map(|batch| &mut batch.after),
+                        |texture| self.fx.iter().any(|fx| fx.snapshot_slot == Some(texture)),
                     );
                     #[cfg(test)]
                     self.snapshot_draws.push((prefix.len(), batches.len()));
@@ -4023,8 +4076,14 @@ impl Group {
         }
     }
 
+    fn fade_source(&self, output: &str) -> Option<&FadeSource> {
+        self.output_from.get(output).or(self.from.as_ref())
+    }
+
     fn drop_from(&mut self) {
-        if let Some(source) = self.from.take() {
+        for source in
+            self.from.take().into_iter().chain(std::mem::take(&mut self.output_from).into_values())
+        {
             match source.source {
                 FadeFrom::Nv12(up) => self.renderer.destroy_upload_path(up),
                 FadeFrom::Scene(rt) => rt.destroy(&self.renderer.device),
@@ -4050,7 +4109,25 @@ impl Group {
         }
     }
 
-    fn retain_layer_fx_output(&mut self, mut fx: LayerFx) -> vk::SceneTarget {
+    fn discard_layer_fx(&mut self, fx: LayerFx) {
+        self.destroy_layer_fx(fx);
+        self.trim_fx_pool();
+    }
+
+    fn keep_fx_target(&mut self, storage: &mut FxTargetStorage) -> u64 {
+        if let Some(target) = storage.take_owned() {
+            self.baked_fx_outputs.push(target);
+            return 0;
+        }
+        let lease = storage.lease().expect("static output target");
+        let target = self.fx_pool.take(lease).expect("static output target");
+        let bytes = target.allocation_bytes;
+        self.baked_fx_outputs.push(target);
+        bytes
+    }
+
+    fn retain_layer_fx_output(&mut self, mut fx: LayerFx) -> u64 {
+        let mut pooled = 0;
         self.baked_fx_quads.push(fx.quad);
         if let Some(blend) = fx.mesh_blend {
             let pipeline = fx.pipelines.remove(blend.pass);
@@ -4061,9 +4138,7 @@ impl Group {
             self.baked_fx_draws.push((*pipeline, fx.verts.take().expect("effect vertices")));
             for target in std::mem::take(&mut fx.presentation_inputs) {
                 if Some(target) != fx.output {
-                    self.baked_fx_outputs.push(
-                        fx.target_storage_mut(target).take_owned().expect("presentation target"),
-                    );
+                    pooled += self.keep_fx_target(fx.target_storage_mut(target));
                 }
             }
         }
@@ -4071,12 +4146,9 @@ impl Group {
         for pipe in std::mem::take(&mut fx.pipelines) {
             self.renderer.destroy_effect_pipeline(pipe);
         }
-        let retained = fx
-            .target_storage_mut(output)
-            .take_owned()
-            .expect("static effect output must still own its target");
+        pooled += self.keep_fx_target(fx.target_storage_mut(output));
         self.destroy_layer_fx(fx);
-        retained
+        pooled
     }
 
     fn bake_static_effects(&mut self) -> Result<EffectBakeReport> {
@@ -4122,13 +4194,53 @@ impl Group {
                 report.baked_layers += 1;
                 report.retained_bytes += bytes.retained;
                 report.released_transient_bytes += bytes.transient;
-                let output = self.retain_layer_fx_output(fx);
-                self.baked_fx_outputs.push(output);
+                report.retained_bytes += self.retain_layer_fx_output(fx);
             }
         }
         self.fx = live_fx;
         self.release_empty_fx_quads();
+        let pooled = self.fx_pool.allocation_bytes();
+        self.trim_fx_pool();
+        let live = self.fx_pool.allocation_bytes();
+        report.transient_bytes += live;
+        report.released_transient_bytes += pooled - live;
         Ok(report)
+    }
+
+    fn starved_chains(&mut self) -> Vec<String> {
+        let mut starved = Vec::new();
+        for fx in self.fx.iter().chain(&self.mirror_fx) {
+            if fx.starved.is_some() {
+                starved.push(fx.layer_id.clone());
+                continue;
+            }
+            if !fx.unleased() {
+                continue;
+            }
+            match self.fx_pool.lease(&mut self.renderer, &fx.pooled_classes()) {
+                Ok(leases) => self.fx_pool.release(&leases),
+                Err(err) => {
+                    tracing::warn!(
+                        "skwd-wall-vk: hidden effect chain on {} ({err:#})",
+                        fx.layer_id
+                    );
+                    starved.push(fx.layer_id.clone());
+                }
+            }
+        }
+        starved
+    }
+
+    fn trim_fx_pool(&mut self) {
+        let leased: Vec<Lease> = self
+            .fx
+            .iter()
+            .chain(&self.mirror_fx)
+            .flat_map(LayerFx::storages)
+            .filter_map(FxTargetStorage::lease)
+            .collect();
+        self.fx_pool.release_all();
+        self.fx_pool.trim(&mut self.renderer, &leased);
     }
 
     fn release_unused_scene_snapshot(&mut self) {
@@ -4140,106 +4252,6 @@ impl Group {
         }
     }
 
-    fn alias_dynamic_effect_scratch(&mut self) -> EffectAliasReport {
-        debug_assert!(self.fx_scratch.is_empty());
-
-        let mut report = EffectAliasReport::default();
-        let mut plans: Vec<Option<TargetPlan>> = Vec::with_capacity(self.fx.len());
-        let mut candidates: Vec<Vec<(FxTargetId, FxTargetClass)>> =
-            Vec::with_capacity(self.fx.len());
-        for (layer, fx) in self.fx.iter().enumerate() {
-            if fx.output.is_none()
-                || fx.visibility_dynamic
-                || fx.effects.iter().any(|effect| !effect.visible)
-            {
-                report.fallback_layers += 1;
-                plans.push(None);
-                candidates.push(Vec::new());
-                continue;
-            }
-            let plan = match fx.plan() {
-                Ok(plan) if Some(plan.output) == fx.output => plan,
-                Ok(plan) => {
-                    report.fallback_layers += 1;
-                    tracing::warn!(
-                        layer,
-                        runtime_output = ?fx.output,
-                        planned_output = ?plan.output,
-                        "skwd-wall-vk: effect scratch alias plan disagreed with runtime routing"
-                    );
-                    plans.push(None);
-                    candidates.push(Vec::new());
-                    continue;
-                }
-                Err(error) => {
-                    report.fallback_layers += 1;
-                    tracing::warn!(
-                        layer,
-                        ?error,
-                        "skwd-wall-vk: effect scratch alias plan rejected"
-                    );
-                    plans.push(None);
-                    candidates.push(Vec::new());
-                    continue;
-                }
-            };
-            report.planned_layers += 1;
-            let layer_candidates = fx
-                .target_ids()
-                .filter(|target| {
-                    !fx.presentation_inputs.contains(target)
-                        && scratch_candidate(&plan, &fx.sampled_targets, *target)
-                })
-                .map(|target| {
-                    let class = FxTargetClass::of(
-                        fx.target_storage(target)
-                            .owned()
-                            .expect("scratch aliasing runs before target sharing"),
-                    );
-                    (target, class)
-                })
-                .collect();
-            plans.push(Some(plan));
-            candidates.push(layer_candidates);
-        }
-
-        let classes: Vec<Vec<FxTargetClass>> = candidates
-            .iter()
-            .map(|layer| layer.iter().map(|(_, class)| *class).collect())
-            .collect();
-        let layout = plan_scratch_layout(&classes);
-        report.logical_scratch_targets = candidates.iter().map(Vec::len).sum();
-        report.physical_scratch_targets = layout.physical_classes.len();
-
-        let mut physical: Vec<Option<vk::SceneTarget>> =
-            (0..layout.physical_classes.len()).map(|_| None).collect();
-        for (layer, (layer_candidates, assignments)) in
-            candidates.into_iter().zip(layout.assignments).enumerate()
-        {
-            if plans[layer].is_none() {
-                continue;
-            }
-            for ((target_id, class), slot) in layer_candidates.into_iter().zip(assignments) {
-                debug_assert_eq!(layout.physical_classes[slot], class);
-                let target = self.fx[layer]
-                    .target_storage_mut(target_id)
-                    .take_owned()
-                    .expect("scratch candidate owns its image");
-                if physical[slot].is_none() {
-                    report.scratch_bytes += target.allocation_bytes;
-                    physical[slot] = Some(target);
-                } else {
-                    report.released_bytes += target.allocation_bytes;
-                    self.renderer.destroy_scene_target(target);
-                }
-                *self.fx[layer].target_storage_mut(target_id) = FxTargetStorage::Shared(slot);
-            }
-        }
-        self.fx_scratch =
-            physical.into_iter().map(|target| target.expect("scratch slot populated")).collect();
-        report
-    }
-
     fn effect_target_allocation_bytes(&self) -> u64 {
         let owned = self.fx.iter().map(LayerFx::allocation_bytes).sum::<u64>();
         owned
@@ -4248,8 +4260,8 @@ impl Group {
             + self.reflection.as_ref().map_or(0, |reflection| reflection.target().allocation_bytes)
             + self.materials.iter().map(material::Material::target_bytes).sum::<u64>()
             + self.baked_fx_outputs.iter().map(|target| target.allocation_bytes).sum::<u64>()
-            + self.fx_scratch.iter().map(|target| target.allocation_bytes).sum::<u64>()
             + self.clip_planes.as_ref().map_or(0, vk::ClipPlanes::allocation_bytes)
+            + self.fx_pool.allocation_bytes()
     }
 
     fn release_composition_inputs(&mut self) {
@@ -4284,9 +4296,7 @@ impl Group {
         if let Some(planes) = self.clip_planes.take() {
             self.renderer.destroy_clip_planes(planes);
         }
-        for target in std::mem::take(&mut self.fx_scratch) {
-            self.renderer.destroy_scene_target(target);
-        }
+        self.fx_pool.destroy(&mut self.renderer);
         for target in std::mem::take(&mut self.passive_scene_targets) {
             self.renderer.destroy_scene_target(target);
         }
@@ -4516,6 +4526,24 @@ fn ordered_scene_quads(
     );
     ordered.sort_by_key(|(order, serial, quad)| (*order, quad.order_bias, *serial));
     ordered.into_iter().map(|(_, _, quad)| quad).collect()
+}
+
+fn drop_snapshot_quads<'a>(
+    quads: &mut Vec<vk::SceneQuad>,
+    afters: impl IntoIterator<Item = &'a mut usize>,
+    is_snapshot: impl Fn(usize) -> bool,
+) {
+    let mut kept = 0;
+    let kept_before: Vec<usize> = std::iter::once(0)
+        .chain(quads.iter().map(|quad| {
+            kept += usize::from(!is_snapshot(quad.texture));
+            kept
+        }))
+        .collect();
+    for after in afters {
+        *after = kept_before[(*after).min(quads.len())];
+    }
+    quads.retain(|quad| !is_snapshot(quad.texture));
 }
 
 fn pass_blend(blend: paper_scene::effects::PassBlend) -> vk::SceneBlend {
@@ -4897,9 +4925,9 @@ fn effect_dimensions_for(size: (f32, f32), dimensions: SceneDimensions) -> (u32,
 }
 
 fn bounded_effect_dimensions(raw_w: f64, raw_h: f64) -> (u32, u32) {
-    let shrink = (2048.0 / raw_w.max(raw_h)).min(1.0);
-    let width = ((raw_w * shrink).round() as u32).clamp(16, 2048);
-    let height = ((raw_h * shrink).round() as u32).clamp(16, 2048);
+    let shrink = (f64::from(FBO_MAX_EXTENT) / raw_w.max(raw_h)).min(1.0);
+    let width = ((raw_w * shrink).round() as u32).clamp(EFFECT_MIN_EXTENT, FBO_MAX_EXTENT);
+    let height = ((raw_h * shrink).round() as u32).clamp(EFFECT_MIN_EXTENT, FBO_MAX_EXTENT);
     (width, height)
 }
 
@@ -5048,6 +5076,7 @@ fn validate_pipeline_skip(strict: bool, layer: &str, reason: &str) -> Result<()>
 }
 
 const EFFECT_REDUCTION_CODE: &str = "effect-reduction";
+const STARVED_CHAIN: &str = "effect targets unavailable";
 
 fn record_effect_skip(
     strict: bool,
@@ -5556,50 +5585,7 @@ fn build_group(
     let mut mirror_fx = Vec::new();
     let canvas = model.canvas;
     let mut dynamic_chains = 0usize;
-    let byte_limit = std::env::var("SKWD_VK_SCENE_FX_BYTES")
-        .ok()
-        .and_then(|text| text.parse::<u64>().ok())
-        .unwrap_or(512)
-        .saturating_mul(1024 * 1024);
-    let history_needed = mesh_history.is_some()
-        || model.layers.iter().any(|layer| {
-            layer.material.as_ref().is_some_and(|material| {
-                binds_history(&material.pass.binds)
-                    || material
-                        .prelit
-                        .as_ref()
-                        .is_some_and(|prelit| binds_history(&prelit.pass.binds))
-            }) || binds_history(
-                layer.effects.iter().flat_map(|effect| &effect.passes).flat_map(|pass| &pass.binds),
-            )
-        });
-    let history_reservation = if history_needed {
-        vk::SceneHistory::expected_bytes(target.extent, renderer.scene_format())
-            .context("scene history format unsupported")?
-    } else {
-        0
-    };
-    ensure!(
-        history_reservation <= byte_limit,
-        "[native-scene-gap:{HISTORY_BUDGET_GAP}] history needs at least {history_reservation} bytes; budget {byte_limit}"
-    );
     let volumes = volume::Volumes::new(&mut renderer, &target, &model.lights)?;
-    let lighting_bytes = volumes.as_ref().map_or(0, volume::Volumes::allocation_bytes)
-        + shadows.as_ref().map_or(0, shadow::Shadows::allocation_bytes);
-    let reflection_bytes =
-        reflection.as_ref().map_or(0, |reflection| reflection.target().allocation_bytes);
-    let text_snapshot_bytes =
-        if model.layers.iter().any(|layer| layer.is_text() && !layer.effects.is_empty()) {
-            target.allocation_bytes
-        } else {
-            0
-        };
-    let mut admitted_bytes = history_reservation
-        .saturating_add(reflection_bytes)
-        .saturating_add(text_snapshot_bytes)
-        .saturating_add(lighting_bytes)
-        .saturating_add(materials.iter().map(material::Material::target_bytes).sum());
-    anyhow::ensure!(admitted_bytes <= byte_limit, "scene input targets exceed effect budget");
     let scene_lights = (model.ambient, model.skylight);
     let pointer_scene = model.mouse.amount != 0.0
         || model.layers.iter().any(|layer| {
@@ -5637,8 +5623,6 @@ fn build_group(
         world: model.camera.is_some(),
         pass_cap,
         fx_limit,
-        byte_limit,
-        admitted_bytes: &mut admitted_bytes,
         dynamic_chains: &mut dynamic_chains,
     };
     for index in chain_admission_order(&model.layers, scripted, &model.dependencies) {
@@ -5898,12 +5882,16 @@ fn build_group(
     let ndc_quad = if chained { Some(renderer.create_quad_buffer_ndc()?) } else { None };
     let ndc_quad_d3d = if chained { Some(renderer.create_quad_buffer_ndc_d3d()?) } else { None };
     let texture_bytes: u64 = textures.iter().map(|texture| texture.allocation_bytes).sum();
+    let effect_target_bytes =
+        fx.iter().chain(&mirror_fx).map(LayerFx::allocation_bytes).sum::<u64>()
+            + volumes.as_ref().map_or(0, volume::Volumes::allocation_bytes)
+            + shadows.as_ref().map_or(0, shadow::Shadows::allocation_bytes)
+            + reflection.as_ref().map_or(0, |reflection| reflection.target().allocation_bytes)
+            + materials.iter().map(material::Material::target_bytes).sum::<u64>();
     tracing::info!(
         chains_admitted = fx.len(),
         chains_dynamic = dynamic_chains,
-        effect_target_bytes = admitted_bytes,
-        history_reservation,
-        effect_target_budget = byte_limit,
+        effect_target_bytes,
         particle_systems = particles.len(),
         particle_capacity = particles
             .iter()
@@ -5912,7 +5900,7 @@ fn build_group(
             .sum::<usize>(),
         texture_slots = textures.len(),
         texture_bytes,
-        "skwd-wall-vk: scene budget"
+        "skwd-wall-vk: scene resources"
     );
     let live_text: Vec<LiveText> = model
         .layers
@@ -6007,8 +5995,6 @@ fn build_group(
         layer_poses,
         reflection_excluded,
         unreflected: std::mem::take(&mut model.unreflected),
-        history_budget: byte_limit.saturating_sub(admitted_bytes - history_reservation),
-        effect_budget: byte_limit,
         #[cfg(test)]
         replay_snapshots: tests::REPLAY_SNAPSHOTS.get(),
         #[cfg(test)]
@@ -6017,6 +6003,7 @@ fn build_group(
         resize_inputs_static,
         composed_at: 0.0,
         from: None,
+        output_from: BTreeMap::new(),
         quads,
         quad_scene_order,
         textures,
@@ -6052,7 +6039,7 @@ fn build_group(
             .collect(),
         puppets,
         clip_planes,
-        fx_scratch: Vec::new(),
+        fx_pool: FxPool::default(),
         ndc_quad,
         ndc_quad_d3d,
         particles,
@@ -6103,6 +6090,11 @@ fn build_group(
     let composed = group.compose(0.0, 0.0);
     #[cfg(test)]
     let composed = composed.and_then(|()| resize::tests::after_compose());
+    let composed = composed.and_then(|()| {
+        group.starved_chains().iter().try_for_each(|layer| {
+            record_effect_skip(strict, &mut model.skipped, layer, STARVED_CHAIN)
+        })
+    });
     if let Err(error) = composed {
         group.destroy();
         return Err(error);
@@ -6116,7 +6108,13 @@ fn build_group(
         || group.scripts.is_some()
         || group.media.is_some();
     let memory = if retain_composition_inputs {
-        group.bake_static_effects()?
+        match group.bake_static_effects() {
+            Ok(report) => report,
+            Err(error) => {
+                group.destroy();
+                return Err(error);
+            }
+        }
     } else {
         group.release_composition_inputs();
         group.frozen = true;
@@ -6127,12 +6125,6 @@ fn build_group(
         }
     };
     group.release_unused_scene_snapshot();
-    let alias_enabled = std::env::var("SKWD_VK_FX_ALIAS").as_deref() != Ok("0");
-    let alias = if retain_composition_inputs && alias_enabled {
-        group.alias_dynamic_effect_scratch()
-    } else {
-        EffectAliasReport::default()
-    };
     let effect_target_bytes_after = group.effect_target_allocation_bytes();
     debug_assert_eq!(
         effect_target_bytes_before,
@@ -6140,26 +6132,22 @@ fn build_group(
     );
     debug_assert_eq!(
         effect_target_bytes_before,
-        effect_target_bytes_after + memory.released_transient_bytes + alias.released_bytes
+        effect_target_bytes_after + memory.released_transient_bytes
     );
     if effect_target_bytes_before > 0 {
+        let pool_bytes = group.fx_pool.allocation_bytes();
         tracing::info!(
             effect_layers,
             baked_layers = memory.baked_layers,
-            alias_enabled,
-            alias_planned_layers = alias.planned_layers,
-            alias_fallback_layers = alias.fallback_layers,
-            logical_scratch_targets = alias.logical_scratch_targets,
-            physical_scratch_targets = alias.physical_scratch_targets,
+            pool_targets = group.fx_pool.len(),
+            pool_bytes,
             before_bytes = effect_target_bytes_before,
             after_bytes = effect_target_bytes_after,
-            scratch_bytes = alias.scratch_bytes,
-            released_bytes = memory.released_transient_bytes + alias.released_bytes,
+            released_bytes = memory.released_transient_bytes,
             before_mib = effect_target_bytes_before as f64 / 1_048_576.0,
             after_mib = effect_target_bytes_after as f64 / 1_048_576.0,
-            scratch_mib = alias.scratch_bytes as f64 / 1_048_576.0,
-            released_mib =
-                (memory.released_transient_bytes + alias.released_bytes) as f64 / 1_048_576.0,
+            pool_mib = pool_bytes as f64 / 1_048_576.0,
+            released_mib = memory.released_transient_bytes as f64 / 1_048_576.0,
             "skwd-wall-vk: effect target allocation accounting"
         );
     }
@@ -6329,7 +6317,14 @@ fn create_scene_presentation_buffers(
                 }
             };
             buffers.push(ring);
-            rings.push(SceneRing { ptrs, stride, bytes: stride as usize * h as usize * n_exports });
+            rings.push(SceneRing {
+                _mapping: super::dmabuf_helpers::ShmMapping {
+                    pointer: ptrs[0],
+                    bytes: stride as usize * h as usize * n_exports,
+                },
+                ptrs,
+                stride,
+            });
         }
     }
     Ok(ScenePresentationBuffers { rbs, buffers, rings })
@@ -6394,21 +6389,22 @@ fn build_stream_presenter(sd: &shared::SharedDevice, width: u32, height: u32) ->
     })
 }
 
-fn load_from_frame(group: &mut Group, path: &str) -> Result<()> {
+fn load_from_frame(group: &Group, path: &str) -> Result<FadeSource> {
     let mut dec = decode::SwDecoder::open_threads(path, 2).context("fade source decode")?;
     let (frame, _) = dec.next().context("fade source frame")?;
     let up =
         group.renderer.create_upload_path(dec.width, dec.height).context("fade source upload")?;
-    group.renderer.upload_nv12(
+    if let Err(error) = group.renderer.upload_nv12(
         &up,
         frame.data(0),
         frame.stride(0),
         frame.data(1),
         frame.stride(1),
-    )?;
-    group.from =
-        Some(FadeSource { source: FadeFrom::Nv12(up), width: dec.width, height: dec.height });
-    Ok(())
+    ) {
+        group.renderer.destroy_upload_path(up);
+        return Err(error);
+    }
+    Ok(FadeSource { source: FadeFrom::Nv12(up), width: dec.width, height: dec.height })
 }
 
 fn transition_style(shader: Option<&str>) -> TransitionStyle {
@@ -6727,12 +6723,36 @@ pub(super) fn run_scene(
         .unwrap_or(0);
     if fade_ms > 0
         && let Some(sf) = &start_fade
-        && let Err(err) = load_from_frame(&mut group, &sf.from)
     {
-        tracing::info!("skwd-wall-vk: scene fade source unavailable ({err:#}), cutting");
-        group.from = None;
+        match load_from_frame(&group, &sf.from) {
+            Ok(source) => group.from = Some(source),
+            Err(error) => {
+                tracing::info!("skwd-wall-vk: scene fade source unavailable ({error:#}), cutting")
+            }
+        }
+        if let Ok(raw) = std::env::var(paper_control::TRANSITION_SOURCES_ENV) {
+            match serde_json::from_str::<BTreeMap<String, String>>(&raw) {
+                Ok(paths) => {
+                    for surface in &target.app.surfaces {
+                        let Some(path) = paths.get(&surface.name) else { continue };
+                        if path == &sf.from {
+                            continue;
+                        }
+                        match load_from_frame(&group, path) {
+                            Ok(source) => {
+                                group.output_from.insert(surface.name.clone(), source);
+                            }
+                            Err(error) => {
+                                tracing::warn!(output = %surface.name, "scene fade source unavailable: {error:#}");
+                            }
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!("scene transition sources invalid: {error:#}"),
+            }
+        }
     }
-    let fading_enabled = fade_ms > 0 && group.from.is_some();
+    let fading_enabled = fade_ms > 0 && (group.from.is_some() || !group.output_from.is_empty());
     let mut trans_style = transition_style(start_fade.as_ref().and_then(|sf| sf.shader.as_deref()));
 
     let mut animated = group.animated();
@@ -6921,6 +6941,7 @@ pub(super) fn run_scene(
                     });
                     if let Some(mut candidate) = replacement.take() {
                         candidate.from = group.from.take();
+                        candidate.output_from = std::mem::take(&mut group.output_from);
                         let old = std::mem::replace(&mut group, candidate);
                         old.destroy();
                     }
@@ -6975,7 +6996,7 @@ pub(super) fn run_scene(
                 drop(ctl);
                 group.destroy();
                 let argv_properties = scene_properties_argv(&active_properties);
-                return wayland::Target::reexec(&wayland::ReexecSource::Scene {
+                return target.reexec(&wayland::ReexecSource::Scene {
                     dir: &active_dir,
                     properties: argv_properties.as_deref(),
                 });
@@ -6983,6 +7004,7 @@ pub(super) fn run_scene(
         }
         let request = ctl.poll();
         group.sync_audio_source(&ctl);
+        target.sync_widgets(&mut ctl);
         if let Some(req) = request {
             tracing::info!("skwd-wall-vk: scene swap to {}", req.to);
             let swap_started = Instant::now();
@@ -7311,6 +7333,7 @@ pub(super) fn run_scene(
         let fade_step = scene_fade_step(
             fade_start.map(|started| started.elapsed().as_secs_f32() * 1000.0 / fade_ms as f32),
             fade_first_frame,
+            false,
         );
         if presented
             && fade_start.is_none()
@@ -7378,14 +7401,22 @@ pub(super) fn run_scene(
             };
             if !shared_pool || shared_frame.is_none() {
                 if fade_step.render_transition {
-                    presenters[gi].fade(&group, bi, fade_step.mix, trans_style)?;
+                    presenters[gi].fade(
+                        &group,
+                        bi,
+                        fade_step.mix,
+                        trans_style,
+                        &target.app.surfaces[si].name,
+                    )?;
                 } else {
                     presenters[gi].present(&group.target, bi)?;
                 }
                 if dmabuf_present {
                     presenters[gi].wait_render()?;
                 }
-                shared_frame = shared_pool.then_some(bi);
+                shared_frame = (shared_pool
+                    && (!fade_step.render_transition || group.output_from.is_empty()))
+                .then_some(bi);
             }
             if !dmabuf_present {
                 let (w, h) = presenter_dims[gi];
@@ -7667,11 +7698,25 @@ pub(super) fn stream_scene(
     let mut free = vec![[true; 3]; targets.len()];
     let mut emitted = vec![false; targets.len()];
     let mut render_pending = vec![true; targets.len()];
+    let mut stream_frames: Vec<_> = targets.iter().map(|_| StreamFrame::default()).collect();
+    let mut widgets: Vec<_> =
+        targets.iter().map(|_| crate::preview::widgets::Widgets::default()).collect();
     loop {
         for (socket, slots) in sockets.iter().zip(free.iter_mut()) {
             crate::preview::drain_acks(*socket, slots)?;
         }
         let request = ctl.poll();
+        let scene = ctl.take_widgets();
+        for ((widgets, presenter), target) in widgets.iter_mut().zip(&mut presenters).zip(&targets)
+        {
+            widgets.sync(scene.as_ref(), target, &mut presenter.renderer)?;
+        }
+        let wake: Vec<_> = ctl
+            .wake_fd()
+            .into_iter()
+            .chain(widgets.iter().filter_map(crate::preview::widgets::Widgets::wake_fd))
+            .collect();
+        let widget_frame = widgets.iter().any(|widgets| widgets.pending);
         group.sync_audio_source(&ctl);
         if let Some(req) = request {
             let swap_started = Instant::now();
@@ -7782,22 +7827,40 @@ pub(super) fn stream_scene(
         if let Some(all_paused) = crate::preview::apply_output_pauses(&mut targets, pauses) {
             ctl.set_paused(all_paused);
         }
+        for (index, target) in targets.iter().enumerate() {
+            stream_frames[index].hold(
+                FrameStatus {
+                    emitted: emitted[index],
+                    paused: target.paused || ctl.paused,
+                    available: free[index].iter().any(|slot| *slot),
+                },
+                &mut presenters[index],
+                &group,
+                trans_style,
+            )?;
+        }
         if let Some((revision, position, buttons)) = ctl.pointer() {
             group.mouse.update(revision, position, buttons, sizes[0], fill_mode());
         }
         let mouse_driven = group.mouse.pending();
         if ctl.paused && presented {
             suspended_at.get_or_insert_with(Instant::now);
+        }
+        if ctl.paused && presented && !widget_frame {
+            suspended_at.get_or_insert_with(Instant::now);
             crate::preview::wait_any_free(
                 &sockets,
                 &mut free,
                 &vec![false; targets.len()],
-                ctl.wake_fd(),
+                &wake,
                 None,
             )?;
             continue;
         }
-        if !property_frame && let Some(started) = suspended_at.take() {
+        if !ctl.paused
+            && !property_frame
+            && let Some(started) = suspended_at.take()
+        {
             let suspended = Instant::now().saturating_duration_since(started);
             epoch += suspended;
             last_frame += suspended;
@@ -7807,6 +7870,7 @@ pub(super) fn stream_scene(
             }
         }
         if presented
+            && !widget_frame
             && !animated
             && !targets
                 .iter()
@@ -7817,7 +7881,7 @@ pub(super) fn stream_scene(
             && !group.media.as_ref().is_some_and(media::Media::has_pending)
         {
             if let Some(fd) = ctl.wake_fd() {
-                let mut events = [
+                let mut events = vec![
                     libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
                     libc::pollfd {
                         fd: group.media.as_ref().and_then(media::Media::wake_fd).unwrap_or(-1),
@@ -7825,7 +7889,15 @@ pub(super) fn stream_scene(
                         revents: 0,
                     },
                 ];
-                let result = unsafe { libc::poll(events.as_mut_ptr(), 2, 30_000) };
+                events.extend(
+                    widgets
+                        .iter()
+                        .filter_map(crate::preview::widgets::Widgets::wake_fd)
+                        .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }),
+                );
+                let result = unsafe {
+                    libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, 30_000)
+                };
                 if result < 0
                     && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
                 {
@@ -7843,12 +7915,14 @@ pub(super) fn stream_scene(
             .iter()
             .zip(&emitted)
             .zip(&render_pending)
-            .map(|((target, emitted), pending)| {
-                target.active(*emitted)
-                    && (*pending || animated || mouse_driven || fade_start.is_some())
+            .zip(&widgets)
+            .map(|(((target, emitted), pending), widgets)| {
+                widgets.pending
+                    || (target.active(*emitted)
+                        && (*pending || animated || mouse_driven || fade_start.is_some()))
             })
             .collect();
-        if !crate::preview::wait_any_free(&sockets, &mut free, &active, ctl.wake_fd(), None)? {
+        if !crate::preview::wait_any_free(&sockets, &mut free, &active, &wake, None)? {
             continue;
         }
         let now = Instant::now();
@@ -7857,7 +7931,7 @@ pub(super) fn stream_scene(
         }
         let now = Instant::now();
         next_frame = now + frame_gap;
-        if (animated || mouse_driven) && !property_frame {
+        if !ctl.paused && (animated || mouse_driven) && !property_frame {
             let dt = now
                 .duration_since(last_frame)
                 .as_secs_f32()
@@ -7872,6 +7946,7 @@ pub(super) fn stream_scene(
         let fade_step = scene_fade_step(
             fade_start.map(|started| started.elapsed().as_secs_f32() * 1000.0 / fade_ms as f32),
             fade_first_frame,
+            ctl.paused,
         );
         if fade_start.is_some() {
             render_pending.fill(true);
@@ -7885,10 +7960,16 @@ pub(super) fn stream_scene(
                 continue;
             };
             let presenter = &mut presenters[index];
-            if fade_step.render_transition {
-                presenter.fade(&group, slot, fade_step.mix, trans_style)?;
+            if (target.paused || ctl.paused)
+                && let Some(frozen) = &stream_frames[index].frozen
+            {
+                presenter.present(frozen, slot)?;
+            } else if fade_step.render_transition {
+                presenter.fade(&group, slot, fade_step.mix, trans_style, "")?;
+                stream_frames[index].progress = fade_step.mix;
             } else {
                 presenter.present(&group.target, slot)?;
+                stream_frames[index].progress = 1.0;
             }
             presenter.wait_render()?;
             presenter.renderer.complete_external_signal(&presenter.stream_semaphores[slot])?;
@@ -7900,6 +7981,10 @@ pub(super) fn stream_scene(
             .context("send scene stream frame")?;
             free[index][slot] = false;
             render_pending[index] = false;
+            widgets[index].pending = false;
+            if !target.paused && !ctl.paused {
+                stream_frames[index].frozen = None;
+            }
             if !emitted[index] {
                 paper_runtime::plasma::frame_ready_on(target.socket)?;
                 emitted[index] = true;

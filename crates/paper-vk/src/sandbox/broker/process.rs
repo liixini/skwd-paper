@@ -140,16 +140,9 @@ fn spawn(source: std::fs::File, job: &crate::health::Job) -> io::Result<Running>
     if let crate::health::Job::Fault(mode) = job {
         command.env(super::tests::FAULT_ENV, mode);
     }
-    let parent = unsafe { libc::getpid() };
+    paper_runtime::die_with_parent(&mut command);
     unsafe {
         command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::getppid() != parent {
-                libc::_exit(1);
-            }
-
             let core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
             if libc::setrlimit(libc::RLIMIT_CORE, &raw const core) != 0 {
                 return Err(io::Error::last_os_error());

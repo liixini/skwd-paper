@@ -2624,11 +2624,9 @@ impl ImageResources {
         assets: &'a crate::effects::Assets,
         by_id: &'a std::collections::HashMap<String, &'a Value>,
         geometry: &'a ImageGeometry,
-        force_material: bool,
     ) -> ImageContext<'a> {
         ImageContext {
             scripted: true,
-            force_material,
             font_source: Some(&self.font_source),
             hdr: hdr::enabled(scene.get(GENERAL_FIELD), &assets.properties),
             pkg: &self.package,
@@ -2660,35 +2658,6 @@ impl ImageResources {
         });
         anyhow::ensure!(skipped.is_empty(), skipped.join(DIAGNOSTIC_SEPARATOR));
         Ok(layer)
-    }
-
-    pub fn base_material_layer(
-        &self,
-        scene: &Value,
-        properties: &Properties,
-        slot: usize,
-    ) -> Result<Option<Layer>> {
-        let objects = scene
-            .get(OBJECTS_FIELD)
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("material scene has no objects"))?;
-        let object = objects.get(slot).ok_or_else(|| anyhow!("material layer missing"))?;
-        if object.get(IMAGE_FIELD).is_none() {
-            return Ok(None);
-        }
-        let by_id = objects
-            .iter()
-            .filter_map(|object| Some((object.get(ID_FIELD).and_then(id_of)?, object)))
-            .collect();
-        let mut assets = self.assets.snapshot();
-        assets.properties.clone_from(properties);
-        let geometry = ImageGeometry::of(scene, properties);
-        let context = self.image_context(scene, &assets, &by_id, &geometry, true);
-        let mut skipped = Vec::new();
-        let mut bytes = 0;
-        let layer = context.load(object, slot, &mut skipped, &mut bytes)?;
-        anyhow::ensure!(skipped.is_empty(), skipped.join(DIAGNOSTIC_SEPARATOR));
-        Ok(layer.filter(|layer| layer.material.is_some()))
     }
 
     fn changed(&self) {
@@ -2723,7 +2692,7 @@ impl ImageResources {
             .filter_map(|object| Some((object.get(ID_FIELD).and_then(id_of)?, object)))
             .collect();
         let geometry = ImageGeometry::of(scene, &self.assets.properties);
-        let context = self.image_context(scene, &self.assets, &by_id, &geometry, false);
+        let context = self.image_context(scene, &self.assets, &by_id, &geometry);
         let mut skipped = Vec::new();
         let mut bytes = 0;
         let layer = if object.get(TEXT_FIELD).is_some() && object.get(IMAGE_FIELD).is_none() {
@@ -2940,7 +2909,6 @@ impl ImageResources {
 struct ImageContext<'a> {
     font_source: Option<&'a std::sync::Arc<crate::text::script::Source>>,
     scripted: bool,
-    force_material: bool,
     hdr: bool,
     pkg: &'a Package,
     assets: &'a crate::effects::Assets,
@@ -3236,7 +3204,6 @@ impl ImageContext<'_> {
                 puppet.as_mut(),
                 &crate::effects::material::Options {
                     source_texture: has_texture || errored,
-                    force: self.force_material,
                     effects: !effects.is_empty() || blend.is_some(),
                     blend: (color_blend == crate::effects::ADDITIVE_COLOR_BLEND)
                         .then_some(crate::effects::PassBlend::Add),
@@ -3586,7 +3553,6 @@ fn load_with_project(
         scripts.as_ref().map(|host| host.created_layer_slots().to_vec()).unwrap_or_default();
     let image_context = ImageContext {
         scripted,
-        force_material: false,
         font_source: font_source.as_ref(),
         hdr,
         pkg,

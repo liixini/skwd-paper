@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaperCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drawing_photo: Option<String>,
@@ -12,6 +12,8 @@ pub struct PaperCommand {
     pub drawing: Option<Box<crate::DrawingTransition>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<Box<crate::SurfacePolicy>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widgets: Option<Box<crate::WidgetScene>>,
     #[serde(default, alias = "path")]
     pub to: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +126,7 @@ impl PaperCommand {
         Self {
             drawing_photo: None,
             surface: None,
+            widgets: None,
             system_audio: None,
             drawing: None,
             reveal: None,
@@ -160,6 +163,7 @@ impl PaperCommand {
         Self {
             drawing_photo: None,
             surface: None,
+            widgets: None,
             system_audio: None,
             drawing: None,
             reveal: None,
@@ -184,6 +188,7 @@ impl PaperCommand {
         Self {
             drawing_photo: None,
             surface: None,
+            widgets: None,
             system_audio: None,
             drawing: None,
             reveal: None,
@@ -215,6 +220,7 @@ impl PaperCommand {
         Self {
             drawing_photo: None,
             surface: None,
+            widgets: None,
             system_audio: None,
             drawing: None,
             reveal: None,
@@ -239,6 +245,7 @@ impl PaperCommand {
         Self {
             drawing_photo: None,
             surface: None,
+            widgets: None,
             system_audio: None,
             drawing: None,
             reveal: None,
@@ -272,10 +279,11 @@ impl PaperCommand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CommandClass {
     Mirror(crate::MirrorTarget),
     Surface(crate::SurfacePolicy),
+    Widgets(Box<crate::WidgetScene>),
     Pointer(PointerState),
     Freeze(String),
     Pause(bool),
@@ -291,6 +299,9 @@ pub fn classify_command(command: PaperCommand) -> CommandClass {
     }
     if let Some(surface) = command.surface {
         return CommandClass::Surface(*surface);
+    }
+    if let Some(widgets) = command.widgets {
+        return CommandClass::Widgets(widgets);
     }
     if let Some(pointer) = command.pointer {
         return CommandClass::Pointer(pointer);

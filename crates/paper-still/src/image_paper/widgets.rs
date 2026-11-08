@@ -5,7 +5,7 @@ use crate::fill_mode::FillMode;
 use anyhow::{Context, Result};
 use paper_control::{Depth, DrawingManifest, WidgetScene};
 use paper_runtime::minute::MinuteTimer;
-use paper_widgets::{Canvas, Frame, Lettering, Moment, Outline, Place, Scene, Tones, place};
+use paper_widgets::{Frame, Lettering, Moment, Outline, Place, Scene, Tones, place};
 use std::cell::OnceCell;
 use std::path::Path;
 use std::time::SystemTime;
@@ -332,13 +332,10 @@ impl App {
         let Some(look) = panel.look.as_ref() else { return };
         let place = look.place;
         let face = widgets.scene.widgets[panel.widget].face;
-        let mut canvas = Canvas::window(place.size, place.ink, place.shift);
         let labels = &widgets.scene.labels;
         let scene = Scene { lettering: &widgets.lettering, tones: look.tones, moment, labels };
-        paper_widgets::draw(face, &mut canvas, &scene);
-        if let Some((_, Some(cut))) = &panel.cut {
-            canvas.occlude(cut);
-        }
+        let cut = panel.cut.as_ref().and_then(|(_, cut)| cut.as_deref());
+        let canvas = scene.paint(face, place, cut);
         let flat = canvas.pixels.as_flattened();
         let size = (canvas.width as u32, canvas.height as u32);
         let reused = panel

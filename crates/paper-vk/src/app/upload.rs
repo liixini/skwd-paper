@@ -44,6 +44,7 @@ pub(super) fn run_upload(
         {
             readiness.arm_swap();
         }
+        target.sync_widgets(&mut ctl);
         crate::freeze::write_last_requested(&mut ctl, last_presented.as_ref())?;
         if last_presented.is_some() && ctl.paused && !ctl.freeze_pending() {
             std::thread::sleep(Duration::from_millis(100));

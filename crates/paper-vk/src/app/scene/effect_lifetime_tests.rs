@@ -510,43 +510,13 @@ fn bloom_staged_values() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "requires Vulkan and original Wallpaper Engine image assets"]
-fn material_value_lazily_uploads() -> anyhow::Result<()> {
-    const MIDPOINT: u32 = 2;
-    let assets = std::env::var("SKWD_WE_ENGINE_ASSETS")?;
-    let path = std::env::var("SKWD_WE_MATERIAL_RUNTIME")?;
-    let package = paper_scene::pkg::Package::parse(std::fs::read(path)?)?;
-    let mut model = paper_scene::model::load_with(
-        &package,
-        &paper_scene::effects::Assets::discover(Some(&assets)),
-    )?;
-    assert!(model.layers[0].material.is_none());
-    let live_targets = vk::Renderer::scene_target_live_allocations();
-    let live_effects = vk::Renderer::effect_live_allocations();
-    let shared = crate::shared::test_device();
-    let mut group = build_group(&shared, &mut model, true, &[(1920, 1080)], FillMode::Fit)?;
-    assert!(group.materials.is_empty());
-    group.compose(0.5, 0.5)?;
-    let (width, height, before) = group.read_canvas()?;
-    group.compose(1.5, 0.5)?;
-    let (_, _, after) = group.read_canvas()?;
-    let center = ((height / MIDPOINT * width + width / MIDPOINT) * RGBA_CHANNELS as u32) as usize;
-    assert!(u16::from(before[center]) > u16::from(after[center]) * MIDPOINT as u16);
-    assert_eq!(group.materials.len(), 1);
-    group.destroy();
-    assert_eq!(vk::Renderer::scene_target_live_allocations(), live_targets);
-    assert_eq!(vk::Renderer::effect_live_allocations(), live_effects);
-    Ok(())
-}
-
-#[test]
 #[ignore = "requires Vulkan"]
 fn effect_material_value_uploads() -> anyhow::Result<()> {
     let scene = serde_json::json!({
         "general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},
         "objects":[{"id":1,"image":"models/flat.json","origin":"32 32 0",
             "size":"64 64","visible":{"value":true,"script":
-                "let done=false; export function update(){if(engine.runtime>1&&!done){thisLayer.getEffect(0).getMaterial().setValue('u_Red',0);done=true;}return true;}"},
+                "let done=false; export function update(){if(engine.runtime>1&&!done){thisLayer.getEffect(0).getMaterial().red=0;done=true;}return true;}"},
             "effects":[{"file":"effects/test.json","passes":[{"constantshadervalues":{"red":1}}]}]}]
     });
     let mut model = model_scene(
@@ -577,7 +547,7 @@ fn indexed_material_pixels() -> anyhow::Result<()> {
         "general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},
         "objects":[{"id":1,"image":"models/flat.json","origin":"32 32 0",
             "size":"64 64","visible":{"value":true,"script":
-                "let stage=0; export function update(){const effect=thisLayer.getEffect(0); if(engine.runtime>1&&stage===0){effect.getMaterial(1).setValue('u_Green',0);stage=1;} if(engine.runtime>2&&stage===1){effect.getMaterial(0).setValue('u_Red',0);stage=2;} return true;}"},
+                "let stage=0; export function update(){const effect=thisLayer.getEffect(0); if(engine.runtime>1&&stage===0){effect.getMaterial(1).green=0;stage=1;} if(engine.runtime>2&&stage===1){effect.getMaterial(0).red=0;stage=2;} return true;}"},
             "effects":[{"file":"effects/test.json","passes":[
                 {"constantshadervalues":{"red":1}},
                 {"constantshadervalues":{"green":1}}
@@ -620,64 +590,6 @@ fn indexed_material_pixels() -> anyhow::Result<()> {
 
 #[test]
 #[ignore = "requires Vulkan and original Wallpaper Engine image assets"]
-fn base_material_feeds_effect() -> anyhow::Result<()> {
-    const MIDPOINT: u32 = 2;
-    let assets = std::env::var("SKWD_WE_ENGINE_ASSETS")?;
-    let path = std::env::var("SKWD_WE_MATERIAL_FX_RUNTIME")?;
-    let package = paper_scene::pkg::Package::parse(std::fs::read(path)?)?;
-    let mut model = paper_scene::model::load_with(
-        &package,
-        &paper_scene::effects::Assets::discover(Some(&assets)),
-    )?;
-    assert!(model.layers[0].material.is_none());
-    let live_targets = vk::Renderer::scene_target_live_allocations();
-    let live_effects = vk::Renderer::effect_live_allocations();
-    let shared = crate::shared::test_device();
-    let mut group = build_group(&shared, &mut model, true, &[(1920, 1080)], FillMode::Fit)?;
-    group.compose(0.5, 0.5)?;
-    let (width, height, before) = group.read_canvas()?;
-    group.compose(1.5, 0.5)?;
-    let (_, _, after) = group.read_canvas()?;
-    let center = ((height / MIDPOINT * width + width / MIDPOINT) * RGBA_CHANNELS as u32) as usize;
-    assert!(before[center] > after[center]);
-    group.destroy();
-    assert_eq!(vk::Renderer::scene_target_live_allocations(), live_targets);
-    assert_eq!(vk::Renderer::effect_live_allocations(), live_effects);
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires Vulkan and original Wallpaper Engine flat shader"]
-fn flat_material_value_uploads() -> anyhow::Result<()> {
-    let scene = serde_json::json!({
-        "general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},
-        "objects":[{"id":1,"image":"models/flat.json","origin":"32 32 0",
-            "size":"64 64","visible":{"value":true,"script":
-                "let done=false; export function update(){if(engine.runtime>1&&!done){thisLayer.getMaterial().setValue('g_Color',[0,0,0]);done=true;}return true;}"},
-            "effects":[{"file":"effects/test.json"}]}]
-    });
-    let mut model = model_scene(
-        scene,
-        b"uniform sampler2D g_Texture0;\nvoid main(){gl_FragColor=texSample2D(g_Texture0,vec2(0.5));}",
-    );
-    assert!(model.layers[0].material.is_none());
-    let live_targets = vk::Renderer::scene_target_live_allocations();
-    let live_effects = vk::Renderer::effect_live_allocations();
-    let shared = crate::shared::test_device();
-    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit)?;
-    group.compose(0.5, 0.5)?;
-    let before = center(&mut group);
-    group.compose(1.5, 0.5)?;
-    let after = center(&mut group);
-    assert!(before[0] > after[0]);
-    group.destroy();
-    assert_eq!(vk::Renderer::scene_target_live_allocations(), live_targets);
-    assert_eq!(vk::Renderer::effect_live_allocations(), live_effects);
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires Vulkan and original Wallpaper Engine image assets"]
 fn material_alias_pixels() -> anyhow::Result<()> {
     const SAMPLE_X: [u32; 3] = [380, 960, 1540];
     const MIDPOINT: u32 = 2;
@@ -700,7 +612,8 @@ fn material_alias_pixels() -> anyhow::Result<()> {
         let offset = ((height / MIDPOINT * width + x) * RGBA_CHANNELS as u32) as usize;
         rgba[offset]
     });
-    assert!(reds[0] > reds[2] && reds[2] > reds[1]);
+    assert_eq!(reds, [reds[0]; SAMPLE_X.len()]);
+    assert!(group.materials.is_empty());
     if let Ok(path) = std::env::var(CAPTURE) {
         image::save_buffer(path, &rgba, width, height, image::ColorType::Rgba8)?;
     }
@@ -761,7 +674,7 @@ fn packed_audio_spectrum_reads_the_requested_band_and_updates_pixels() {
 
 #[test]
 #[ignore = "requires Vulkan"]
-fn initially_hidden_effect_keeps_its_targets_until_first_visible_frame() {
+fn hidden_chain_leases_late() {
     let mut model = model(
         serde_json::json!({"value":false,"script":"export function update(v){return engine.runtime>=1.0;}"}),
         b"void main(){\ngl_FragColor=vec4(1.0);\n}",
@@ -771,7 +684,7 @@ fn initially_hidden_effect_keeps_its_targets_until_first_visible_frame() {
     assert_eq!(center(&mut group), [0, 0, 0, 255]);
     assert_eq!(group.fx.len(), 1);
     assert!(group.fx[0].output.is_none());
-    assert!(group.effect_target_allocation_bytes() > 0);
+    assert_eq!(group.fx_pool.len(), 0);
     group.compose(1.5, 1.0 / 60.0).unwrap();
     assert_eq!(center(&mut group), [255, 255, 255, 255]);
     assert!(group.fx[0].output.is_some());
@@ -1269,7 +1182,6 @@ export function update(value) {
     );
     let shared = crate::shared::test_device();
     let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
-    assert!(group.fx_scratch.is_empty());
     for (time, expected) in [
         (1.0, [255, 255, 255, 255]),
         (4.0, [255, 0, 0, 255]),
@@ -1478,7 +1390,6 @@ fn effect_visibility_feedback() {
     assert!(model.scripts.is_none());
     let shared = crate::shared::test_device();
     let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
-    assert!(!group.fx[0].visibility_dynamic);
     assert!(group.fx[0].fbos[0].1.owned().is_some());
     for time in [1.0, 2.0, 3.0] {
         group.compose(time, 0.1).unwrap();
@@ -1596,7 +1507,7 @@ fn effect_final_projection() {
     let mut model = projection_model(scene, b"uniform float g_Time;\nvoid main(){\nif(g_Time>=3.0) discard;\ngl_FragColor=vec4(0.0,1.0,0.0,1.0);\n}");
     let shared = crate::shared::test_device();
     let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
-    let target = group.fx[0].fbos[0].1.get(&group.fx_scratch);
+    let target = group.fx[0].fbos[0].1.get(&group.fx_pool);
     assert_eq!((target.extent.width, target.extent.height), (32, 32));
     for (time, dense) in [(0.0, false), (1.0, true), (2.0, false), (3.0, false), (4.0, false)] {
         group.compose(time, 0.1).unwrap();
@@ -1637,12 +1548,12 @@ fn effect_direct_geometry() {
     assert_eq!(group.baked_fx_draws.len(), 1);
     let (_, _, pixels) = group.read_canvas().unwrap();
     let scan: Vec<_> = (838..847).map(|x| pixels[(141 * 1280 + x) * 4 + 1]).collect();
-    assert_eq!(scan, [5, 25, 60, 108, 175, 134, 78, 38, 12]);
+    assert_eq!(scan, [6, 25, 56, 99, 155, 99, 56, 25, 6]);
     group.mouse.enabled = false;
     group.quads[0].rect[0] += 3.0;
     group.compose(1.0, 0.1).unwrap();
     let (_, _, pixels) = group.read_canvas().unwrap();
-    assert_eq!(pixels[(141 * 1280 + 844) * 4 + 1], 175);
+    assert_eq!(pixels[(141 * 1280 + 844) * 4 + 1], 155);
     group.quads[1].rect = [1266.0, 213.0, 3.0, 3.0];
     group.quads[1].projection = None;
     group.compose(2.0, 0.1).unwrap();
@@ -1668,7 +1579,7 @@ fn effect_direct_geometry() {
         )
         .unwrap();
     let (_, _, pixels) = group.renderer.read_scene_target(&snapshot).unwrap();
-    assert_eq!(pixels[(141 * 1280 + 844) * 4 + 1], 175);
+    assert_eq!(pixels[(141 * 1280 + 844) * 4 + 1], 155);
     group.renderer.destroy_scene_target(snapshot);
     assert_eq!(group.baked_fx_outputs.len(), 2);
     let output = group.baked_fx_outputs.last().unwrap();
@@ -1732,15 +1643,16 @@ fn cropped_effect_accounting() {
         model.layers[0].effects[0].passes[0].binds = vec![(0, EffectBind::SceneUnderLayer)];
         let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
         let fx = &group.fx[0];
-        let crop = fx.crop.as_ref().unwrap().owned().unwrap().allocation_bytes;
-        let targets = fx
-            .target_ids()
-            .filter_map(|id| fx.target_storage(id).owned())
-            .map(|target| target.allocation_bytes)
-            .sum::<u64>();
-        assert_eq!(fx.allocation_bytes(), targets + crop);
-        let scratch = group.fx_scratch.iter().map(|target| target.allocation_bytes).sum::<u64>();
-        assert_eq!(group.effect_target_allocation_bytes(), fx.allocation_bytes() + scratch);
+        let (Some(FxTargetStorage::Pooled(crop)), FxTargetStorage::Pooled(ping)) =
+            (&fx.crop, &fx.ping)
+        else {
+            panic!("pooled crop");
+        };
+        assert_eq!(crop.class, ping.class);
+        assert_eq!(
+            group.effect_target_allocation_bytes(),
+            fx.allocation_bytes() + group.fx_pool.allocation_bytes()
+        );
         group.compose(1.5, 0.1).unwrap();
         let pixel = center(&mut group);
         assert_eq!(pixel[1], 64);
@@ -1808,14 +1720,14 @@ fn reordered_effect_inputs() {
     assert!(group.fx[1].snapshot);
     assert_eq!(group.fx[0].presentation, Some(1));
     assert_eq!(center(&mut group), [255, 0, 0, 255]);
-    let output = group.fx[0].target(group.fx[0].output.unwrap(), &group.fx_scratch).view;
+    let output = group.fx[0].output.unwrap();
     group.fx[0].effects[0].visible = false;
     group.fx.rotate_left(1);
     eprintln!("prefix phase: changed owner inputs");
     group.compose(1.0, 1.0).unwrap();
     assert_eq!(group.fx[1].presentation, Some(1));
     assert!(!group.fx[1].snapshot);
-    assert_ne!(group.fx[1].target(group.fx[1].output.unwrap(), &group.fx_scratch).view, output);
+    assert_ne!(group.fx[1].output.unwrap(), output);
     let snapshot = group.scene_snapshot.as_ref().unwrap();
     let (_, _, pixels) = group.renderer.read_scene_target(snapshot).unwrap();
     assert_eq!(&pixels[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4], &[255, 0, 0, 255]);
@@ -1932,7 +1844,7 @@ fn copy_visibility_cycles() {
     assert!(group.quads[1].blend == vk::SceneBlend::CopyRgb);
     assert_eq!(center(&mut group), [37, 68, 34, 255]);
     let fx = group.fx.iter().find(|fx| fx.quad == 1).unwrap();
-    let output = fx.target(fx.output.unwrap(), &group.fx_scratch);
+    let output = fx.target(fx.output.unwrap(), &group.fx_pool);
     let (width, height, pixels) = group.renderer.read_scene_target(output).unwrap();
     let offset = ((height / 2 * width + width / 2) * 4) as usize;
     assert_eq!(&pixels[offset..offset + 4], &[37, 68, 34, 140]);
@@ -2004,7 +1916,7 @@ fn material_blend_visibility() {
         let fx = group.fx.iter().find(|fx| fx.quad == 1).unwrap();
         assert!(fx.presentation.is_none());
         assert!(group.textures[fx.slot].effect.is_none());
-        let output = fx.target(fx.output.unwrap(), &group.fx_scratch);
+        let output = fx.target(fx.output.unwrap(), &group.fx_pool);
         let (width, height, pixels) = group.renderer.read_scene_target(output).unwrap();
         let offset = ((height / 2 * width + width / 2) * 4) as usize;
         assert_eq!(&pixels[offset..offset + 4], &[37, 68, 34, 140]);
@@ -2655,42 +2567,151 @@ fn disabled_material_effect() {
 }
 
 #[test]
-#[ignore = "requires Vulkan and SKWD_VK_SCENE_FX_BYTES=0"]
-fn rejected_material_effect() {
-    assert_eq!(std::env::var("SKWD_VK_SCENE_FX_BYTES").as_deref(), Ok("0"));
+#[ignore = "requires Vulkan"]
+fn oversized_chain_admitted() {
+    let extent = paper_scene::effects::FBO_MAX_EXTENT;
+    let mut model = source_model(b"void main(){gl_FragColor=vec4(1.0);}", false);
+    model.layers[0].texture.img_width = extent;
+    model.layers[0].texture.img_height = extent;
     let shared = crate::shared::test_device();
-    let targets = vk::Renderer::scene_target_live_allocations();
-    let allocations = vk::Renderer::effect_live_allocations();
-    let mut expected = None;
-    for effects in [false, true] {
-        let mut model = source_model(b"void main(){gl_FragColor=vec4(1.0);}", false);
-        model.custom_shaders = false;
-        let layer = &mut model.layers[0];
-        layer.texture.img_width = 24;
-        layer.texture.img_height = 24;
-        layer.size = (24.0, 24.0);
-        layer.geometry.as_mut().unwrap().size = [24.0, 24.0];
-        assert!(layer.material.is_some());
-        if !effects {
-            layer.effects.clear();
-        }
+    let group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    assert!(model.skipped.is_empty());
+    assert_eq!(group.fx.len(), 1);
+    let ping = group.fx[0].ping.get(&group.fx_pool).extent;
+    assert_eq!((ping.width, ping.height), (extent, extent));
+    assert!(group.effect_target_allocation_bytes() > 512 << 20);
+    group.destroy();
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn failed_target_skips_chain() {
+    let shared = crate::shared::test_device();
+    let models: [fn() -> SceneModel; 4] = [
+        || source_model(b"void main(){gl_FragColor=vec4(1.0);}", false),
+        || tinted_model(false),
+        || tinted_model(true),
+        || text_effect_model(TEXT_EFFECT_SCENE),
+    ];
+    let (mut built, mut leased) = (0, 0);
+    for model_of in models {
+        let mut model = model_of();
         let mut group =
             build_group(&shared, &mut model, false, &[(64, 64)], FillMode::Fit).unwrap();
-        assert!(group.fx.is_empty());
-        assert_eq!(group.materials[0].target_bytes(), 0);
-        if effects {
-            assert!(model.skipped.iter().any(|message| message.contains("budget")));
-        }
-        let pixels = group.read_canvas().unwrap().2;
+        group.compose(1.0, 0.1).unwrap();
+        let reference = center(&mut group);
         group.destroy();
-        if let Some(expected) = &expected {
-            assert_eq!(&pixels, expected);
-        } else {
-            expected = Some(pixels);
+        for created in 0.. {
+            let mut model = model_of();
+            let targets = vk::Renderer::scene_target_live_allocations();
+            let resources = vk::Renderer::effect_live_allocations();
+            vk::Renderer::fail_scene_target_after(Some(created));
+            let built_group = build_group(&shared, &mut model, false, &[(64, 64)], FillMode::Fit);
+            let pending = vk::Renderer::scene_target_failure_pending();
+            vk::Renderer::fail_scene_target_after(None);
+            let Ok(mut group) = built_group else {
+                assert!(!pending, "failure {created}");
+                assert_eq!(vk::Renderer::scene_target_live_allocations(), targets);
+                continue;
+            };
+            if pending {
+                group.destroy();
+                break;
+            }
+            assert_eq!(model.skipped.len(), 1, "failure {created}: {:?}", model.skipped);
+            if group.fx.is_empty() {
+                built += 1;
+                assert!(model.skipped[0].contains("injected scene target allocation failure"));
+            } else {
+                leased += 1;
+                assert!(model.skipped[0].ends_with(STARVED_CHAIN));
+                assert!(group.fx[0].starved.is_some() && group.fx[0].output.is_none());
+                group.compose(1.0, 0.1).unwrap();
+                assert!(group.fx[0].starved.is_none() && group.fx[0].output.is_some());
+                assert_eq!(center(&mut group), reference, "failure {created}");
+            }
+            group.destroy();
+            assert_eq!(vk::Renderer::scene_target_live_allocations(), targets, "failure {created}");
+            assert_eq!(vk::Renderer::effect_live_allocations(), resources, "failure {created}");
         }
-        assert_eq!(vk::Renderer::scene_target_live_allocations(), targets);
-        assert_eq!(vk::Renderer::effect_live_allocations(), allocations);
     }
+    assert!(built >= 4 && leased >= 5, "built {built} leased {leased}");
+}
+
+fn tinted_model(solid: bool) -> SceneModel {
+    let scene = serde_json::json!({
+        "general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},
+        "objects":[
+            {"id":1,"image":"models/flat.json","origin":"32 32 0","size":"64 64","color":"0.5 0.25 1","effects":[{"file":"effects/test.json"}]}
+        ]
+    });
+    let mut model = model_scene(
+        scene,
+        b"uniform float g_AudioSpectrum16Left[16];\nvoid main(){\ngl_FragColor=vec4(1.0,1.0,1.0,1.0+g_AudioSpectrum16Left[0]*0.0);\n}",
+    );
+    model.layers[0].solid = solid;
+    assert!(model.scripts.is_none());
+    model
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn failed_target_strict() {
+    let shared = crate::shared::test_device();
+    let mut model = source_model(b"void main(){gl_FragColor=vec4(1.0);}", false);
+    let targets = vk::Renderer::scene_target_live_allocations();
+    vk::Renderer::fail_scene_target_after(Some(2));
+    let error = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).err().unwrap();
+    assert!(format!("{error:#}").ends_with(STARVED_CHAIN));
+    assert_eq!(vk::Renderer::scene_target_live_allocations(), targets);
+}
+
+const TEXT_FONT: &[u8] = include_bytes!("../../../../paper-scene/src/fixtures/fonts/latin.ttf");
+
+pub(super) const TEXT_EFFECT_SCENE: &str = r#"{"general":{"orthogonalprojection":{"width":64,"height":64}},"objects":[{"id":1,"text":"A","font":"fonts/Latin.ttf","pointsize":{"value":16,"script":"export function update(){return engine.runtime>=1?24:16;}"},"origin":"32 32 0","opaquebackground":true,"effects":[{"file":"effects/text.json"}]}]}"#;
+
+pub(super) fn text_effect_model(scene: &str) -> SceneModel {
+    model_files(&[
+        ("scene.json", scene.as_bytes()),
+        ("fonts/Latin.ttf", TEXT_FONT),
+        ("effects/text.json", br#"{"fbos":[{"name":"cache","width":16,"height":16,"format":"rgba8888"}],"passes":[{"material":"materials/capture.json","target":"cache"},{"material":"materials/show.json","bind":[{"name":"cache","index":0}]}]}"#),
+        ("materials/capture.json", br#"{"passes":[{"shader":"capture","blending":"normal"}]}"#),
+        ("shaders/capture.vert", b"attribute vec3 a_Position;\nvoid main(){gl_Position=vec4(a_Position,1.0);}"),
+        ("shaders/capture.frag", b"void main(){gl_FragColor=vec4(1.0);}"),
+        ("materials/show.json", br#"{"passes":[{"shader":"show","blending":"normal"}]}"#),
+        ("shaders/show.vert", b"uniform mat4 g_ModelViewProjectionMatrix;\nattribute vec3 a_Position;\nvoid main(){gl_Position=mul(vec4(a_Position,1.0),g_ModelViewProjectionMatrix);}"),
+        ("shaders/show.frag", b"uniform sampler2D g_Texture0;\nvoid main(){gl_FragColor=texSample2D(g_Texture0,vec2(0.5,0.5));}"),
+    ])
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn failed_resize_keeps_targets() {
+    let mut model = text_effect_model(TEXT_EFFECT_SCENE);
+    let shared = crate::shared::test_device();
+    let mut group = build_group(&shared, &mut model, false, &[(64, 64)], FillMode::Fit).unwrap();
+    assert_eq!(group.fx.len(), 1, "{:?}", model.skipped);
+    let layer = group.fx[0].quad;
+    let ping = group.fx[0].ping.get(&group.fx_pool);
+    let (view, extent) = (ping.view, (ping.extent.width, ping.extent.height));
+    let bytes = group.effect_target_allocation_bytes();
+    let images = group.renderer.scene_image_allocations();
+    let targets = vk::Renderer::scene_target_live_allocations();
+    for created in 0..group.fx[0].target_ids().count() {
+        vk::Renderer::fail_scene_target_after(Some(created));
+        let size = (extent.0 / 2, extent.1);
+        assert!(group.resize_text_effect(layer, size).is_err(), "failure {created}");
+        let ping = group.fx[0].ping.get(&group.fx_pool);
+        assert_eq!((ping.view, (ping.extent.width, ping.extent.height)), (view, extent));
+        assert_eq!(group.effect_target_allocation_bytes(), bytes);
+        if created == 0 {
+            assert_eq!(group.renderer.scene_image_allocations(), images);
+        }
+        assert_eq!(vk::Renderer::scene_target_live_allocations(), targets, "failure {created}");
+    }
+    vk::Renderer::fail_scene_target_after(None);
+    group.resize_text_effect(layer, (extent.0 / 2, extent.1)).unwrap();
+    group.destroy();
 }
 
 #[test]
@@ -2781,4 +2802,305 @@ fn puppet_clock_scheduling() {
         }
         group.destroy();
     }
+}
+
+fn pooled_pair() -> SceneModel {
+    let scene = serde_json::json!({
+        "general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},
+        "objects":[
+            {"id":1,"image":"models/flat.json","origin":"16 32 0","size":"32 64",
+                "effects":[{"file":"effects/local.json","passes":[{"constantshadervalues":{"color":"1 0 0"}},{}]}]},
+            {"id":2,"image":"models/flat.json","origin":"48 32 0","size":"32 64",
+                "effects":[{"file":"effects/local.json","passes":[{"constantshadervalues":{"color":"0 1 0"}},{}]}]},
+            {"id":3,"alpha":{"value":1,"script":"export function update(value){return value;}"}}
+        ]
+    })
+    .to_string();
+    let vertex = b"attribute vec3 a_Position;\nuniform mat4 g_ModelViewProjectionMatrix;\nvoid main(){gl_Position=mul(vec4(a_Position,1.0),g_ModelViewProjectionMatrix);}";
+    model_files(&[
+        ("scene.json", scene.as_bytes()),
+        ("models/flat.json", br#"{"material":"materials/flat.json"}"#),
+        ("materials/flat.json", br#"{"passes":[{"shader":"flat"}]}"#),
+        ("effects/local.json", br#"{"fbos":[{"name":"local","format":"rgba8888"}],"passes":[{"material":"materials/color.json","target":"local"},{"material":"materials/copy.json","bind":[{"index":0,"name":"local"}]}]}"#),
+        ("materials/color.json", br#"{"passes":[{"shader":"color"}]}"#),
+        ("materials/copy.json", br#"{"passes":[{"shader":"copy"}]}"#),
+        ("shaders/color.vert", b"attribute vec3 a_Position;\nvoid main(){gl_Position=vec4(a_Position,1.0);}"),
+        ("shaders/copy.vert", vertex),
+        ("shaders/color.frag", b"uniform vec3 g_Color; // {\"material\":\"color\"}\nvoid main(){gl_FragColor=vec4(g_Color,1.0);}"),
+        ("shaders/copy.frag", b"uniform sampler2D g_Texture0;\nvoid main(){gl_FragColor=texSample2D(g_Texture0,vec2(0.5));}"),
+    ])
+}
+
+fn halves(group: &mut Group) -> [[u8; 4]; 2] {
+    let (width, _, rgba) = group.read_canvas().unwrap();
+    [16, 48].map(|x| {
+        let offset = ((32 * width + x) * 4) as usize;
+        rgba[offset..offset + 4].try_into().unwrap()
+    })
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn pooled_chains_keep_outputs() {
+    let shared = crate::shared::test_device();
+    let targets = vk::Renderer::scene_target_live_allocations();
+    let mut model = pooled_pair();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    assert_eq!(group.fx.len(), 2);
+    assert!(group.fx.iter().all(|fx| matches!(fx.fbos[0].1, FxTargetStorage::Pooled(_))));
+    assert_eq!(group.fx.iter().map(LayerFx::allocation_bytes).sum::<u64>(), 0);
+    group.compose(1.0, 0.1).unwrap();
+    assert_eq!(halves(&mut group), [[255, 0, 0, 255], [0, 255, 0, 255]]);
+    let owned = 3 * group.fx.len();
+    assert!(group.fx_pool.len() < owned, "pool {}", group.fx_pool.len());
+    group.destroy();
+    assert_eq!(vk::Renderer::scene_target_live_allocations(), targets);
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn bloom_off_trims_pool() {
+    let shared = crate::shared::test_device();
+    let targets = vk::Renderer::scene_target_live_allocations();
+    let mut model = pooled_pair();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    group.compose(1.0, 0.1).unwrap();
+    group.fx[0].layer_id = paper_scene::model::bloom::ID.to_owned();
+    let pooled = group.fx_pool.len();
+    let live = vk::Renderer::scene_target_live_allocations();
+    let host = group.scripts.as_ref().and_then(|scripts| scripts.host.as_ref()).unwrap();
+    let (scene, properties) = (host.scene.clone(), host.properties.clone());
+    let resources = host.image_resources().unwrap();
+    group.sync_bloom(&scene, &properties, &resources, &mut Vec::new()).unwrap();
+    assert_eq!(group.fx.len(), 1);
+    let trimmed = group.fx_pool.len();
+    assert!(trimmed < pooled, "pool {trimmed}");
+    assert_eq!(vk::Renderer::scene_target_live_allocations(), live - (pooled - trimmed));
+    group.compose(1.1, 0.1).unwrap();
+    assert_eq!(halves(&mut group)[1], [0, 255, 0, 255]);
+    assert_eq!(group.fx_pool.len(), trimmed);
+    group.destroy();
+    assert_eq!(vk::Renderer::scene_target_live_allocations(), targets);
+}
+
+const POISON: [f32; 4] = [1.0; 4];
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn fresh_lease_cleared() {
+    let shared = crate::shared::test_device();
+    let mut model = pooled_pair();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    for batched in [false, true] {
+        let mut pool = FxPool::default();
+        let first = pool.lease(&mut group.renderer, &group.fx[0].pooled_classes()).unwrap();
+        for lease in &first {
+            let target = pool.target(*lease).unwrap();
+            group.renderer.render_scene(target, POISON, &[], &[]).unwrap();
+        }
+        pool.release(&first);
+        if batched {
+            group.renderer.begin_scene_batch().unwrap();
+        }
+        fx_pool::lease_chain(&mut pool, &mut group.renderer, &mut group.fx[0], batched).unwrap();
+        if batched {
+            group.renderer.submit_scene_batch().unwrap();
+        }
+        let fx = &group.fx[0];
+        let leased: Vec<_> = fx.storages().filter_map(|storage| storage.lease()).collect();
+        assert_eq!(leased.len(), pool.len());
+        assert!(matches!(fx.fbos[0].1, FxTargetStorage::Pooled(_)));
+        for lease in leased {
+            let target = pool.target(lease).unwrap();
+            let (_, _, pixels) = group.renderer.read_scene_target(target).unwrap();
+            assert!(
+                pixels.iter().all(|byte| *byte == 0),
+                "batched {batched} lease {}",
+                lease.index
+            );
+        }
+        pool.destroy(&mut group.renderer);
+    }
+    group.destroy();
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn scripted_tint_resumes() {
+    let scene = serde_json::json!({
+        "general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},
+        "objects":[
+            {"id":1,"image":"models/flat.json","origin":"32 32 0","size":"64 64","color":"0.5 0.25 1","effects":[{"file":"effects/test.json"}]},
+            {"id":2,"alpha":{"value":1,"script":"export function update(value){return value;}"}}
+        ]
+    });
+    let mut model = model_scene(
+        scene,
+        b"uniform float g_Time;\nvoid main(){\ngl_FragColor=vec4(1.0+g_Time*0.0);\n}",
+    );
+    assert!(model.scripts.is_some());
+    let shared = crate::shared::test_device();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    group.compose(1.0, 0.1).unwrap();
+    let quad = group.fx[0].quad;
+    let tint = group.quads[quad].tint;
+    assert_ne!(tint, group.fx[0].fallback_tint);
+    group.fx[0].starved = Some(Starvation { wait: 1, backoff: 1 });
+    group.compose(1.1, 0.1).unwrap();
+    assert_eq!(group.quads[quad].tint, group.fx[0].fallback_tint);
+    group.compose(1.2, 0.1).unwrap();
+    assert!(group.fx[0].starved.is_none());
+    group.compose(1.3, 0.1).unwrap();
+    assert_eq!(group.quads[quad].tint, tint);
+    group.destroy();
+}
+
+fn layer_pair(effect: &[u8], color: &[u8], show: &[u8]) -> SceneModel {
+    let scene = serde_json::json!({
+        "general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},
+        "objects":[
+            {"id":1,"image":"models/flat.json","origin":"16 32 0","size":"32 64",
+                "effects":[{"file":"effects/pair.json","passes":[{"constantshadervalues":{"color":"1 0 0"}},{},{}]}]},
+            {"id":2,"image":"models/flat.json","origin":"48 32 0","size":"32 64",
+                "effects":[{"file":"effects/pair.json","passes":[{"constantshadervalues":{"color":"0 1 0"}},{},{}]}]},
+            {"id":3,"origin":{"value":"0 0 0","animation":{"options":{"fps":30,"length":30,"mode":"single"},"c0":[{"frame":0,"value":0},{"frame":30,"value":1}]}}}
+        ]
+    })
+    .to_string();
+    let vertex = b"attribute vec3 a_Position;\nuniform mat4 g_ModelViewProjectionMatrix;\nvoid main(){gl_Position=mul(vec4(a_Position,1.0),g_ModelViewProjectionMatrix);}";
+    let direct = b"attribute vec3 a_Position;\nvoid main(){gl_Position=vec4(a_Position,1.0);}";
+    let copy = b"uniform sampler2D g_Texture0;\nvoid main(){gl_FragColor=texSample2D(g_Texture0,vec2(0.5));}";
+    model_files(&[
+        ("scene.json", scene.as_bytes()),
+        ("models/flat.json", br#"{"material":"materials/flat.json"}"#),
+        ("materials/flat.json", br#"{"passes":[{"shader":"flat"}]}"#),
+        ("effects/pair.json", effect),
+        ("materials/color.json", br#"{"passes":[{"shader":"color"}]}"#),
+        ("materials/store.json", br#"{"passes":[{"shader":"store"}]}"#),
+        ("materials/show.json", br#"{"passes":[{"shader":"show"}]}"#),
+        ("shaders/color.vert", direct),
+        ("shaders/store.vert", direct),
+        ("shaders/show.vert", vertex),
+        ("shaders/color.frag", color),
+        ("shaders/store.frag", copy),
+        ("shaders/show.frag", show),
+    ])
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn feedback_layers_isolated() {
+    let mut model = layer_pair(
+        br#"{"fbos":[{"name":"history","format":"rgba8888"},{"name":"sum","format":"rgba8888"}],"passes":[{"material":"materials/color.json","target":"sum","bind":[{"index":0,"name":"history"}]},{"material":"materials/store.json","target":"history","bind":[{"index":0,"name":"sum"}]},{"material":"materials/show.json","bind":[{"index":0,"name":"history"}]}]}"#,
+        b"uniform sampler2D g_Texture0;\nuniform vec3 g_Color; // {\"material\":\"color\"}\nvoid main(){gl_FragColor=vec4(texSample2D(g_Texture0,vec2(0.5)).rgb+g_Color*0.25,1.0);}",
+        b"uniform sampler2D g_Texture0;\nvoid main(){gl_FragColor=texSample2D(g_Texture0,vec2(0.5));}",
+    );
+    let shared = crate::shared::test_device();
+    let targets = vk::Renderer::scene_target_live_allocations();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    assert_eq!(group.fx.len(), 2);
+    assert!(group.fx.iter().all(|fx| fx.fbos[0].1.owned().is_some()));
+    group.compose(1.0, 0.1).unwrap();
+    let [first, second] =
+        [&group.fx[0], &group.fx[1]].map(|fx| fx.fbos[1].1.lease().map(|lease| lease.index));
+    assert!(first.is_some() && first == second);
+    let [red, green] = halves(&mut group);
+    assert!(red[0].abs_diff(128) <= 1 && red[1] == 0, "{red:?}");
+    assert!(green[1].abs_diff(128) <= 1 && green[0] == 0, "{green:?}");
+    group.destroy();
+    assert_eq!(vk::Renderer::scene_target_live_allocations(), targets);
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn discarding_fbo_owned() {
+    let mut model = layer_pair(
+        br#"{"fbos":[{"name":"local","format":"rgba8888","clear":"0 0 1 1"},{"name":"out","format":"rgba8888"}],"passes":[{"material":"materials/color.json","target":"local"},{"material":"materials/store.json","target":"out","bind":[{"index":0,"name":"local"}]},{"material":"materials/show.json","bind":[{"index":0,"name":"out"}]}]}"#,
+        b"uniform vec3 g_Color; // {\"material\":\"color\"}\nvoid main(){\nif(g_Color.g>0.5) discard;\ngl_FragColor=vec4(g_Color,1.0);\n}",
+        b"uniform sampler2D g_Texture0;\nuniform float g_Time;\nvoid main(){gl_FragColor=texSample2D(g_Texture0,vec2(0.5))+vec4(g_Time*0.0);}",
+    );
+    let shared = crate::shared::test_device();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    assert!(group.fx.iter().all(|fx| fx.fbos[0].1.owned().is_some()));
+    for time in [1.0, 2.0] {
+        group.compose(time, 0.1).unwrap();
+        assert_eq!(halves(&mut group), [[255, 0, 0, 255], [0, 0, 255, 255]]);
+    }
+    group.destroy();
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn hidden_layer_detached() {
+    let mut model = model(
+        serde_json::json!({"value":true,"script":"export function update(v){return engine.runtime<1.0;}"}),
+        b"uniform float g_Time;\nvoid main(){\ngl_FragColor=vec4(1.0+g_Time*0.0);\n}",
+    );
+    let shared = crate::shared::test_device();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    assert!(group.fx[0].output.is_some());
+    group.compose(1.5, 0.1).unwrap();
+    let fx = &group.fx[0];
+    assert!(fx.output.is_none() && group.textures[fx.slot].effect.is_none());
+    assert_eq!(group.quads[fx.quad].texture, fx.base_quad.texture);
+    group.destroy();
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn hidden_chain_strict() {
+    let shared = crate::shared::test_device();
+    let mut starved = 0;
+    for created in 0.. {
+        let mut model = model(
+            serde_json::json!({"value":false,"script":"export function update(v){return engine.runtime>=1.0;}"}),
+            b"void main(){\ngl_FragColor=vec4(1.0);\n}",
+        );
+        let targets = vk::Renderer::scene_target_live_allocations();
+        vk::Renderer::fail_scene_target_after(Some(created));
+        let built = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit);
+        let pending = vk::Renderer::scene_target_failure_pending();
+        vk::Renderer::fail_scene_target_after(None);
+        match built {
+            Ok(group) => {
+                group.destroy();
+                assert!(pending, "failure {created} hidden");
+                break;
+            }
+            Err(error) => starved += usize::from(format!("{error:#}").ends_with(STARVED_CHAIN)),
+        }
+        assert_eq!(vk::Renderer::scene_target_live_allocations(), targets, "failure {created}");
+    }
+    assert!(starved >= 1);
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn crop_never_presented() {
+    let scene = serde_json::json!({
+        "general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},
+        "objects":[
+            {"id":1,"image":"models/flat.json","origin":"16 32 0","size":"32 64","effects":[{"file":"effects/test.json"}]},
+            {"id":2,"origin":{"value":"0 0 0","animation":{"options":{"fps":30,"length":30,"mode":"single"},"c0":[{"frame":0,"value":0},{"frame":30,"value":1}]}}}
+        ]
+    });
+    let mut model = model_scene(
+        scene,
+        b"uniform sampler2D g_Texture0;\nvoid main(){\ngl_FragColor=vec4(texSample2D(g_Texture0,vec2(0.5)).rgb+vec3(0.5,0.0,0.0),1.0);\n}",
+    );
+    model.clear = [0.0, 0.25, 0.0];
+    model.layers[0].effects[0].passes[0].binds = vec![(0, EffectBind::SceneUnderLayer)];
+    let shared = crate::shared::test_device();
+    let targets = vk::Renderer::scene_target_live_allocations();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    assert!(!group.frozen && group.fx.is_empty());
+    assert!(group.baked_fx_draws.is_empty());
+    assert_eq!(group.baked_fx_outputs.len(), 1);
+    for time in [0.5, 1.0] {
+        group.compose(time, 0.1).unwrap();
+        let [pixel, _] = halves(&mut group);
+        assert_eq!((pixel[0].abs_diff(128) <= 1, pixel[1]), (true, 64), "{pixel:?}");
+    }
+    group.destroy();
+    assert_eq!(vk::Renderer::scene_target_live_allocations(), targets);
 }

@@ -680,7 +680,7 @@ pub struct Fbo {
     pub unique: bool,
 }
 
-const FBO_MAX_EXTENT: u32 = 8192;
+pub const FBO_MAX_EXTENT: u32 = 8192;
 const FBO_MIN_SCALE: f32 = 1e-3;
 
 impl Fbo {

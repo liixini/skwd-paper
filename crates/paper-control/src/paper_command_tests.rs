@@ -19,6 +19,38 @@ fn drawing_photo_shape() {
     assert!(serde_json::from_str::<PaperCommand>("{}").unwrap().drawing_photo.is_none());
 }
 
+#[test]
+fn widget_command_shape() {
+    let scene = crate::WidgetScene {
+        widgets: vec![crate::Widget {
+            face: crate::Face::Clock(crate::ClockStyle::Aperture),
+            depth: crate::Depth::Front,
+            pin: crate::Pin { anchor: [0.5, 0.5], offset: [0.0, 0.0] },
+            height: None,
+            output: None,
+        }],
+        outlines: Vec::new(),
+        palette: crate::Palette { text: [1, 2, 3], accent: [4, 5, 6], shade: [7, 8, 9] },
+        font: None,
+        labels: crate::Labels {
+            days: std::array::from_fn(|_| String::new()),
+            day_names: std::array::from_fn(|_| String::new()),
+            months: std::array::from_fn(|_| String::new()),
+            month_names: std::array::from_fn(|_| String::new()),
+        },
+    };
+    let mut command = PaperCommand::audio(None, None);
+    command.widgets = Some(Box::new(scene.clone()));
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&command.line())
+            .unwrap()
+            .get("widgets")
+            .is_some()
+    );
+    assert_eq!(round_trip(&command), command);
+    assert_eq!(classify_command(command), CommandClass::Widgets(Box::new(scene)));
+}
+
 fn round_trip(command: &PaperCommand) -> PaperCommand {
     let line = command.line();
     assert!(line.ends_with('\n'));

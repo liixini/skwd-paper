@@ -108,7 +108,7 @@ impl Group {
                 return false;
             }
         }
-        scripts.startup_compose = false;
+        scripts.startup = super::script::Startup::Running;
         if let Err(error) = self.compose(self.composed_at, 0.0) {
             tracing::warn!("scene properties need a rebuild: {error:#}");
             return false;

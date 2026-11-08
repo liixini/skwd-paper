@@ -25,6 +25,9 @@ mod bone_tests;
 #[cfg(test)]
 mod event_tests;
 
+#[cfg(test)]
+mod material_tests;
+
 mod video;
 pub use video::{VideoOp, VideoState};
 

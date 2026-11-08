@@ -26,6 +26,10 @@ pub(crate) struct Cli {
     pub(crate) frame_stream: Vec<String>,
     #[arg(long = "frame-fd")]
     pub(crate) frame_fd: Vec<i32>,
+    #[arg(long = "stream-output")]
+    pub(crate) stream_output: Vec<String>,
+    #[arg(long = "stream-logical")]
+    pub(crate) stream_logical: Vec<String>,
     #[arg(long = "stream-no-header")]
     pub(crate) stream_no_header: bool,
 }

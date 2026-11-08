@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use wayland_client::protocol::{
-    wl_compositor, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface,
+    wl_compositor, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_subcompositor, wl_surface,
 };
 use wayland_client::{Connection, EventQueue, Proxy};
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
@@ -96,6 +96,8 @@ pub struct App {
     pub(super) xdg_output_manager: Option<ZxdgOutputManagerV1>,
     pub(super) content_type_manager: Option<WpContentTypeManagerV1>,
     pub(super) shm: Option<wl_shm::WlShm>,
+    pub(super) subcompositor: Option<wl_subcompositor::WlSubcompositor>,
+    pub(super) widgets: Option<super::widgets::Widgets>,
     pub(super) outputs: Vec<OutputInfo>,
     pub surfaces: Vec<SurfaceUi>,
     pub closed: bool,

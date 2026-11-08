@@ -263,25 +263,26 @@ fn effect_targets_follow_scene_raster_scale() {
 fn effect_target_cap_preserves_layer_aspect() {
     let dimensions = scene_dimensions_for((3840.0, 2160.0), 4096);
 
-    assert_eq!(effect_dimensions_for((3840.0, 2160.0), dimensions), (2048, 1152));
+    assert_eq!(effect_dimensions_for((3840.0, 2160.0), dimensions), (3840, 2160));
+    assert_eq!(effect_dimensions_for((16384.0, 9216.0), dimensions), (8192, 4608));
 }
 
 #[test]
-fn scene_fade_commits_exact_endpoints_before_leaving_the_transition_path() {
+fn scene_fade_endpoints() {
     assert_eq!(
-        scene_fade_step(None, false),
+        scene_fade_step(None, false, false),
         SceneFadeStep { mix: 1.0, render_transition: false, finish_after_commit: false }
     );
     assert_eq!(
-        scene_fade_step(Some(0.18), true),
+        scene_fade_step(Some(0.18), true, false),
         SceneFadeStep { mix: 0.0, render_transition: true, finish_after_commit: false }
     );
     assert_eq!(
-        scene_fade_step(Some(0.18), false),
+        scene_fade_step(Some(0.18), false, false),
         SceneFadeStep { mix: 0.18, render_transition: true, finish_after_commit: false }
     );
     assert_eq!(
-        scene_fade_step(Some(1.04), false),
+        scene_fade_step(Some(1.04), false, false),
         SceneFadeStep { mix: 1.0, render_transition: true, finish_after_commit: true }
     );
 }
@@ -359,54 +360,6 @@ fn shared_scene_pool_does_not_reuse_closed_outputs_unreleased_storage() {
         shared_scene_slot([live.as_slice(), closed.as_slice()].into_iter(), 3, &[]),
         Some(2)
     );
-}
-
-#[test]
-fn effect_target_accounting_retains_only_the_selected_output() {
-    let ping_output = classify_effect_target_bytes(&[64, 64, 16, 8], FxTargetId::Ping).unwrap();
-    assert_eq!(ping_output, EffectTargetBytes { retained: 64, transient: 88 });
-
-    let named_output = classify_effect_target_bytes(&[64, 64, 16, 8], FxTargetId::Fbo(1)).unwrap();
-    assert_eq!(named_output, EffectTargetBytes { retained: 8, transient: 144 });
-}
-
-#[test]
-fn effect_target_accounting_rejects_an_unknown_named_output() {
-    assert_eq!(classify_effect_target_bytes(&[64, 64, 16], FxTargetId::Fbo(1)), None);
-}
-
-#[test]
-fn scratch_layout_reuses_only_compatible_cross_layer_targets() {
-    let full = FxTargetClass { width: 1920, height: 1080, repeat: false, format: 37 };
-    let half = FxTargetClass { width: 960, height: 540, repeat: false, format: 37 };
-    let repeating = FxTargetClass { repeat: true, ..full };
-
-    let layout = plan_scratch_layout(&[vec![full, full, half], vec![full, half], vec![repeating]]);
-
-    // Targets in one layer never alias even when their image class matches.
-    assert_ne!(layout.assignments[0][0], layout.assignments[0][1]);
-    // Sequential layers reuse matching scratch slots.
-    assert_eq!(layout.assignments[1][0], layout.assignments[0][0]);
-    assert_eq!(layout.assignments[1][1], layout.assignments[0][2]);
-    // Sampler addressing is part of compatibility.
-    assert_ne!(layout.assignments[2][0], layout.assignments[0][0]);
-    assert_eq!(layout.physical_classes.len(), 4);
-}
-
-#[test]
-fn sampled_target_aliases() {
-    let plan = lifetime::plan_targets(&[], &[None, None], &[vec![], vec![]], &[0, 0]).unwrap();
-    assert_eq!(plan.output, FxTargetId::Ping);
-    assert!(!scratch_candidate(&plan, &BTreeSet::new(), FxTargetId::Ping));
-
-    let plan = lifetime::plan_targets(&[], &[None, None], &[vec![], vec![]], &[0, 1]).unwrap();
-    assert_eq!(plan.output, FxTargetId::Pong);
-    assert!(plan.lifetimes[FxTargetId::Ping.index()].scratch_eligible());
-
-    assert!(scratch_candidate(&plan, &BTreeSet::new(), FxTargetId::Ping));
-    assert!(scratch_candidate(&plan, &BTreeSet::from([CompositeBuffer::A]), FxTargetId::Ping));
-    assert!(!scratch_candidate(&plan, &BTreeSet::from([CompositeBuffer::A]), plan.output));
-    assert!(!scratch_candidate(&plan, &BTreeSet::new(), plan.output));
 }
 
 #[test]
@@ -573,6 +526,27 @@ fn full_frame_prefix_merges_lower_particles_in_unified_order() {
     assert_eq!(prefix.iter().map(|quad| quad.texture).collect::<Vec<_>>(), [10, 20]);
     let full = ordered_scene_quads(&images, &[0, 2], &particles, 0, None);
     assert_eq!(full.iter().map(|quad| quad.texture).collect::<Vec<_>>(), [10, 20, 30]);
+}
+
+#[test]
+fn snapshot_quads_shift_particles() {
+    let quad = |texture| vk::SceneQuad {
+        uv_axes: None,
+        uv_padding: false,
+        projection: None,
+        order_bias: 0,
+        rect: [0.0; 4],
+        uv: [0.0; 4],
+        tint: [1.0; 4],
+        angle: 0.0,
+        texture,
+        blend: vk::SceneBlend::Alpha,
+    };
+    let mut quads = vec![quad(10), quad(7), quad(30), quad(7)];
+    let mut afters = [0, 1, 2, 3, 4, 9];
+    drop_snapshot_quads(&mut quads, &mut afters, |texture| texture == 7);
+    assert_eq!(quads.iter().map(|quad| quad.texture).collect::<Vec<_>>(), [10, 30]);
+    assert_eq!(afters, [0, 1, 1, 2, 2, 2]);
 }
 
 #[test]
@@ -1422,6 +1396,25 @@ export function update(value) {
 }
 
 #[test]
+#[ignore = "requires Vulkan"]
+fn init_particle_first_frame() -> Result<()> {
+    let script = r"
+const asset = engine.registerAsset('particles/p.json');
+export function init(value) {
+    thisScene.createLayer(asset).origin = new Vec3(128, 128, 0);
+    return value;
+}
+export function update(value) { return value; }
+";
+    let mut model = scripted_particle_model(script)?;
+    let shared = crate::shared::test_device();
+    let group = build_group(&shared, &mut model, true, &[(256, 256)], FillMode::Fit)?;
+    assert_eq!(group.particles.len(), 2);
+    group.destroy();
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires a Vulkan device"]
 fn initialized_particle_lifecycle() -> Result<()> {
     let script = r"
@@ -1444,15 +1437,17 @@ export function update(value) {
     let textures = vk::Renderer::scene_texture_live_allocations();
     let effects = vk::Renderer::effect_live_allocations();
     let mut group = build_group(&shared, &mut model, true, &[(256, 256)], FillMode::Fit)?;
+    assert_eq!(group.particles.len(), 1);
+    group.compose(0.1, 0.1)?;
     assert_eq!(group.particles.len(), 2);
     let slots = group.textures.len();
     let resources =
         group.scripts.as_ref().unwrap().host.as_ref().unwrap().image_resources().unwrap();
     let payload = resources.payload_bytes();
-    for frame in 1..=20 {
+    for frame in 2..=21 {
         group.compose(frame as f32 * 0.1, 0.1)?;
-        assert_eq!(group.particles.len(), if frame % 2 == 0 { 2 } else { 1 });
-        if frame % 2 == 0 {
+        assert_eq!(group.particles.len(), if frame % 2 == 1 { 2 } else { 1 });
+        if frame % 2 == 1 {
             assert_eq!(group.textures.len(), slots);
             assert_eq!(resources.payload_bytes(), payload);
         } else {
@@ -1460,7 +1455,7 @@ export function update(value) {
         }
         let host = group.scripts.as_ref().unwrap().host.as_ref().unwrap();
         assert_eq!(host.scene["objects"].as_array().unwrap().len(), 2);
-        assert_eq!(host.created_layer_slots().len(), usize::from(frame % 2 == 0));
+        assert_eq!(host.created_layer_slots().len(), usize::from(frame % 2 == 1));
         assert!(host.diagnostics.is_empty());
     }
     let (_, _, pixels) = group.read_canvas()?;
@@ -1990,7 +1985,7 @@ fn rope_buffer_demand() -> Result<()> {
     let engine = group.particles[0].engines.first().context("missing rope pipeline")?;
     assert!(engine.mesh == vk::ParticleMesh::RopePoints);
     assert_eq!(engine.limit, 32_768 * 32);
-    assert!(engine.capacity <= 1);
+    assert_eq!(engine.capacity, paper_scene::particles::MAX_TRAIL_SEGMENTS);
     assert_eq!(engine.buffers.is_some(), engine.capacity > 0);
     for frame in 1..=120 {
         group.compose(frame as f32 / 60.0, 1.0 / 60.0)?;
@@ -2271,7 +2266,7 @@ fn composition_effects_keep_authored_resolution_when_geometry_or_output_shrinks(
     layer.copy_background = false;
     assert_eq!(layer_effect_dimensions(&layer, low_resolution), (960, 540));
     layer.composition_size = Some((3840.0, 2160.0));
-    assert_eq!(layer_effect_dimensions(&layer, low_resolution), (2048, 1152));
+    assert_eq!(layer_effect_dimensions(&layer, low_resolution), (3840, 2160));
     layer.composition_size = None;
     low_resolution.raster = (1920, 1080);
     assert_eq!(layer_effect_dimensions(&layer, low_resolution), (296, 117));
@@ -3470,37 +3465,25 @@ fn check_text_lifecycle(case: &str, names: &[&str], phases: &[(f32, usize)]) -> 
     let mut previous_targets = Vec::new();
     for &(time, reference) in phases {
         if case.ends_with("length-cycle") && time == 2.0 {
-            let before: Vec<_> =
-                group.fx.iter().map(|fx| fx.ping.get(&group.fx_scratch).view).collect();
+            let before: Vec<_> = group
+                .fx
+                .iter()
+                .map(|fx| {
+                    let ping = fx.ping.get(&group.fx_pool);
+                    (ping.view, (ping.extent.width, ping.extent.height))
+                })
+                .collect();
             let old_bytes = group.effect_target_allocation_bytes();
-            let fx = &group.fx[0];
-            let size = extents[reference][0];
-            let required = fx.target_ids().try_fold(0_u64, |bytes, id| {
-                let extent = match id {
-                    FxTargetId::Fbo(index) => fx.fbo_specs[index].extent(size),
-                    FxTargetId::Ping | FxTargetId::Pong => size,
-                };
-                Ok::<_, anyhow::Error>(
-                    bytes
-                        + group.renderer.scene_target_allocation_size(
-                            extent.0,
-                            extent.1,
-                            fx.target(id, &group.fx_scratch).format,
-                        )?,
-                )
-            })?;
-            let delta = required.checked_sub(fx.allocation_bytes()).expect("first layer grows");
-            assert!(delta > 0);
-            let allowance = std::mem::replace(&mut group.history_budget, delta);
             group.compose(time, 0.0)?;
-            let committed = group.effect_target_allocation_bytes() - old_bytes;
-            assert_eq!(committed, delta);
-            assert_eq!(group.history_budget, 0);
-            group.history_budget = allowance - committed;
-            let after: Vec<_> =
-                group.fx.iter().map(|fx| fx.ping.get(&group.fx_scratch).view).collect();
-            assert_ne!(before[0], after[0]);
-            assert_eq!(before[1..], after[1..]);
+            assert!(group.effect_target_allocation_bytes() > old_bytes);
+            assert_eq!(group.fx.len(), extents[reference].len());
+            assert!(before.iter().zip(&extents[reference]).any(|((_, old), extent)| old != extent));
+            for ((fx, (view, old)), extent) in group.fx.iter().zip(before).zip(&extents[reference])
+            {
+                let ping = fx.ping.get(&group.fx_pool);
+                assert_eq!((ping.extent.width, ping.extent.height), *extent);
+                assert_eq!(ping.view == view, old == *extent);
+            }
         }
         group.compose(time, 0.0)?;
         let pixels = group.renderer.read_scene_target(&group.target)?.2;
@@ -3510,16 +3493,15 @@ fn check_text_lifecycle(case: &str, names: &[&str], phases: &[(f32, usize)]) -> 
             .filter(|(actual, expected)| actual[..3] != expected[..3])
             .count();
         assert_eq!(changed, 0, "text lifecycle {case} at {time}");
-        let targets: Vec<_> =
-            group.fx.iter().map(|fx| fx.ping.get(&group.fx_scratch).view).collect();
+        let targets: Vec<_> = group.fx.iter().map(|fx| fx.ping.get(&group.fx_pool).view).collect();
         if case.ends_with("length-cycle") && time == 1.0 {
             assert_eq!(previous_targets, targets);
         }
         previous_targets.clone_from(&targets);
         for fx in &group.fx {
-            let base = fx.ping.get(&group.fx_scratch).extent;
+            let base = fx.ping.get(&group.fx_pool).extent;
             for (spec, (_, storage)) in fx.fbo_specs.iter().zip(&fx.fbos) {
-                let target = storage.get(&group.fx_scratch);
+                let target = storage.get(&group.fx_pool);
                 assert_eq!(
                     (target.extent.width, target.extent.height),
                     spec.extent((base.width, base.height))
@@ -3528,8 +3510,7 @@ fn check_text_lifecycle(case: &str, names: &[&str], phases: &[(f32, usize)]) -> 
         }
         let bytes = group.effect_target_allocation_bytes();
         group.compose(time + 0.25, 0.0)?;
-        let repeated: Vec<_> =
-            group.fx.iter().map(|fx| fx.ping.get(&group.fx_scratch).view).collect();
+        let repeated: Vec<_> = group.fx.iter().map(|fx| fx.ping.get(&group.fx_pool).view).collect();
         assert_eq!(targets, repeated);
         assert_eq!(bytes, group.effect_target_allocation_bytes());
     }
@@ -3564,7 +3545,7 @@ fn text_named_targets_resize() -> Result<()> {
 }
 #[test]
 #[ignore = "requires Vulkan and SKWD_WE_TEXT_LIFECYCLE_ROOT"]
-fn text_resize_checks_budget() -> Result<()> {
+fn text_resize_reallocates() -> Result<()> {
     let root = std::path::PathBuf::from(std::env::var("SKWD_WE_TEXT_LIFECYCLE_ROOT")?);
     let dir = root.join("length-cycle");
     let package = paper_scene::pkg::Package::open(&dir.join("scene.pkg"))?;
@@ -3573,43 +3554,21 @@ fn text_resize_checks_budget() -> Result<()> {
     let mut group = build_group(&shared, &mut model, true, &[(1280, 720)], FillMode::Fit)?;
     group.compose(0.0, 0.0)?;
     let layer = group.fx[0].quad;
-    let old = group.fx[0].ping.get(&group.fx_scratch);
-    let extent = (old.extent.width, old.extent.height);
-    assert_eq!(
-        group.renderer.scene_target_allocation_size(extent.0, extent.1, old.format)?,
-        old.allocation_bytes
-    );
-    let history = group.scene_history.as_ref().map_or(0, vk::SceneHistory::allocation_bytes);
-    let resident = group.effect_target_allocation_bytes()
-        + group.scene_snapshot.as_ref().map_or(0, |target| target.allocation_bytes)
-        + group.scene_grab.as_ref().map_or(0, |target| target.allocation_bytes)
-        + history;
-    group.effect_budget = resident + resident / 4;
-    group.history_budget = resident / 4 + history;
-    assert!(resident > group.effect_budget / 2);
-    let allowance = group.history_budget;
+    let old = group.fx[0].ping.get(&group.fx_pool).extent;
+    let extent = (old.width, old.height);
     let before = group.effect_target_allocation_bytes();
     group.resize_text_effect(layer, (extent.0 / 2, extent.1))?;
-    let after = group.effect_target_allocation_bytes();
-    assert!(after < before);
-    assert_eq!(group.history_budget, allowance + before - after);
-    let view = group.fx[0].ping.get(&group.fx_scratch).view;
-    let allocations = group.renderer.scene_image_allocations();
-    assert!(group.resize_text_effect(layer, (8192, 8192)).is_err());
-    assert_eq!(group.renderer.scene_image_allocations(), allocations);
-    assert_eq!(group.fx[0].ping.get(&group.fx_scratch).view, view);
+    assert!(group.effect_target_allocation_bytes() < before);
     group.resize_text_effect(layer, extent)?;
-    assert_eq!(group.history_budget, allowance);
-    let view = group.fx[0].ping.get(&group.fx_scratch).view;
+    assert_eq!(group.effect_target_allocation_bytes(), before);
+    let view = group.fx[0].ping.get(&group.fx_pool).view;
     for effect in &mut group.fx[0].effects {
         effect.visible = false;
     }
-    group.history_budget = 0;
-    group.effect_budget = 0;
     let allocations = group.renderer.scene_image_allocations();
     group.resize_text_effect(layer, (8192, 8192))?;
     assert_eq!(group.renderer.scene_image_allocations(), allocations);
-    assert_eq!(group.fx[0].ping.get(&group.fx_scratch).view, view);
+    assert_eq!(group.fx[0].ping.get(&group.fx_pool).view, view);
     group.destroy();
     Ok(())
 }
@@ -3651,23 +3610,16 @@ fn hidden_text_defers_resize() -> Result<()> {
         group
             .fx
             .iter()
-            .flat_map(|fx| fx.target_ids().map(move |id| fx.target(id, &group.fx_scratch).view))
+            .flat_map(|fx| fx.target_ids().map(move |id| fx.target(id, &group.fx_pool).view))
             .collect::<Vec<_>>()
     };
     let targets = views(&group);
     let bytes = group.effect_target_allocation_bytes();
-    let allowance = std::mem::replace(&mut group.history_budget, 0);
     group.compose(1.0, 0.0)?;
     assert_eq!(rgb(group.renderer.read_scene_target(&group.target)?.2), references[1]);
     assert_eq!(views(&group), targets);
     assert_eq!(group.effect_target_allocation_bytes(), bytes);
     assert!(group.fx.iter().all(|fx| fx.effects.iter().all(|effect| !effect.visible)));
-    let frame = group.renderer.read_scene_target(&group.target)?.2;
-    assert!(group.compose(2.0, 0.0).is_err());
-    assert_eq!(group.renderer.read_scene_target(&group.target)?.2, frame);
-    assert_eq!(views(&group), targets);
-    assert_eq!(group.effect_target_allocation_bytes(), bytes);
-    group.history_budget = allowance;
     group.compose(2.0, 0.0)?;
     assert_eq!(rgb(group.renderer.read_scene_target(&group.target)?.2), references[2]);
     assert_ne!(views(&group), targets);
@@ -4363,4 +4315,71 @@ fn spent_burst_stays_spent() {
     step_containers(&mut groups, 0.1);
     assert!(groups[0].sim.particles.is_empty());
     assert!(oldest(&groups[1]) > before);
+}
+
+#[test]
+fn paused_fade_preserves_remainder() {
+    let active = scene_fade_step(Some(0.25), false, false);
+    let held = scene_fade_step(Some(10.0), false, true);
+    assert!(!held.finish_after_commit);
+    assert!(held.render_transition);
+    assert_eq!(scene_fade_step(Some(0.25), false, false), active);
+    assert!(scene_fade_step(Some(1.0), false, false).finish_after_commit);
+}
+
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn output_fade_origins() -> Result<()> {
+    let shared = crate::shared::test_device();
+    let mut model = mesh_model(
+        br#"{"general":{"orthogonalprojection":{"width":32,"height":32}},"objects":[]}"#,
+    );
+    let mut group = build_group(&shared, &mut model, true, &[(32, 32)], FillMode::Fill)?;
+    let directory = tempfile::tempdir()?;
+    for (output, color) in [("fallback", [255, 0, 0]), ("DP-1", [0, 255, 0]), ("DP-2", [0, 0, 255])]
+    {
+        let path = directory.path().join(format!("{output}.png"));
+        image::RgbImage::from_pixel(32, 32, image::Rgb(color)).save(&path)?;
+        let source = load_from_frame(&group, path.to_str().unwrap())?;
+        if output == "fallback" {
+            group.from = Some(source);
+        } else {
+            group.output_from.insert(output.to_owned(), source);
+        }
+    }
+    let mut presenter = build_presenter(&shared, 32, 32, 1, None)?;
+    group.frozen = false;
+    group.clear = [0.0; 3];
+    group.compose(0.0, 0.0)?;
+    for (output, channel) in [("HDMI-A-1", 0), ("DP-1", 1), ("DP-2", 2)] {
+        presenter.fade(&group, 0, 0.0, TransitionStyle::Fade, output)?;
+        let pixels = super::super::dmabuf_helpers::read_rgba_export(
+            &mut presenter.renderer,
+            &presenter.exports[0],
+            (32, 32),
+        )?;
+        let pixel = pixels.get_pixel(16, 16);
+        assert!(pixel[channel] > 200, "origin channel");
+        assert!(pixel[channel].saturating_sub(pixel[(channel + 1) % 3]) > 100, "{pixel:?}");
+        assert!(pixel[channel].saturating_sub(pixel[(channel + 2) % 3]) > 100, "{pixel:?}");
+    }
+    let mut frames = Vec::new();
+    for color in [[0.0; 3], [1.0; 3]] {
+        group.clear = color;
+        group.compose(1.0, 0.0)?;
+        presenter.fade(&group, 0, 0.5, TransitionStyle::Fade, "DP-1")?;
+        frames.push(super::super::dmabuf_helpers::read_rgba_export(
+            &mut presenter.renderer,
+            &presenter.exports[0],
+            (32, 32),
+        )?);
+    }
+    assert!(frames[1].get_pixel(16, 16)[0] > frames[0].get_pixel(16, 16)[0] + 80);
+    presenter.wait_render()?;
+    group.drop_from();
+    assert!(group.fade_source("DP-1").is_none());
+    assert!(group.fade_source("HDMI-A-1").is_none());
+    drop(presenter);
+    group.destroy();
+    Ok(())
 }

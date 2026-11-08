@@ -117,3 +117,39 @@ fn preview_drawing_needs_shader() {
     let parsed = preview_drawing("drawing", Some(drawing.into())).unwrap().unwrap();
     assert_eq!(parsed.ink, paper_control::DrawingInk::Rainbow);
 }
+
+#[cfg(feature = "shared-device")]
+#[test]
+fn separates_stream_geometry() {
+    let args = [
+        "--stream-fd",
+        "3",
+        "--stream-output",
+        "stream-7",
+        "--stream-connector",
+        "DP-1",
+        "--stream-size",
+        "1920x1080",
+        "--stream-logical",
+        "2560x1440",
+        "--stream-fd",
+        "4",
+        "--stream-output",
+        "stream-8",
+        "--stream-connector",
+        "DP-2",
+        "--stream-size",
+        "1280x720",
+        "--stream-logical",
+        "3840x2160",
+    ]
+    .map(String::from);
+    let targets = stream_targets(&args, false);
+    assert_eq!(targets[0].output, "stream-7");
+    assert_eq!(targets[0].connector, "DP-1");
+    assert_eq!(targets[0].logical, [2560, 1440]);
+    assert_eq!((targets[0].width, targets[0].height), (1920, 1080));
+    assert_eq!(targets[1].output, "stream-8");
+    assert_eq!(targets[1].connector, "DP-2");
+    assert_eq!(targets[1].logical, [3840, 2160]);
+}

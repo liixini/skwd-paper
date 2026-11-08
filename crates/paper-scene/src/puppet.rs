@@ -116,6 +116,7 @@ pub struct Mesh {
     pub skipped_morphs: bool,
     pub skipped_draw_order: bool,
     pub springs: Vec<spring::Definition>,
+    spatial: bool,
     bind_inverse: Vec<Option<Affine>>,
     native_bind_inverse: Vec<Option<Mat4>>,
 }
@@ -419,6 +420,7 @@ pub(crate) fn rig(
     let draw_rest = std::mem::take(&mut skeleton.draw_rest);
     let mut mesh = assemble(skeleton, attachments, animations);
     mesh.skipped_morphs = morph_section;
+    mesh.spatial = spatial;
     Ok((mesh, draw_rest))
 }
 
@@ -446,6 +448,7 @@ fn assemble(skeleton: Skeleton, attachments: Vec<Attachment>, animations: Vec<An
         draw_order: None,
         masks: masks::Masks::default(),
         skipped_draw_order: false,
+        spatial: false,
         bind_inverse,
         native_bind_inverse,
     }

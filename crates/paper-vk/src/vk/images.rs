@@ -211,13 +211,4 @@ impl Spec {
                 .map_err(Into::into)
         }
     }
-
-    pub fn allocation_size(&self, renderer: &Renderer) -> Result<u64> {
-        let image = self.create(renderer)?;
-        unsafe {
-            let bytes = renderer.device.get_image_memory_requirements(image).size;
-            renderer.device.destroy_image(image, None);
-            Ok(bytes)
-        }
-    }
 }

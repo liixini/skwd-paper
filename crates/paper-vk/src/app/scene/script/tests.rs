@@ -1,4 +1,4 @@
-use super::{TextBackdrop, effect_objects, script_update_due, update_backdrop};
+use super::{Startup, TextBackdrop, effect_objects, script_update_due, update_backdrop};
 use serde_json::json;
 
 #[test]
@@ -21,12 +21,38 @@ fn effect_objects_preserve_first_match_and_refresh_after_scene_changes() {
 }
 
 #[test]
-fn keyed_update_waits() {
-    let mut startup = true;
-    assert!(!script_update_due(&mut startup, 0.0));
+fn startup_updates_once() {
+    let mut startup = Startup::Pending;
+    assert!(script_update_due(&mut startup, 0.0));
     assert!(!script_update_due(&mut startup, 0.0));
     assert!(script_update_due(&mut startup, 0.05));
     assert!(script_update_due(&mut startup, 0.0));
+    let mut startup = Startup::Pending;
+    assert!(script_update_due(&mut startup, 0.3));
+    assert!(script_update_due(&mut startup, 0.1));
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn first_frame_scripted() {
+    use super::super::{FillMode, build_group};
+    let mut model = super::super::effect_lifetime_tests::model_files(&[
+        ("scene.json", br#"{"general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},"objects":[{"id":1,"image":"models/flat.json","origin":"16 32 0","size":"16 16","alpha":{"value":0,"script":"let n=0;export function update(){n++;return n==1?1:0;}"}},{"id":2,"image":"models/flat.json","origin":"48 32 0","size":"16 16","alpha":{"value":0,"script":"export function init(){return 1;}"}}]}"#),
+        ("models/flat.json", br#"{"material":"materials/flat.json"}"#),
+        ("materials/flat.json", br#"{"passes":[{"shader":"flat"}]}"#),
+    ]);
+    let shared = crate::shared::test_device();
+    let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
+    let lit = |group: &mut super::super::Group| {
+        let pixels = group.read_canvas().unwrap().2;
+        [16, 48].map(|x| pixels[(32 * 64 + x) * 4] > 0)
+    };
+    assert_eq!(lit(&mut group), [true, true]);
+    group.compose(0.0, 0.0).unwrap();
+    assert_eq!(lit(&mut group), [true, true]);
+    group.compose(0.5, 0.5).unwrap();
+    assert_eq!(lit(&mut group), [false, true]);
+    group.destroy();
 }
 
 #[test]
@@ -279,15 +305,15 @@ pub(super) fn text_raster_attempt() {
 }
 
 #[test]
-#[ignore = "requires pinned dynamic text package and Vulkan"]
+#[ignore = "requires Vulkan"]
 fn failed_raster_waits() {
     use super::super::{FillMode, build_group};
     let scene = json!({"general":{"orthogonalprojection":{"width":64,"height":64},"clearcolor":"0 0 0"},
-        "objects":[{"id":1,"origin":"32 32 0","font":"fonts/Probe.ttf",
-        "pointsize":{"value":8,"script":"export function update(){return engine.runtime>=1 && engine.runtime<3?1024:8;}"},
-        "text":{"value":"A","script":"export function update(){return engine.runtime<1?'A':engine.runtime<3?'W'.repeat(4096):'BB';}"}},
+        "objects":[{"id":1,"origin":"32 32 0","font":"fonts/Latin.ttf","effects":[{"file":"effects/text.json"}],
+        "pointsize":8,
+        "text":{"value":"A","script":"export function update(){return engine.runtime<1?'A':engine.runtime<3?'W'.repeat(400):'BB';}"}},
         {"id":2,"alpha":{"value":1,"script":"export function update(){return engine.runtime;}"}}]});
-    let mut model = super::super::effect_lifetime_tests::dynamic_text_model(&scene);
+    let mut model = super::super::effect_lifetime_tests::text_effect_model(&scene.to_string());
     let shared = crate::shared::test_device();
     let mut group = build_group(&shared, &mut model, true, &[(64, 64)], FillMode::Fit).unwrap();
     group.compose(0.0, 0.0).unwrap();
@@ -523,6 +549,36 @@ fn failed_upload_keeps_bounds() {
 }
 
 #[test]
+#[ignore = "requires Vulkan"]
+fn failed_resize_rejects_text() {
+    use super::super::{FillMode, build_group};
+    let mut model = super::super::effect_lifetime_tests::text_effect_model(
+        super::super::effect_lifetime_tests::TEXT_EFFECT_SCENE,
+    );
+    let shared = crate::shared::test_device();
+    let mut group = build_group(&shared, &mut model, false, &[(64, 64)], FillMode::Fit).unwrap();
+    group.compose(0.0, 0.0).unwrap();
+    let scripts = group.scripts.as_ref().unwrap();
+    let (bounds, slot) = (scripts.text[0].2.bounds, scripts.text[0].1);
+    let texture = group.textures[slot].view;
+    let ping = group.fx[0].ping.get(&group.fx_pool).view;
+    let bytes = group.effect_target_allocation_bytes();
+    let targets = crate::vk::Renderer::scene_target_live_allocations();
+    crate::vk::Renderer::fail_scene_target_after(Some(1));
+    group.compose(1.0, 0.1).unwrap();
+    crate::vk::Renderer::fail_scene_target_after(None);
+    let scripts = group.scripts.as_ref().unwrap();
+    assert_eq!(scripts.text[0].2.bounds, bounds);
+    assert_eq!(group.textures[slot].view, texture);
+    assert_eq!(group.fx[0].ping.get(&group.fx_pool).view, ping);
+    assert_eq!(group.effect_target_allocation_bytes(), bytes);
+    assert_eq!(crate::vk::Renderer::scene_target_live_allocations(), targets);
+    group.compose(2.0, 0.1).unwrap();
+    assert_eq!(group.textures[slot].view, texture);
+    group.destroy();
+}
+
+#[test]
 #[ignore = "requires Vulkan and SKWD_WE_TEXT_LIFECYCLE_ROOT"]
 fn effect_padding_transaction() {
     use super::super::{FillMode, build_group};
@@ -541,7 +597,7 @@ fn effect_padding_transaction() {
     let backdrop = *scripts.backdrops.iter().find(|backdrop| backdrop.layer == layer).unwrap();
     let rect = group.quads[layer].rect;
     let texture = group.textures[slot].view;
-    let target = group.fx[0].ping.get(&group.fx_scratch);
+    let target = group.fx[0].ping.get(&group.fx_pool);
     let view = target.view;
     let extent = (target.extent.width, target.extent.height);
     let pixels = group.read_canvas().unwrap().2;
@@ -554,21 +610,14 @@ fn effect_padding_transaction() {
     assert!(
         group.compose(0.1, 0.1).unwrap_err().to_string().contains("injected text upload failure")
     );
-    let budget = group.effect_budget;
-    group.effect_budget = 0;
-    group.compose(0.2, 0.1).unwrap();
     let scripts = group.scripts.as_ref().unwrap();
-    let (_, _, rejected) = scripts.text.iter().find(|(index, _, _)| *index == layer).unwrap();
-    assert!(rejected.has_rejection());
-    assert_eq!(rejected.bounds, bounds);
     assert_eq!(*scripts.backdrops.iter().find(|entry| entry.layer == layer).unwrap(), backdrop);
     assert_eq!(group.textures[slot].view, texture);
-    assert_eq!(group.fx[0].ping.get(&group.fx_scratch).view, view);
+    assert_eq!(group.fx[0].ping.get(&group.fx_pool).view, view);
     assert_eq!(group.quads[layer].rect, rect);
     assert_eq!(group.read_canvas().unwrap().2, pixels);
-    group.effect_budget = budget;
     group.compose(0.3, 0.1).unwrap();
-    let target = group.fx[0].ping.get(&group.fx_scratch);
+    let target = group.fx[0].ping.get(&group.fx_pool);
     assert_eq!((target.extent.width, target.extent.height), (extent.0 + 24, extent.1 + 24));
     assert_ne!(target.view, view);
     assert_ne!(group.textures[slot].view, texture);

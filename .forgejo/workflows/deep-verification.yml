@@ -76,9 +76,11 @@ jobs:
         run: mkdir -p ci-artifacts/results "$TMPDIR"
 
       - name: Prepare the pinned HLSL test compiler
+        env:
+          SKWD_RELEASE_TOKEN: ${{ secrets.SKWD_SUITE_READ_TOKEN }}
         run: |
           mkdir -p .ci/dxc
-          curl --fail --location --retry 3 --output .ci/dxc/archive.tar.gz https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/linux_dxc_2025_07_14.x86_64.tar.gz
+          curl --fail --location --retry 3 --header "Authorization: token $SKWD_RELEASE_TOKEN" --output .ci/dxc/archive.tar.gz "$GITHUB_SERVER_URL/liixini/skwd-ci-mirror/releases/download/dxc-v1.8.2505.1/linux_dxc_2025_07_14.x86_64.tar.gz"
           echo 'f2213da1fc99dc8778c8823078e16ba97c7f80f86a1d4520ab1adf4b462bc48c  .ci/dxc/archive.tar.gz' | sha256sum --check --strict
           tar -xzf .ci/dxc/archive.tar.gz -C .ci/dxc
           echo "SKWD_DXC_PATH=$PWD/.ci/dxc/lib/libdxcompiler.so" >> "$GITHUB_ENV"

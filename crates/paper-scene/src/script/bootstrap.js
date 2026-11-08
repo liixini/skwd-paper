@@ -507,7 +507,6 @@ function __wrap(value, path, key, eager = false, converted = false, owner = null
 const __commands = [];
 const __sortCommand = 'sort';
 const __effectCommand = 'effect';
-const __materialCommand = 'material';
 const __effectMaterialCommand = 'effectMaterial';
 let __sortPending = false;
 const __sprites = new Map();
@@ -685,34 +684,12 @@ function __installMethod(layer, key, value) {
 }
 const __materialHandles = new WeakSet();
 const __materialVectors = [null, null, Vec2, Vec3, Vec4];
-const __materialAliases = {color:'color',channelMask:'channelMask',channelmask:'channelMask',alpha:'alpha',tint:'tint'};
 function __materialValues(value) {
     if (typeof value === 'number') return Number.isFinite(value) ? [value] : null;
     if (!value || typeof value !== 'object') return null;
     const values = Array.isArray(value) ? value.slice(0, __maxMaterialValues).map(Number)
         : __vectorComponents.filter(key => typeof value[key] === 'number').map(key => value[key]);
     return values.length && values.every(Number.isFinite) ? values : null;
-}
-function __materialProxy(layer, effect, pass) {
-    const owner = __layerStates.get(layer);
-    const cache = new Map();
-    const effectIndex = effect === undefined ? undefined : (__nativeValue(layer, 'effects') || []).indexOf(effect);
-    const write = (name, value) => {
-        name = String(name || '');
-        const values = __materialValues(value);
-        if (!__ownsSlot(owner) || !name || !values || effectIndex === -1) return;
-        __command(effectIndex === undefined ? __materialCommand : __effectMaterialCommand,
-            __layerId(layer), name, effectIndex === undefined ? values : [effectIndex, pass, values]);
-        cache.set(name, values);
-    };
-    const handle = {
-        setValue:write,
-        getValue:name => cache.get(String(name || '')) ?? null
-    };
-    for (const [property, uniform] of Object.entries(__materialAliases))
-        Object.defineProperty(handle, property, {enumerable:true, configurable:true,
-            get:() => cache.get(uniform) ?? null, set:value => write(uniform, value)});
-    return handle;
 }
 function __installEffect(layer, effect) {
     if (!effect || __materialHandles.has(effect)) return effect;
@@ -732,22 +709,23 @@ function __installEffect(layer, effect) {
         if (materials.has(index)) return materials.get(index);
         const source = metadata().materials.find(source => source.source === index);
         if (!source) return null;
-        const material = __materialProxy(layer, effect, source.source);
+        const owner = __layerStates.get(layer);
+        const effectIndex = (__nativeValue(layer, 'effects') || []).indexOf(effect);
+        const material = {};
         for (const [key, binding] of Object.entries(source.uniforms)) {
-            const initial = binding.value?.map(Math.fround);
-            let written;
+            let current = binding.value?.map(Math.fround);
             Object.defineProperty(material, key, {enumerable:true,
                 get:() => {
-                    const values = written ?? initial;
-                    if (!values) return undefined;
+                    if (!current) return undefined;
                     const Vector = __materialVectors[binding.width];
-                    return binding.width === 1 ? values[0] : Vector ? new Vector(...values) : undefined;
+                    return binding.width === 1 ? current[0] : Vector ? new Vector(...current) : undefined;
                 },
                 set:value => {
                     const values = __materialValues(value);
                     if (!values) return;
-                    material.setValue(binding.uniform, values);
-                    written = values.map(Math.fround);
+                    if (__ownsSlot(owner) && effectIndex !== -1)
+                        __command(__effectMaterialCommand, __layerId(layer), binding.uniform, [effectIndex, source.source, values]);
+                    current = values.map(Math.fround);
                 }});
         }
         materials.set(index, material);
@@ -756,13 +734,8 @@ function __installEffect(layer, effect) {
     __installMethod(effect, 'getMaterialCount', () => metadata().count);
     __installMethod(effect, 'getMaterial', index => at(index === undefined ? 0 : index));
     __installMethod(effect, 'setMaterialProperty', (key, value) => {
-        let matched = false;
-        for (const source of metadata().materials) {
-            if (!Object.hasOwn(source.uniforms, key)) continue;
-            at(source.source)[key] = value;
-            matched = true;
-        }
-        if (!matched) throw Error('effect material property unavailable');
+        for (const source of metadata().materials)
+            if (Object.hasOwn(source.uniforms, key)) at(source.source)[key] = value;
     });
     __installMethod(effect, 'executeMaterialFunction', name => {
         const effects = __nativeValue(layer, 'effects');
@@ -818,10 +791,6 @@ function __installLayer(layer, slot) {
         const effects = __nativeValue(layer, 'effects') || [];
         return __installEffect(layer, (typeof key === 'number' ? effects[key] : effects.find(effect => effect.name === key)) ?? null);
     });
-    if (__nativeValue(layer, 'image') !== undefined) {
-        let material;
-        __installMethod(layer, 'getMaterial', () => material ??= __materialProxy(layer));
-    }
     __installMethod(layer, 'getAnimation', name => __getAnimation(layer, __objectPrefix + slot, name));
     if (__nativeValue(layer, 'image') !== undefined) {
         let animation;

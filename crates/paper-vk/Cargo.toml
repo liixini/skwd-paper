@@ -20,6 +20,7 @@ paper-log = { path = "../paper-log" }
 paper-runtime = { path = "../paper-runtime" }
 tracing = { workspace = true }
 paper-control = { path = "../paper-control" }
+paper-widgets = { path = "../paper-widgets" }
 paper-audio = { path = "../paper-audio" }
 paper-scene = { path = "../paper-scene" }
 paper-shaders = { path = "../paper-shaders" }

@@ -1,9 +1,10 @@
+use super::fx_pool;
 use super::mesh::{MATRIX_TRANSLATION_X, MATRIX_TRANSLATION_Y};
 use super::{
     CompositeBuffer, EffectBind, FX_MODEL_MATRIX, FX_MODEL_PROJECTION, FxTargetId, Group,
-    MATRIX_COLUMN_COMPONENTS, Mat4, PresentView, active_effect_counts, background_projection,
-    camera_projection, flip_clip_y, last_effect_pass, layer_puppet, layer_view, mat4_mul,
-    pixel_means, present_uniforms, scene_view_projection, size4, vk,
+    MATRIX_COLUMN_COMPONENTS, Mat4, PresentView, Starvation, active_effect_counts,
+    background_projection, camera_projection, flip_clip_y, last_effect_pass, layer_puppet,
+    layer_view, mat4_mul, pixel_means, present_uniforms, scene_view_projection, size4, vk,
 };
 use anyhow::{Context, Result};
 
@@ -33,9 +34,29 @@ impl Group {
             debug_fx,
             scene_targets,
         } = chain;
+        let fx = if mirror { &mut self.mirror_fx[index] } else { &mut self.fx[index] };
+        if let Some(starved) = &mut fx.starved
+            && starved.wait > 0
+        {
+            starved.wait -= 1;
+            fx.starve(mirror, &mut self.quads, &mut self.textures);
+            return Ok(());
+        }
+        if let Err(err) = fx_pool::lease_chain(&mut self.fx_pool, &mut self.renderer, fx, !debug_fx)
+        {
+            if fx.starved.is_none() {
+                tracing::warn!("skwd-wall-vk: effect chain bypassed on {} ({err:#})", fx.layer_id);
+            }
+            fx.starved = Some(Starvation::after(fx.starved));
+            fx.starve(mirror, &mut self.quads, &mut self.textures);
+            return Ok(());
+        }
+        if fx.starved.take().is_some() {
+            tracing::info!("skwd-wall-vk: effect chain restored on {}", fx.layer_id);
+        }
         let ndc_quad = self.ndc_quad.as_ref().context("ndc quad missing")?;
         let ndc_quad_d3d = self.ndc_quad_d3d.as_ref().context("ndc quad missing")?;
-        let fx_scratch = &self.fx_scratch;
+        let pool = &self.fx_pool;
         let cookie_sample = self.cookie_sample();
         let fx_quad = if mirror { self.mirror_fx[index].quad } else { self.fx[index].quad };
         let quad = if mirror && !self.screen_quads.contains(&fx_quad) {
@@ -66,7 +87,7 @@ impl Group {
         if fx.reset_targets || active_counts != fx.active_counts {
             for ((_, target), clear) in fx.fbos.iter().zip(&fx.fbo_clears) {
                 if let Some(clear) = clear {
-                    self.renderer.record_scene(target.get(fx_scratch), *clear, &[], &self.textures);
+                    self.renderer.record_scene(target.get(pool), *clear, &[], &self.textures);
                 }
             }
             fx.active_counts = active_counts;
@@ -74,17 +95,17 @@ impl Group {
         }
         for &(index, clear) in &fx.pending_clears {
             self.renderer.record_scene(
-                fx.target(FxTargetId::Fbo(index), fx_scratch),
+                fx.target(FxTargetId::Fbo(index), pool),
                 clear,
                 &[],
                 &self.textures,
             );
         }
         fx.pending_clears.clear();
-        let ping = fx.ping.get(fx_scratch);
-        let pong = fx.pong.get(fx_scratch);
+        let ping = fx.ping.get(pool);
+        let pong = fx.pong.get(pool);
         if let (Some(crop), Some(crop_quad)) = (&fx.crop, &fx.crop_quad) {
-            let crop = crop.get(fx_scratch);
+            let crop = crop.get(pool);
             let quad = std::slice::from_ref(crop_quad);
             if debug_fx {
                 self.renderer.render_scene(crop, [0.0; 4], quad, &self.textures)?;
@@ -182,7 +203,7 @@ impl Group {
             } else {
                 fx.uniforms.remove(FX_MODEL_PROJECTION);
             }
-            let named = named_id.map(|id| fx.target(id, fx_scratch));
+            let named = named_id.map(|id| fx.target(id, pool));
             let mut views = vec![(previous.0, previous.1)];
             let mut sizes: Vec<Option<[f32; 4]>> = vec![Some(size4(previous.2))];
             for &texture in &fx.inputs[slot] {
@@ -195,7 +216,7 @@ impl Group {
                     EffectBind::Previous => Some(previous),
                     EffectBind::Named(name) => fx
                         .resolve_fbo(fx.owner[slot], name)
-                        .map(|index| fx.target(FxTargetId::Fbo(index), fx_scratch))
+                        .map(|index| fx.target(FxTargetId::Fbo(index), pool))
                         .map(|rt| (rt.view, rt.sampler, rt.extent)),
                     EffectBind::LayerComposite { layer, buffer } => scene_targets
                         .as_deref()
@@ -216,7 +237,7 @@ impl Group {
                         self.scene_history.as_ref().map(vk::SceneHistory::sample)
                     }
                     EffectBind::SceneUnderLayer => fx.crop.as_ref().map(|storage| {
-                        let crop = storage.get(fx_scratch);
+                        let crop = storage.get(pool);
                         (crop.view, crop.sampler, crop.extent)
                     }),
                 };
@@ -275,7 +296,7 @@ impl Group {
                 id
             } else {
                 let candidate = if flip { FxTargetId::Ping } else { FxTargetId::Pong };
-                let candidate_target = fx.target(candidate, fx_scratch);
+                let candidate_target = fx.target(candidate, pool);
                 if candidate_target.view == previous.0
                     || views.iter().any(|(view, _)| *view == candidate_target.view)
                 {
@@ -285,7 +306,7 @@ impl Group {
                     candidate
                 }
             };
-            let target = fx.target(target_id, fx_scratch);
+            let target = fx.target(target_id, pool);
             let meta = &fx.passes[slot];
             let quad_dims = named.is_none().then_some((ping.extent.width, ping.extent.height));
             let uniforms = meta.uniform_bytes_with(
@@ -306,10 +327,8 @@ impl Group {
                             "PING".into()
                         } else if *view == pong.view {
                             "PONG".into()
-                        } else if let Some((name, _)) = fx
-                            .fbos
-                            .iter()
-                            .find(|(_, storage)| storage.get(fx_scratch).view == *view)
+                        } else if let Some((name, _)) =
+                            fx.fbos.iter().find(|(_, storage)| storage.get(pool).view == *view)
                         {
                             name.clone()
                         } else {
@@ -386,9 +405,7 @@ impl Group {
                 let meta = &fx.passes[slot];
                 fx.presentation_inputs = fx
                     .target_ids()
-                    .filter(|id| {
-                        views.iter().any(|(view, _)| *view == fx.target(*id, fx_scratch).view)
-                    })
+                    .filter(|id| views.iter().any(|(view, _)| *view == fx.target(*id, pool).view))
                     .collect();
                 fx.presentation = Some(slot);
                 self.textures[fx.slot].effect = Some(vk::SceneEffect::new(
@@ -413,19 +430,25 @@ impl Group {
         }
         if !hidden_text && !mirror {
             self.quads[fx.quad].texture = fx.slot;
+            if fx.resume(&mut self.quads[fx.quad], self.scripts.is_some())
+                && let Some(scripts) = &mut self.scripts
+            {
+                scripts.pending = true;
+            }
         }
         fx.output = Some(source_id);
         if let Some(scene_targets) = scene_targets {
             for (buffer, target_id) in
                 [(CompositeBuffer::A, source_id), (CompositeBuffer::B, FxTargetId::Pong)]
             {
-                let target = fx.target(target_id, fx_scratch);
+                let target = fx.target(target_id, pool);
                 scene_targets.insert(
                     (fx.layer_id.clone(), buffer),
                     (target.view, target.sampler, target.extent),
                 );
             }
         }
+        fx.settle(&mut self.fx_pool);
         Ok(())
     }
 }

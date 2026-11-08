@@ -4893,11 +4893,10 @@ export function init() {
     if (!material || material.probeLevel !== 0.25) throw Error('material default');
     if (effect.getMaterial(1) !== null || effect.getMaterial(3) !== null) throw Error('material bounds');
     const second = effect.getMaterial(2);
-    second.setValue('u_probeLevel', 0.6);
-    if (second.getValue('u_probeLevel')[0] !== 0.6 ||
-        material.getValue('u_probeLevel') !== null) throw Error('material index');
-    effect.getMaterial().setValue('u_probeLevel', 0.4);
-    if (effect.getMaterial().getValue('u_probeLevel')[0] !== 0.4) throw Error('effect material cache');
+    second.probeLevel = 0.6;
+    if (second.probeLevel !== Math.fround(0.6) || material.probeLevel !== 0.25) throw Error('material index');
+    effect.getMaterial().probeLevel = 0.4;
+    if (effect.getMaterial().probeLevel !== Math.fround(0.4)) throw Error('effect material cache');
     return true;
 }
 export function update() {
@@ -4947,7 +4946,7 @@ void main(){gl_FragColor=vec4(u_probeLevel,0.0,0.0,1.0);}"#,
             host.take_commands(),
             [(2, 0.6), (0, 0.4)].map(|(pass, value)| ScriptCommand::Material {
                 id: "1".into(),
-                effect: Some((0, pass)),
+                effect: (0, pass),
                 name: "u_probeLevel".into(),
                 values: vec![value],
             })
@@ -4964,7 +4963,7 @@ void main(){gl_FragColor=vec4(u_probeLevel,0.0,0.0,1.0);}"#,
                     .into_iter()
                     .map(|pass| ScriptCommand::Material {
                         id: "1".into(),
-                        effect: Some((0, pass)),
+                        effect: (0, pass),
                         name: "u_probeLevel".into(),
                         values: vec![value],
                     })
@@ -4973,41 +4972,6 @@ void main(){gl_FragColor=vec4(u_probeLevel,0.0,0.0,1.0);}"#,
         }
         assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
     }
-}
-
-#[test]
-fn base_material_value_queue() {
-    let mut scene = json!({"objects":[{"id":1,"name":"target","image":"models/white.json",
-        "visible":{"value":true,"script":r"
-export function init() {
-    const material = thisLayer.getMaterial();
-    if (!material || material.getValue('g_Tint') !== null) throw Error('missing material');
-    material.setValue('', 1);
-    material.setValue('invalid', [1, NaN]);
-    material.setValue('g_Tint', new Vec3(0.1, 0.2, 0.3));
-    if (material.getValue('g_Tint')[1] !== 0.2) throw Error('material cache');
-    material.alpha = 0.5;
-    if (material.getValue('alpha')[0] !== 0.5) throw Error('material alias');
-}"}}]});
-    let mut host = image_host(&mut scene);
-    assert!(host.diagnostics.is_empty(), "{:?}", host.diagnostics);
-    assert_eq!(
-        host.take_commands(),
-        [
-            ScriptCommand::Material {
-                id: "1".into(),
-                effect: None,
-                name: "g_Tint".into(),
-                values: vec![0.1, 0.2, 0.3],
-            },
-            ScriptCommand::Material {
-                id: "1".into(),
-                effect: None,
-                name: "alpha".into(),
-                values: vec![0.5],
-            },
-        ]
-    );
 }
 
 #[test]
@@ -5128,7 +5092,7 @@ uniform vec3 u_Color; // {"material":"color","default":"0.1 0.2 0.3"}"#,
             host.take_commands(),
             [ScriptCommand::Material {
                 id: "1".into(),
-                effect: Some((0, 0)),
+                effect: (0, 0),
                 name: "u_Color".into(),
                 values: vec![0.2, 0.5, 0.8],
             }]

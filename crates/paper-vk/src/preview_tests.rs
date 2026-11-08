@@ -1,7 +1,16 @@
 use super::*;
 
 fn target(output: &str, fps: u32) -> StreamTarget {
-    StreamTarget { socket: -1, width: 16, height: 16, fps, output: output.into(), paused: false }
+    StreamTarget {
+        connector: output.into(),
+        logical: [16, 16],
+        socket: -1,
+        width: 16,
+        height: 16,
+        fps,
+        output: output.into(),
+        paused: false,
+    }
 }
 
 #[test]
@@ -26,7 +35,7 @@ fn output_pauses_only_touch_their_stream() {
 #[test]
 fn free_slots_short_circuit_the_wait() {
     let mut free = [[false; 3], [true, false, false]];
-    assert!(wait_any_free(&[-1, -1], &mut free, &[true, true], None, None).unwrap());
+    assert!(wait_any_free(&[-1, -1], &mut free, &[true, true], &[], None).unwrap());
 }
 
 #[test]
@@ -76,8 +85,13 @@ fn check_output_resume(delayed: bool, all_paused: bool) {
         resumed
     });
     let mut free = [[false; 3]];
-    let result =
-        wait_any_free(&[paper.as_raw_fd()], &mut free, &[!all_paused], ctl.wake_fd(), None);
+    let result = wait_any_free(
+        &[paper.as_raw_fd()],
+        &mut free,
+        &[!all_paused],
+        &ctl.wake_fd().into_iter().collect::<Vec<_>>(),
+        None,
+    );
     let _ = finished.send(());
     assert!(sender.join().unwrap(), "output resume stayed queued inside the slot wait");
     assert!(!result.unwrap());
@@ -168,7 +182,7 @@ fn hidden_free_slots_do_not_spin_or_release_a_blocked_visible_stream() {
             &[paper.as_raw_fd(), hidden_paper.as_raw_fd()],
             &mut free,
             &[true, false],
-            Some(wake.read_fd()),
+            &[wake.read_fd()],
             None,
         )
         .unwrap()
@@ -188,7 +202,7 @@ fn paused_stream_socket_closure_ends_the_wait() {
     let wake = paper_runtime::wake::make_pipe().unwrap();
     drop(plugin);
     let error =
-        wait_any_free(&[paper.as_raw_fd()], &mut [[true; 3]], &[false], Some(wake.read_fd()), None)
+        wait_any_free(&[paper.as_raw_fd()], &mut [[true; 3]], &[false], &[wake.read_fd()], None)
             .unwrap_err();
     assert!(error.to_string().contains("frame socket closed"));
 }
@@ -200,14 +214,17 @@ fn control_wakeup_preserves_a_queued_scene_swap() {
     let mut ctl = crate::ctl::Ctl::from_channel(receive, Some(wake.clone()), "", true, 0, false);
     send.send(serde_json::from_value(serde_json::json!({"to": "/next/scene"})).unwrap()).unwrap();
     wake.poke();
-    assert!(!wait_any_free(&[], &mut [], &[], ctl.wake_fd(), None).unwrap());
+    assert!(
+        !wait_any_free(&[], &mut [], &[], &ctl.wake_fd().into_iter().collect::<Vec<_>>(), None)
+            .unwrap()
+    );
     assert_eq!(ctl.poll().unwrap().to, "/next/scene");
 }
 
 #[test]
 fn unavailable_control_pipe_uses_a_bounded_sleep() {
     let started = Instant::now();
-    assert!(!wait_any_free(&[], &mut [], &[], None, None).unwrap());
+    assert!(!wait_any_free(&[], &mut [], &[], &[], None).unwrap());
     assert!(started.elapsed() >= std::time::Duration::from_millis(40));
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
@@ -223,7 +240,7 @@ fn transition_deadline_releases_an_unacknowledged_stream() {
             &[paper.as_raw_fd()],
             &mut [[false; 3]],
             &[true],
-            None,
+            &[],
             Some(started + std::time::Duration::from_millis(120)),
         )
         .unwrap()
@@ -237,7 +254,7 @@ fn transition_deadline_releases_an_unacknowledged_stream() {
 
 #[test]
 fn available_slot_can_present_the_final_frame_after_the_deadline() {
-    assert!(wait_any_free(&[-1], &mut [[true; 3]], &[true], None, Some(Instant::now())).unwrap());
+    assert!(wait_any_free(&[-1], &mut [[true; 3]], &[true], &[], Some(Instant::now())).unwrap());
 }
 
 #[test]
@@ -281,6 +298,8 @@ fn cpu_stream_child() -> Option<()> {
     let video = std::env::var_os(CPU_STREAM_VIDEO)?;
     let paused = std::env::var_os(CPU_STREAM_PAUSED).is_some();
     let stream = StreamTarget {
+        connector: String::new(),
+        logical: [16, 16],
         output: CPU_STREAM_OUTPUT.into(),
         ..StreamTarget::single(NO_SOCKET, CPU_STREAM_SIZE, CPU_STREAM_SIZE, CPU_STREAM_FPS, paused)
     };
@@ -442,4 +461,58 @@ fn cpu_stream_output_pause() {
     assert!(stream.holds(), "frames while output paused");
     stream.send(Some(CPU_STREAM_OUTPUT), false);
     stream.wait_frames(1);
+}
+
+#[test]
+fn widget_timer_wakes_pause() {
+    let wake = paper_runtime::wake::make_pipe().unwrap();
+    let timer = paper_runtime::wake::make_pipe().unwrap();
+    timer.poke();
+    let started = Instant::now();
+    assert!(!wait_any_free(&[], &mut [], &[], &[wake.read_fd(), timer.read_fd()], None).unwrap());
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn redraws_held_transition() -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let shared = crate::shared::test_device();
+    let (_plugin, paper) = std::os::unix::net::UnixStream::pair()?;
+    let stream = StreamTarget::single(paper.as_raw_fd(), 16, 16, 30, true);
+    let mut sink = build_sink(&shared, stream, (16, 16), Some((16, 16)))?;
+    let frame = |luma| {
+        let mut frame =
+            ffmpeg_the_third::frame::Video::new(ffmpeg_the_third::format::Pixel::NV12, 16, 16);
+        frame.data_mut(0).fill(luma);
+        frame.data_mut(1).fill(128);
+        frame
+    };
+    let old = frame(16);
+    let current = frame(235);
+    let upload = sink.renderer.create_upload_path(16, 16)?;
+    let from = sink.renderer.create_upload_path(16, 16)?;
+    sink.renderer.upload_video(&upload, &current)?;
+    sink.renderer.upload_video(&from, &old)?;
+    let source = Src::Views(upload.luma_view, upload.chroma_view);
+    let old_source = Src::Views(from.luma_view, from.chroma_view);
+    let readback = sink.renderer.create_readback_buf(16 * 16 * 4)?;
+    sink.draw(
+        0,
+        &source,
+        Some(Fade { source: &old_source, progress: 0.25, sand: None, effect: None }),
+    )?;
+    sink.renderer.read_export_to(&sink.exports[0], &readback, 16, 16)?;
+    let expected = unsafe { std::slice::from_raw_parts(readback.ptr, 16 * 16 * 4) }.to_vec();
+    sink.held = Some(crate::decode::retain_frame(&current)?);
+    sink.held_transition = Some((crate::decode::retain_frame(&old)?, 0.25));
+    sink.widgets.pending = true;
+    sink.redraw(true, None, None)?;
+    sink.renderer.read_export_to(&sink.exports[0], &readback, 16, 16)?;
+    let actual = unsafe { std::slice::from_raw_parts(readback.ptr, 16 * 16 * 4) };
+    assert_eq!(actual, expected);
+    assert!(actual[0] > 0 && actual[0] < 255);
+    sink.renderer.destroy_upload_path(upload);
+    sink.renderer.destroy_upload_path(from);
+    Ok(())
 }

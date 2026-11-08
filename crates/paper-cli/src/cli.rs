@@ -53,7 +53,14 @@ pub(crate) struct PresentPlasmaArgs {
     pub(crate) stream_fps: Option<u32>,
     #[arg(long)]
     pub(crate) stream_fd: Option<i32>,
-    #[arg(long = "stream", help = "fd=N,size=WxH,fps=N,output=NAME[,paused=1]; repeatable")]
+    #[arg(long)]
+    pub(crate) stream_output: Option<String>,
+    #[arg(long)]
+    pub(crate) stream_logical: Option<String>,
+    #[arg(
+        long = "stream",
+        help = "fd=N,size=WxH,fps=N,output=ID[,connector=NAME,logical=WxH,paused=1]; repeatable"
+    )]
     pub(crate) streams: Vec<String>,
     #[arg(long)]
     pub(crate) paused: bool,
@@ -102,7 +109,7 @@ pub(crate) struct ApplyArgs {
     pub(crate) idle_seconds: Option<u32>,
     #[arg(long)]
     pub(crate) properties: Option<String>,
-    #[arg(long, help = "Apply wallpapers together using JSON, @file, or - to read JSON from stdin", conflicts_with_all = ["output", "path", "kind", "engine", "frame_rate", "fill_mode", "mute", "volume", "layer", "transition", "transition_from", "effect", "duration_ms", "idle_seconds", "properties"])]
+    #[arg(long, help = "Apply wallpapers together using JSON, @file, or - to read JSON from stdin", conflicts_with_all = ["output", "path", "kind", "fill_mode", "mute", "volume", "layer", "transition", "transition_from", "effect", "duration_ms", "idle_seconds", "properties"])]
     pub(crate) manifest: Option<String>,
     #[arg(
         long,

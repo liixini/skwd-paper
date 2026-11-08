@@ -2,7 +2,6 @@ use super::{Renderer, SceneTarget, images};
 use anyhow::{Result, ensure};
 use ash::vk;
 
-const RGBA_COMPONENTS: usize = 4;
 const MIN_MIP_EXTENT: u32 = 16;
 
 #[cfg(test)]
@@ -33,24 +32,6 @@ impl SceneHistory {
             levels += 1;
         }
         levels
-    }
-
-    pub fn expected_bytes(extent: vk::Extent2D, format: vk::Format) -> Option<u64> {
-        let bytes = match format {
-            vk::Format::R8G8B8A8_UNORM => size_of::<[u8; RGBA_COMPONENTS]>(),
-            vk::Format::R16G16B16A16_SFLOAT => size_of::<[u16; RGBA_COMPONENTS]>(),
-            _ => return None,
-        } as u64;
-        if extent.width == 0 || extent.height == 0 {
-            return None;
-        }
-        let mut total = 0_u64;
-        for level in 0..Self::level_count(extent) {
-            let pixels = u64::from((extent.width >> level).max(1))
-                .checked_mul(u64::from((extent.height >> level).max(1)))?;
-            total = total.checked_add(pixels.checked_mul(bytes)?)?;
-        }
-        Some(total)
     }
 
     pub fn sample(&self) -> (vk::ImageView, vk::Sampler, vk::Extent2D) {

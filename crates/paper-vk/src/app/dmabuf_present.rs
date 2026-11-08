@@ -12,12 +12,80 @@ use crate::timing::{Pacer, due};
 use crate::{ctl, decode, vk, wayland};
 use anyhow::{Context, Result};
 use paper_geom::FillMode;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 type ExportRings = Vec<Vec<vk::ExportImage>>;
 type RenderTargetRings = Vec<Vec<vk::RenderTarget>>;
 const DIRECT_NV12_BUFFER_BASE: usize = 1usize << (usize::BITS - 1);
 const VAAPI_SURFACE_SLOTS: usize = 32;
+
+struct SharedLayout {
+    dims: Vec<(u32, u32)>,
+    indices: Vec<usize>,
+}
+
+fn shared_layout(dims: &[(u32, u32)], origins: &[Option<String>]) -> SharedLayout {
+    let mut keys = Vec::new();
+    let indices = dims
+        .iter()
+        .copied()
+        .zip(origins)
+        .map(|key| {
+            if let Some(index) = keys.iter().position(|existing| *existing == key) {
+                index
+            } else {
+                keys.push(key);
+                keys.len() - 1
+            }
+        })
+        .collect();
+    SharedLayout { dims: keys.into_iter().map(|(size, _)| size).collect(), indices }
+}
+
+fn load_origin(
+    renderer: &mut vk::Renderer,
+    path: &str,
+    dims: &[(u32, u32)],
+) -> Result<Option<RgbaStillSource>> {
+    if let Ok(mut decoder) = decode::still::StillDecoder::open(path, dims, fill_mode()) {
+        let (frame, _) = decoder.next()?;
+        return upload_rgba_still(renderer, &frame, dims);
+    }
+    let source = decode::probe_dims(path).context("transition origin dimensions")?;
+    let bounds = decode::still::texture_size(source, dims, fill_mode());
+    let image = decode::thumbnail::rgba_near(path, 0.0, bounds)?;
+    RgbaStillSource::upload(renderer, &decode::still::StillPixels { image, source }, dims).map(Some)
+}
+
+fn load_origins(
+    renderer: &mut vk::Renderer,
+    paths: &[Option<String>],
+    indices: &[usize],
+    dims: &[(u32, u32)],
+) -> BTreeMap<usize, RgbaStillSource> {
+    let mut sources = BTreeMap::new();
+    for (path, &index) in paths.iter().zip(indices) {
+        let Some(path) = path else { continue };
+        if sources.contains_key(&index) {
+            continue;
+        }
+        match load_origin(renderer, path, dims) {
+            Ok(Some(source)) => {
+                sources.insert(index, source);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%path, "video transition source unavailable: {error:#}"),
+        }
+    }
+    sources
+}
+
+fn clear_origins(renderer: &vk::Renderer, sources: &mut BTreeMap<usize, RgbaStillSource>) {
+    for source in std::mem::take(sources).into_values() {
+        renderer.destroy_scene_texture(source.texture);
+    }
+}
 
 struct SharedOutputState {
     distinct: Vec<(u32, u32)>,
@@ -26,6 +94,74 @@ struct SharedOutputState {
     uvs: Vec<[f32; 4]>,
     exports: ExportRings,
     rts: RenderTargetRings,
+}
+
+struct ShmPresentation {
+    rings: Vec<(Vec<*mut u8>, u32)>,
+    readbacks: Vec<vk::ReadbackBuf>,
+    _mappings: Vec<ShmMapping>,
+}
+
+struct SharedBuffers {
+    buffers: Vec<Vec<wayland_client::protocol::wl_buffer::WlBuffer>>,
+    shm: Option<ShmPresentation>,
+}
+
+struct RetiredOutputs {
+    generation: u64,
+    state: SharedOutputState,
+    memory: SharedBuffers,
+    hybrid: Option<HybridNv12>,
+}
+
+impl RetiredOutputs {
+    fn destroy(self, target: &mut wayland::Target) {
+        for buffer in self.memory.buffers.iter().flatten() {
+            target.retire_scene_buffer(buffer);
+        }
+        drop((self.state, self.memory, self.hybrid));
+    }
+}
+
+fn shared_buffers(
+    target: &mut wayland::Target,
+    state: &SharedOutputState,
+    dims: &[(u32, u32)],
+    count: usize,
+    shm: bool,
+) -> Result<SharedBuffers> {
+    if !shm {
+        return Ok(SharedBuffers {
+            buffers: create_buffers(target, dims, &state.exports, &state.ridx)?,
+            shm: None,
+        });
+    }
+    let readbacks = state
+        .distinct
+        .iter()
+        .zip(&state.renderers)
+        .map(|(&(width, height), renderer)| {
+            renderer.create_readback_buf(
+                u64::from(width) * u64::from(height) * std::mem::size_of::<u32>() as u64,
+            )
+        })
+        .collect::<Result<_>>()?;
+    let mut buffers = Vec::with_capacity(dims.len());
+    let mut rings = Vec::with_capacity(dims.len());
+    let mut mappings = Vec::with_capacity(dims.len());
+    for (index, &(width, height)) in dims.iter().enumerate() {
+        let (ring, pointers, stride) = target.create_shm_ring(index, width, height, count)?;
+        mappings.push(ShmMapping {
+            pointer: pointers[0],
+            bytes: stride as usize * height as usize * count,
+        });
+        buffers.push(ring);
+        rings.push((pointers, stride));
+    }
+    Ok(SharedBuffers {
+        buffers,
+        shm: Some(ShmPresentation { rings, readbacks, _mappings: mappings }),
+    })
 }
 
 struct HybridNv12 {
@@ -773,14 +909,14 @@ fn present_nv12(
 
 fn build_shared_outputs(
     sd: &shared::SharedDevice,
-    render_dims: &[(u32, u32)],
+    layout: SharedLayout,
     dec: Option<&decode::AnyDecoder>,
     n_exports: usize,
     shm_present: bool,
     dmabuf_formats: &[(u32, u64)],
     force_linear: bool,
 ) -> Result<SharedOutputState> {
-    let (distinct, ridx) = dedup_dims(render_dims);
+    let SharedLayout { dims: distinct, indices: ridx } = layout;
     let renderers: Vec<vk::Renderer> = distinct
         .iter()
         .map(|&(w, h)| {
@@ -965,7 +1101,7 @@ pub(super) fn run_nv12(
             }
             if target.take_resized()? {
                 drop(ctl);
-                return wayland::Target::reexec(&wayland::ReexecSource::Video(&path));
+                return target.reexec(&wayland::ReexecSource::Video(&path));
             }
             let was_paused = ctl.paused;
             if let Some(req) = ctl.poll() {
@@ -977,6 +1113,7 @@ pub(super) fn run_nv12(
                 retired.push(presentation);
                 continue 'source;
             }
+            target.sync_widgets(&mut ctl);
             crate::freeze::write_last_requested(&mut ctl, last_presented.as_ref())?;
             let idle_should_pause = target.app.idle && source_presented;
             if !idle_should_pause && idle_paused {
@@ -1192,6 +1329,28 @@ fn run_shared_dmabuf_with_readiness(
     let n_surf = target.surface_count();
     let dims: Vec<(u32, u32)> = (0..n_surf).map(|si| target.size_at(si)).collect();
     let first_source = start_fade.as_ref().map(|sf| sf.from.clone());
+    let origins = if start_fade.is_some() && !overlay {
+        std::env::var(paper_control::TRANSITION_SOURCES_ENV)
+            .ok()
+            .and_then(|raw| match serde_json::from_str::<BTreeMap<String, String>>(&raw) {
+                Ok(paths) => Some(paths),
+                Err(error) => {
+                    tracing::warn!("video transition sources invalid: {error:#}");
+                    None
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    let output_origins: Vec<Option<String>> = target
+        .app
+        .surfaces
+        .iter()
+        .map(|surface| {
+            origins.get(&surface.name).filter(|path| Some(*path) != first_source.as_ref()).cloned()
+        })
+        .collect();
     let dec = open_shared_decoder(
         &pattern,
         first_source.as_deref().unwrap_or(video),
@@ -1224,85 +1383,49 @@ fn run_shared_dmabuf_with_readiness(
     let mut render_dims =
         xr_render_dims(&dims, reuse_source_dims, reuse_mode.as_deref(), reuse_supported, span);
     let mut reuse_export = render_dims != dims || (span.is_some() && reuse_supported);
-    let mut output_state = build_shared_outputs(
-        sd,
-        &render_dims,
-        dec.as_ref(),
-        n_exports,
-        shm_present,
-        &dmabuf_formats,
-        force_linear_xr24,
-    )?;
+    let build_outputs = |sizes: &[(u32, u32)], shm, linear| {
+        build_shared_outputs(
+            sd,
+            shared_layout(sizes, &output_origins),
+            dec.as_ref(),
+            n_exports,
+            shm,
+            &dmabuf_formats,
+            linear,
+        )
+    };
+    let mut output_state = build_outputs(&render_dims, shm_present, force_linear_xr24)?;
     if !shm_present {
         let mut accepted = probe_shared_output(target, &output_state)?;
         if !accepted && reuse_export && span.is_none() {
             tracing::info!("skwd-wall-vk: compositor rejected shared export, using native extents");
             render_dims.clone_from(&dims);
             reuse_export = false;
-            output_state = build_shared_outputs(
-                sd,
-                &render_dims,
-                dec.as_ref(),
-                n_exports,
-                false,
-                &dmabuf_formats,
-                force_linear_xr24,
-            )?;
+            output_state = build_outputs(&render_dims, false, force_linear_xr24)?;
             accepted = probe_shared_output(target, &output_state)?;
         }
         let linear_available = xr24_export_modifiers(&dmabuf_formats, true).1.is_some();
         if !accepted && !force_linear_xr24 && linear_available {
             tracing::info!("skwd-wall-vk: compositor rejected tiled dmabuf import, trying linear");
             force_linear_xr24 = true;
-            output_state = build_shared_outputs(
-                sd,
-                &render_dims,
-                dec.as_ref(),
-                n_exports,
-                false,
-                &dmabuf_formats,
-                force_linear_xr24,
-            )?;
+            output_state = build_outputs(&render_dims, false, force_linear_xr24)?;
             accepted = probe_shared_output(target, &output_state)?;
         }
         if !accepted {
             tracing::info!("skwd-wall-vk: compositor rejected dmabuf import, using shm present");
             shm_present = true;
-            output_state = build_shared_outputs(
-                sd,
-                &render_dims,
-                dec.as_ref(),
-                n_exports,
-                true,
-                &dmabuf_formats,
-                force_linear_xr24,
-            )?;
+            output_state = build_outputs(&render_dims, true, force_linear_xr24)?;
         }
     }
-    let SharedOutputState { distinct, ridx, mut renderers, mut uvs, mut exports, mut rts } =
+    let SharedBuffers { mut buffers, mut shm } =
+        shared_buffers(target, &output_state, &render_dims, n_exports, shm_present)?;
+    let SharedOutputState { mut distinct, mut ridx, mut renderers, mut uvs, mut exports, mut rts } =
         output_state;
-    let groups: Vec<Vec<usize>> =
+    let mut groups: Vec<Vec<usize>> =
         (0..distinct.len()).map(|ri| (0..n_surf).filter(|&si| ridx[si] == ri).collect()).collect();
     if exports.first().and_then(|ring| ring.first()).is_some_and(|export| export.direct_render) {
         tracing::info!("skwd-wall-vk: direct render into exports (no copy pass)");
     }
-    let (mut buffers, shm) = if shm_present {
-        let rbs: Vec<vk::ReadbackBuf> = distinct
-            .iter()
-            .enumerate()
-            .map(|(ri, &(w, h))| renderers[ri].create_readback_buf(u64::from(w) * u64::from(h) * 4))
-            .collect::<Result<_>>()?;
-        let mut bufs = Vec::with_capacity(n_surf);
-        let mut rings = Vec::with_capacity(n_surf);
-        for (si, &(w, h)) in render_dims.iter().enumerate() {
-            let (ring, ptrs, stride) = target.create_shm_ring(si, w, h, n_exports)?;
-            bufs.push(ring);
-            rings.push((ptrs, stride));
-        }
-        (bufs, Some((rings, rbs)))
-    } else {
-        (create_buffers(target, &render_dims, &exports, &ridx)?, None)
-    };
     let hybrid_allowed = !crate::surface::needs_shader()
         && std::env::var("SKWD_VK_HYBRID_NV12").as_deref() != Ok("0")
         && pattern.is_none()
@@ -1407,13 +1530,18 @@ fn run_shared_dmabuf_with_readiness(
         Some(state) => upload_rgba_still(&mut renderers[0], &state.cur.0, &distinct)?,
         None => None,
     };
+    let mut origin_textures = if fade.is_some() {
+        load_origins(&mut renderers[0], &output_origins, &ridx, &distinct)
+    } else {
+        BTreeMap::new()
+    };
     if let Some(fade) = &mut fade {
         super::drawing::prepare(&mut renderers[0], fade)?;
         ctl.swap_audio(&fade.path, !fade.still_b);
         prepare_transition_pipelines(
             &mut renderers,
             fade,
-            fade_rgba_a.is_some() || fade_rgba_b.is_some(),
+            fade_rgba_a.is_some() || fade_rgba_b.is_some() || !origin_textures.is_empty(),
         )?;
         // Image decoding/upload is setup work, not part of the authored transition duration.
         fade.t0 = Instant::now();
@@ -1457,13 +1585,95 @@ fn run_shared_dmabuf_with_readiness(
     let mut last_presented_mix = None;
     let mut repaint = false;
     let mut last_presented: Option<ffmpeg_the_third::frame::Video> = None;
+    let mut retired_outputs: Vec<RetiredOutputs> = Vec::new();
+    let steady_origins = vec![None; n_surf];
     loop {
+        let mut retired = 0;
+        while retired < retired_outputs.len() {
+            if target.scene_buffers_released(retired_outputs[retired].generation) {
+                retired_outputs.swap_remove(retired).destroy(target);
+            } else {
+                retired += 1;
+            }
+        }
+        if fade.is_none()
+            && shared_layout(&render_dims, &steady_origins).dims.len() < distinct.len()
+        {
+            wait_render_all(&mut renderers, &pattern)?;
+            let mut replacement = build_shared_outputs(
+                sd,
+                shared_layout(&render_dims, &steady_origins),
+                None,
+                n_exports,
+                shm_present,
+                &dmabuf_formats,
+                force_linear_xr24,
+            )?;
+            let frame = pending
+                .as_ref()
+                .map(|(frame, _)| frame.video())
+                .or(last_presented.as_ref())
+                .context("coalesce before video presentation")?;
+            replacement.uvs = replacement
+                .distinct
+                .iter()
+                .map(|&(width, height)| mode_uv(frame.width(), frame.height(), width, height))
+                .collect();
+            if let Some(source) = &mut steady_rgba {
+                source.uvs = replacement
+                    .distinct
+                    .iter()
+                    .map(|size| source.uvs[distinct.iter().position(|old| old == size).unwrap()])
+                    .collect();
+            }
+            target.stage_scene_buffers(true);
+            let memory = shared_buffers(target, &replacement, &render_dims, n_exports, shm_present);
+            target.stage_scene_buffers(false);
+            let memory = memory?;
+            let generation = target.rotate_scene_buffers(&buffers);
+            let old = SharedOutputState {
+                distinct: std::mem::replace(&mut distinct, replacement.distinct),
+                ridx: std::mem::replace(&mut ridx, replacement.ridx),
+                renderers: std::mem::replace(&mut renderers, replacement.renderers),
+                uvs: std::mem::replace(&mut uvs, replacement.uvs),
+                exports: std::mem::replace(&mut exports, replacement.exports),
+                rts: std::mem::replace(&mut rts, replacement.rts),
+            };
+            retired_outputs.push(RetiredOutputs {
+                generation,
+                state: old,
+                memory: SharedBuffers {
+                    buffers: std::mem::replace(&mut buffers, memory.buffers),
+                    shm: std::mem::replace(&mut shm, memory.shm),
+                },
+                hybrid: hybrid.take(),
+            });
+            groups = (0..distinct.len())
+                .map(|index| (0..n_surf).filter(|&output| ridx[output] == index).collect())
+                .collect();
+            chosen = vec![None; distinct.len()];
+            init_free_buffers(target, n_exports);
+            presenting_nv12 = false;
+            hybrid_rebuild_failed = None;
+            xr_ready = true;
+            repaint = true;
+            for (index, &(width, height)) in render_dims.iter().enumerate() {
+                if !target.app.surfaces[index].closed {
+                    if reuse_export {
+                        target.set_viewport_cover(index, width, height)?;
+                    } else {
+                        target.set_viewport_dst(index)?;
+                    }
+                }
+            }
+            tracing::info!("video transition origins coalesced: {} steady groups", distinct.len());
+        }
         if target.app.closed {
             return Ok(());
         }
         if target.take_resized()? {
             drop(ctl);
-            return wayland::Target::reexec(&wayland::ReexecSource::Video(&active_source));
+            return target.reexec(&wayland::ReexecSource::Video(&active_source));
         }
         if presenting_nv12
             && xr_ready
@@ -1491,6 +1701,7 @@ fn run_shared_dmabuf_with_readiness(
                 if let Some(slot) = sw_b.take() {
                     slot.destroy(&renderers[0]);
                 }
+                clear_origins(&renderers[0], &mut origin_textures);
                 old_pace = None;
                 queued_old = None;
                 last_fade_render = None;
@@ -1513,6 +1724,7 @@ fn run_shared_dmabuf_with_readiness(
                 &dims,
             ));
         }
+        target.sync_widgets(&mut ctl);
         let photo_changed = if let Some(path) = ctl.drawing_photo.take()
             && fade.as_ref().is_some_and(|active| active.drawing.is_some())
             && let Some(photo) = fade_rgba_b.as_mut()
@@ -1582,7 +1794,11 @@ fn run_shared_dmabuf_with_readiness(
                     ridx[si],
                     slot.as_ref(),
                     sw_b.as_ref(),
-                    fade_rgba_a.as_ref().or(steady_rgba.as_ref()),
+                    RgbaOrigins {
+                        shared: fade_rgba_a.as_ref().or(steady_rgba.as_ref()),
+                        outputs: &origin_textures,
+                    }
+                    .get(ridx[si]),
                     fade_rgba_b.as_ref(),
                 )?;
                 let pixels = read_rgba_export(renderer, &export, size)?;
@@ -2028,10 +2244,13 @@ fn run_shared_dmabuf_with_readiness(
                 frames,
                 sw_a.as_ref(),
                 sw_b.as_ref(),
-                if fading {
-                    fade_rgba_a.as_ref().or(steady_rgba.as_ref())
-                } else {
-                    steady_rgba.as_ref()
+                &RgbaOrigins {
+                    shared: if fading {
+                        fade_rgba_a.as_ref().or(steady_rgba.as_ref())
+                    } else {
+                        steady_rgba.as_ref()
+                    },
+                    outputs: &origin_textures,
                 },
                 fading.then_some(fade_rgba_b.as_ref()).flatten(),
             )?;
@@ -2043,7 +2262,7 @@ fn run_shared_dmabuf_with_readiness(
         let presentation_checkpoint = target.presentation_checkpoint();
         let committed = if fading && !using_nv12 {
             wait_render_all(&mut renderers, &pattern)?;
-            if let Some((rings, rbs)) = &shm {
+            if let Some(ShmPresentation { rings, readbacks: rbs, .. }) = &shm {
                 copy_exports_to_shm(
                     &mut renderers,
                     &exports,
@@ -2066,7 +2285,7 @@ fn run_shared_dmabuf_with_readiness(
             } else {
                 wait_render_all(&mut renderers, &pattern)?;
             }
-            if !using_nv12 && let Some((rings, rbs)) = &shm {
+            if !using_nv12 && let Some(ShmPresentation { rings, readbacks: rbs, .. }) = &shm {
                 copy_exports_to_shm(
                     &mut renderers,
                     &exports,
@@ -2114,7 +2333,8 @@ fn run_shared_dmabuf_with_readiness(
             ctl.set_paused(true);
         }
         if ready && transition_held {
-            hold_transition(&mut ctl, &mut fade, || {
+            hold_transition(&mut ctl, &mut fade, |ctl| {
+                target.sync_widgets(ctl);
                 if !target.app.closed {
                     target.dispatch_wait_events(
                         Instant::now() + std::time::Duration::from_secs(30),
@@ -2152,6 +2372,7 @@ fn run_shared_dmabuf_with_readiness(
             &mut still,
         );
         if finishing_fade {
+            clear_origins(&renderers[0], &mut origin_textures);
             for renderer in &mut renderers {
                 renderer.clear_transition()?;
             }

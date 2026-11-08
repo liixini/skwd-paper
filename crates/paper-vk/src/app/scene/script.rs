@@ -41,11 +41,20 @@ fn puppet_attachments(puppets: &[super::PuppetGroup]) -> paper_scene::model::Att
     attachments
 }
 
-fn script_update_due(startup_compose: &mut bool, time: f32) -> bool {
-    if *startup_compose && time <= 0.0 {
-        return false;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Startup {
+    Pending,
+    Shown(f32),
+    Running,
+}
+
+fn script_update_due(startup: &mut Startup, time: f32) -> bool {
+    match *startup {
+        Startup::Pending => *startup = Startup::Shown(time),
+        Startup::Shown(shown) if time == shown => return false,
+        Startup::Shown(_) => *startup = Startup::Running,
+        Startup::Running => {}
     }
-    *startup_compose = false;
     true
 }
 
@@ -68,7 +77,7 @@ pub(super) struct Scripts {
     #[cfg(test)]
     text_upload_error: Option<anyhow::Error>,
     spare_backdrops: std::collections::BTreeMap<usize, usize>,
-    pending: bool,
+    pub(super) pending: bool,
     images: std::collections::BTreeMap<usize, (usize, usize)>,
     particles: std::collections::BTreeMap<usize, String>,
     spare_images: Vec<(usize, usize)>,
@@ -77,7 +86,7 @@ pub(super) struct Scripts {
     discard_warned: std::collections::HashSet<usize>,
     spare_model_textures: Vec<usize>,
     order: Vec<(Option<usize>, usize)>,
-    pub(super) startup_compose: bool,
+    pub(super) startup: Startup,
     particle_state_ready: bool,
 }
 
@@ -133,7 +142,6 @@ impl Scripts {
                     .then_some((slot, (quad, slots[quad])))
             })
             .collect();
-        let startup_compose = host.is_some();
         Some(Self {
             host,
             native,
@@ -154,7 +162,7 @@ impl Scripts {
             discard_warned: std::collections::HashSet::new(),
             spare_model_textures: Vec::new(),
             order,
-            startup_compose,
+            startup: Startup::Pending,
             particle_state_ready: false,
         })
     }
@@ -460,7 +468,7 @@ impl Group {
                 Vec::new()
             };
             host.pointer(pointer, self.mouse.buttons, hits)?;
-            if script_update_due(&mut scripts.startup_compose, time) {
+            if script_update_due(&mut scripts.startup, time) {
                 changed |= host.tick(time, dt, self.mouse.position)?;
             }
         }
@@ -552,32 +560,16 @@ impl Group {
                         }
                     }
                     paper_scene::script::ScriptCommand::Material { id, effect, name, values } => {
-                        if let Some((effect, source)) = effect {
-                            if let Some(fx) = self.fx.iter_mut().find(|fx| fx.layer_id == id)
-                                && let Some(index) = fx
-                                    .passes
-                                    .iter()
-                                    .position(|pass| pass.source() == Some((effect, source)))
-                            {
-                                let resolved = fx.passes[index].apply_script_values(
-                                    &serde_json::json!({(name): values}),
-                                    &std::collections::BTreeMap::new(),
-                                );
-                                fx.material_values[index].extend(resolved);
-                                changed = true;
-                            }
-                        } else if let Some(quad) =
-                            scripts.layouts.iter().position(|layer| layer.id == id)
-                            && let Some(resources) = host.image_resources()
+                        if let Some(fx) = self.fx.iter_mut().find(|fx| fx.layer_id == id)
+                            && let Some(index) =
+                                fx.passes.iter().position(|pass| pass.source() == Some(effect))
                         {
-                            changed |= self.material_value(
-                                quad,
-                                &name,
-                                &values,
-                                &host.scene,
-                                &host.properties,
-                                &resources,
-                            )?;
+                            let resolved = fx.passes[index].apply_script_values(
+                                &serde_json::json!({(name): values}),
+                                &std::collections::BTreeMap::new(),
+                            );
+                            fx.material_values[index].extend(resolved);
+                            changed = true;
                         }
                     }
                     paper_scene::script::ScriptCommand::Sound { id, op } => {
@@ -777,9 +769,7 @@ impl Group {
                         wanted,
                         object,
                         properties,
-                        self.text_budget(
-                            resources.as_ref().map_or(0, |resources| resources.revision()),
-                        ),
+                        resources.as_ref().map_or(0, |resources| resources.revision()),
                     )
                 })
             {
@@ -805,23 +795,13 @@ impl Group {
             if let (Some(resources), Some(object_slot)) = (&resources, object_slot)
                 && resources.replacement(object_slot, payload).is_err()
             {
-                text.reject(wanted, Some(self.text_budget(resources.revision())));
+                text.reject(wanted, Some(resources.revision()));
                 if let Some(style) = previous_style {
                     text.restore(style);
                 }
                 continue;
             }
             let texture = &rendered.texture;
-            let fits = self.text_effect_fits(*index, (texture.width, texture.height));
-            if !matches!(fits, Ok(true)) {
-                if let Some(style) = previous_style {
-                    text.restore(style);
-                }
-                fits?;
-                let revision = resources.as_ref().map_or(0, |resources| resources.revision());
-                text.reject(wanted, Some(self.text_budget(revision)));
-                continue;
-            }
             let upload = |renderer: &mut crate::vk::Renderer| {
                 renderer.create_text_texture(
                     &texture.pixels,
@@ -844,11 +824,13 @@ impl Group {
                 }
             };
             if let Err(error) = self.resize_text_effect(*index, (texture.width, texture.height)) {
+                tracing::warn!("skwd-wall-vk: text effect resize failed: {error:#}");
                 self.renderer.destroy_scene_texture(replacement);
+                text.reject(wanted, resources.as_ref().map(|resources| resources.revision()));
                 if let Some(style) = previous_style {
                     text.restore(style);
                 }
-                return Err(error);
+                continue;
             }
             if let (Some(resources), Some(object_slot)) = (&resources, object_slot)
                 && let Err(error) = resources.replace(object_slot, payload)

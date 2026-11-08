@@ -4,7 +4,7 @@ use crate::app::scene::effect_space_tests::PASS_VERTEX;
 use crate::app::scene::tests::{
     MESH_MATERIAL, particle_clock, particle_package, sound_package, triangle_mdl,
 };
-use crate::app::scene::{FillMode, build_group};
+use crate::app::scene::{FillMode, Starvation, build_group};
 use serde_json::json;
 
 const SIZE: u32 = 64;
@@ -42,6 +42,10 @@ fn scene(height: f32, objects: &serde_json::Value) -> paper_scene::model::SceneM
         ("materials/invert.json", br#"{"passes":[{"shader":"invert"}]}"#),
         ("shaders/invert.vert", PASS_VERTEX),
         ("shaders/invert.frag", b"uniform sampler2D g_Texture0;\nvarying vec2 v_TexCoord;\nvoid main(){gl_FragColor=vec4(1.0-texSample2D(g_Texture0,v_TexCoord).rgb,1.0);}"),
+        ("effects/peek.json", br#"{"passes":[{"material":"materials/peek.json"}]}"#),
+        ("materials/peek.json", br#"{"passes":[{"shader":"peek","textures":["_rt_Reflection"]}]}"#),
+        ("shaders/peek.vert", PASS_VERTEX),
+        ("shaders/peek.frag", b"uniform sampler2D g_Texture0;\nuniform float g_Time;\nvarying vec2 v_TexCoord;\nvoid main(){gl_FragColor=texSample2D(g_Texture0,v_TexCoord)+vec4(g_Time*0.0);}"),
         particle("materials/p.json"),
         particle("materials/mask.tex"),
         particle("shaders/particle.vert"),
@@ -159,7 +163,7 @@ fn runtime_model_samples() {
     let source = json!({"id":2,"image":"models/source.json","size":"1 1","origin":{"script":script,"value":"0 0 0"}});
     let mut model = scene(0.0, &json!([source]));
     let mut group = build_group(&shared, &mut model, true, &[(SIZE, SIZE)], FillMode::Fit).unwrap();
-    assert!(group.reflection.is_none());
+    assert!(group.reflection.is_some());
     assert_eq!(group.unmirrored_layers(), 1);
     let green = |group: &mut Group, time: f32| {
         group.compose(time, 0.25).unwrap();
@@ -272,6 +276,79 @@ fn fullscreen_effects_rerun() {
         pixels.chunks_exact(4).filter(|pixel| pixel[0] < 50 && pixel[1] > 200 && pixel[2] > 200);
     assert!(cyan.count() > 0);
     assert!(pixels.chunks_exact(4).all(|pixel| pixel[1] > 200));
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn starved_mirror_falls_back() {
+    let shared = crate::shared::test_device();
+    let reader = json!({"id":1,"model":"models/reader.mdl"});
+    let source =
+        json!({"id":2,"image":"models/source.json","origin":"0 0 0","size":"1 1","scale":"1 1 1"});
+    let post = json!({"id":3,"image":"models/util/fullscreenlayer.json","effects":[{"file":"effects/invert.json"}]});
+    let mut model = scene(0.0, &json!([reader, source, post]));
+    let mut group = build_group(&shared, &mut model, true, &[(SIZE, SIZE)], FillMode::Fit).unwrap();
+    group.compose(0.0, 0.0).unwrap();
+    assert_eq!(group.mirror_fx.len(), 1);
+    group.mirror_fx[0].starved = Some(Starvation { wait: 2, backoff: 2 });
+    group.reflection.as_mut().unwrap().ready = false;
+    group.compose(1.0, 1.0).unwrap();
+    assert!(group.mirror_fx[0].output.is_none());
+    let target = group.reflection.as_ref().unwrap().target();
+    let pixels = group.renderer.read_scene_target(target).unwrap().2;
+    group.destroy();
+    let cyan = pixels.chunks_exact(4).filter(|pixel| pixel[0] < 50 && pixel[1] > 200);
+    assert_eq!(cyan.count(), 0);
+    assert!(red_pixels(&pixels) > 0);
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn dropped_twin_trims_pool() {
+    let shared = crate::shared::test_device();
+    let targets = vk::Renderer::scene_target_live_allocations();
+    let reader = json!({"id":1,"model":"models/reader.mdl"});
+    let source =
+        json!({"id":2,"image":"models/source.json","origin":"0 0 0","size":"1 1","scale":"1 1 1"});
+    let post = json!({"id":3,"image":"models/util/fullscreenlayer.json","effects":[{"file":"effects/invert.json"}]});
+    let mut model = scene(0.0, &json!([reader, source, post]));
+    let mut group = build_group(&shared, &mut model, true, &[(SIZE, SIZE)], FillMode::Fit).unwrap();
+    group.compose(0.0, 0.0).unwrap();
+    assert_eq!(group.mirror_fx.len(), 1);
+    let pooled = group.fx_pool.len();
+    let live = vk::Renderer::scene_target_live_allocations();
+    group.drop_twin(group.mirror_fx[0].quad);
+    assert!(group.mirror_fx.is_empty());
+    let trimmed = group.fx_pool.len();
+    assert!(trimmed < pooled, "pool {trimmed}");
+    assert_eq!(vk::Renderer::scene_target_live_allocations(), live - (pooled - trimmed));
+    group.compose(1.0, 1.0).unwrap();
+    assert_eq!(group.fx_pool.len(), trimmed);
+    group.destroy();
+    assert_eq!(vk::Renderer::scene_target_live_allocations(), targets);
+}
+
+#[test]
+#[ignore = "requires Vulkan"]
+fn reader_outputs_survive() {
+    let shared = crate::shared::test_device();
+    let reader = json!({"id":1,"model":"models/reader.mdl"});
+    let peek = json!({"id":2,"image":"models/plain.json","origin":"0 0.5 0","size":"1 1","scale":"1 1 1","effects":[{"file":"effects/peek.json"}]});
+    let source = json!({"id":3,"image":"models/source.json","origin":"0 0 0","size":"1 1","scale":"1 1 1","effects":[{"file":"effects/invert.json"}]});
+    let mut model = scene(0.0, &json!([reader, peek, source]));
+    let mut group = build_group(&shared, &mut model, true, &[(SIZE, SIZE)], FillMode::Fit).unwrap();
+    let (order, split) = group.reflection_readers().unwrap();
+    let fx = order[split];
+    group.compose(0.0, 0.0).unwrap();
+    let held: Vec<_> = group.fx[fx]
+        .target_ids()
+        .filter(|id| group.fx[fx].held(*id))
+        .filter_map(|id| group.fx[fx].target_storage(id).lease())
+        .collect();
+    assert!(!held.is_empty());
+    group.compose(1.0, 1.0).unwrap();
+    assert!(held.iter().all(|lease| group.fx_pool.target(*lease).is_some()));
+    group.destroy();
 }
 
 #[test]

@@ -1,6 +1,8 @@
-use paper_control::Labels;
+use paper_control::{Face, Labels};
 
+use crate::canvas::Canvas;
 use crate::lettering::Lettering;
+use crate::place::Place;
 use crate::tones::Tones;
 
 const MINUTES_PER_DAY: f32 = 1440.0;
@@ -40,6 +42,15 @@ pub struct Scene<'a> {
 }
 
 impl Scene<'_> {
+    pub fn paint(&self, face: Face, place: Place, cut: Option<&[u8]>) -> Canvas {
+        let mut canvas = Canvas::window(place.size, place.ink, place.shift);
+        crate::draw(face, &mut canvas, self);
+        if let Some(cut) = cut {
+            canvas.occlude(cut);
+        }
+        canvas
+    }
+
     pub(crate) fn short_date(&self) -> String {
         let moment = self.moment;
         format!(

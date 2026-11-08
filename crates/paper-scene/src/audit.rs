@@ -24,8 +24,6 @@ const ROUTE_UNKNOWN: &str = "unknown";
 const OUTCOME_RUNTIME_VIDEO: &str = "runtime-video-decode-required";
 const OUTCOME_RGBA_DECODE: &str = "rejected: rgba decode";
 const OUTCOME_DECODED: &str = "decoded";
-const STATUS_RUNTIME_CHECK: &str = "runtime-check-required";
-const OUTCOME_UNMEASURED: &str = "unmeasured";
 
 #[derive(Serialize)]
 struct EvaluatedReport {
@@ -36,7 +34,6 @@ struct EvaluatedReport {
     loader_reductions: Vec<String>,
     strict_loader_rejects: bool,
     texture_formats: Vec<TextureOutcome>,
-    effect_budget: BudgetOutcome,
 }
 
 #[derive(Serialize)]
@@ -47,13 +44,6 @@ struct TextureOutcome {
     effective_route: &'static str,
     free_image_format: Option<i32>,
     outcome: String,
-}
-
-#[derive(Serialize)]
-struct BudgetOutcome {
-    status: &'static str,
-    reason: &'static str,
-    outcome: &'static str,
 }
 
 #[derive(Default)]
@@ -302,11 +292,6 @@ pub fn evaluate_scene(dir: &Path) -> Result<Value> {
         .filter(|entry| entry.path.ends_with(TEX_EXTENSION))
         .map(|entry| texture_outcome(&pkg, entry))
         .collect();
-    let budget = BudgetOutcome {
-        status: STATUS_RUNTIME_CHECK,
-        reason: crate::capability::EFFECT_CHAIN_BUDGET_GAP,
-        outcome: OUTCOME_UNMEASURED,
-    };
     Ok(serde_json::to_value(EvaluatedReport {
         schema: EVALUATED_SCHEMA,
         scene: dir.to_path_buf(),
@@ -315,7 +300,6 @@ pub fn evaluate_scene(dir: &Path) -> Result<Value> {
         strict_loader_rejects: !reductions.is_empty(),
         loader_reductions: reductions,
         texture_formats: formats,
-        effect_budget: budget,
     })?)
 }
 

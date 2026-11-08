@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 pub const DEFAULT_DURATION_MS: u64 = 600;
+pub const TRANSITION_SOURCES_ENV: &str = "SKWD_PAPER_TRANSITION_SOURCES";
 pub const DEFAULT_EFFECT: &str = "fade";
 pub const MIN_DURATION_MS: u64 = 50;
 pub const MAX_DURATION_MS: u64 = 10_000;

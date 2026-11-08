@@ -21,7 +21,9 @@ mod scene_thumbnail;
 mod socket;
 mod stdin_reader;
 mod still_command;
+pub mod stream;
 pub mod transitions;
+pub use transitions::TRANSITION_SOURCES_ENV;
 pub mod we_project;
 mod widget;
 

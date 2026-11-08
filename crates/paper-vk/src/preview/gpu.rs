@@ -35,7 +35,7 @@ pub(crate) fn stream(preview: &Preview, socket: RawFd) -> Result<()> {
             &[socket],
             std::slice::from_mut(&mut free),
             &[true],
-            None,
+            &[],
             Some(started + duration),
         )? {
             consumer_wait += wait_started.elapsed();

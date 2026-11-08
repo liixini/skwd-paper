@@ -1,4 +1,5 @@
 pub(crate) mod gpu;
+pub(crate) mod widgets;
 
 use std::io::Write;
 use std::os::fd::RawFd;
@@ -9,6 +10,7 @@ use anyhow::{Context, Result};
 use crate::vk::Src;
 
 const MIN_SIDE: u32 = 16;
+const FADE_EASE: [f32; 2] = [3.0, -2.0];
 const MIN_DURATION_MS: u64 = 100;
 const LOOP_PAUSE_MS: u64 = 600;
 
@@ -261,16 +263,26 @@ pub(crate) fn video_stream(path: &str, stream: &StreamTarget, write_header: bool
     let mut ctl = crate::ctl::Ctl::start(path, true, 0, false);
     ctl.route_output_pauses();
     ctl.set_paused(stream.paused);
+    let mut widgets = widgets::Widgets::default();
+    let mut held_frame = None;
     loop {
         let _ = ctl.poll();
         route_pauses(&mut ctl, &mut targets);
-        if ctl.paused && !first_frame {
+        widgets.sync(ctl.take_widgets().as_ref(), stream, &mut renderer)?;
+        if ctl.paused && !first_frame && !widgets.pending {
             let held = Instant::now();
-            wait_any_free(&[], &mut [], &[], ctl.wake_fd(), None)?;
+            let wake: Vec<_> = ctl.wake_fd().into_iter().chain(widgets.wake_fd()).collect();
+            wait_any_free(&[], &mut [], &[], &wake, None)?;
             started += held.elapsed();
             continue;
         }
-        let (frame, pts) = decoder.next()?;
+        let (frame, pts) = if ctl.paused
+            && let Some((frame, pts)) = &held_frame
+        {
+            (crate::decode::retain_frame(frame)?, *pts)
+        } else {
+            decoder.next()?
+        };
         if last_pts.is_some_and(|last| pts < last) {
             first_pts = None;
             next_emit = 0.0;
@@ -279,7 +291,7 @@ pub(crate) fn video_stream(path: &str, stream: &StreamTarget, write_header: bool
         last_pts = Some(pts);
         let origin = *first_pts.get_or_insert(pts);
         let relative = (pts - origin).max(0.0);
-        if relative + frame_step * 0.25 < next_emit {
+        if !ctl.paused && relative + frame_step * 0.25 < next_emit {
             continue;
         }
         next_emit = relative + frame_step;
@@ -288,13 +300,7 @@ pub(crate) fn video_stream(path: &str, stream: &StreamTarget, write_header: bool
             std::thread::sleep(delay);
         }
         let source = if let Some(upload) = &upload {
-            renderer.upload_nv12(
-                upload,
-                frame.data(0),
-                frame.stride(0),
-                frame.data(1),
-                frame.stride(1),
-            )?;
+            renderer.upload_video(upload, &frame)?;
             Src::Views(upload.luma_view, upload.chroma_view)
         } else {
             Src::Avvk(&frame)
@@ -313,6 +319,8 @@ pub(crate) fn video_stream(path: &str, stream: &StreamTarget, write_header: bool
         if output.write_all(&rgba).is_err() || output.flush().is_err() {
             return Ok(());
         }
+        held_frame = Some((frame, pts));
+        widgets.pending = false;
         if first_frame {
             paper_runtime::plasma::frame_ready()?;
             first_frame = false;
@@ -410,6 +418,8 @@ pub(crate) struct StreamTarget {
     pub height: u32,
     pub fps: u32,
     pub output: String,
+    pub connector: String,
+    pub logical: [u32; 2],
     pub paused: bool,
 }
 
@@ -419,7 +429,16 @@ impl StreamTarget {
     }
 
     pub(crate) fn single(socket: RawFd, width: u32, height: u32, fps: u32, paused: bool) -> Self {
-        Self { socket, width, height, fps, output: String::new(), paused }
+        Self {
+            socket,
+            width,
+            height,
+            fps,
+            output: String::new(),
+            connector: String::new(),
+            logical: [width, height],
+            paused,
+        }
     }
 }
 
@@ -463,7 +482,7 @@ pub(crate) fn wait_any_free(
     sockets: &[RawFd],
     free: &mut [[bool; 3]],
     active: &[bool],
-    wake: Option<RawFd>,
+    wake: &[RawFd],
     deadline: Option<Instant>,
 ) -> Result<bool> {
     loop {
@@ -475,15 +494,13 @@ pub(crate) fn wait_any_free(
             .iter()
             .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
             .collect();
-        if let Some(fd) = wake {
-            events.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
-        }
+        events.extend(wake.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }));
         let timeout = if let Some(deadline) = deadline {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Ok(false);
             };
             remaining.as_millis().saturating_add(1).min(30_000) as i32
-        } else if wake.is_some() {
+        } else if !wake.is_empty() {
             30_000
         } else {
             50
@@ -501,7 +518,7 @@ pub(crate) fn wait_any_free(
             if unsafe { libc::getppid() } <= 1 {
                 return Err(anyhow::anyhow!("stream parent exited"));
             }
-            if wake.is_none() && deadline.is_none() {
+            if wake.is_empty() && deadline.is_none() {
                 return Ok(false);
             }
             continue;
@@ -512,7 +529,7 @@ pub(crate) fn wait_any_free(
             }
             drain_acks(sockets[index], &mut free[index])?;
         }
-        if wake.is_some() && events[sockets.len()].revents != 0 {
+        if events[sockets.len()..].iter().any(|event| event.revents != 0) {
             return Ok(false);
         }
     }
@@ -530,9 +547,119 @@ struct Sink {
     step: f64,
     next_emit: f64,
     emitted: bool,
+    widgets: widgets::Widgets,
+    held: Option<ffmpeg_the_third::frame::Video>,
+    paused_upload: Option<crate::vk::UploadPath>,
+    held_transition: Option<(ffmpeg_the_third::frame::Video, f32)>,
+    paused_from: Option<crate::vk::UploadPath>,
+}
+
+struct Fade<'a> {
+    source: &'a Src<'a>,
+    progress: f32,
+    sand: Option<i32>,
+    effect: Option<usize>,
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        self.clear_paused();
+    }
 }
 
 impl Sink {
+    fn clear_paused(&mut self) {
+        for upload in [self.paused_upload.take(), self.paused_from.take()].into_iter().flatten() {
+            self.renderer.destroy_upload_path(upload);
+        }
+    }
+
+    fn draw(&mut self, slot: usize, source: &Src<'_>, fade: Option<Fade<'_>>) -> Result<()> {
+        let target = &self.targets[slot];
+        let export = &mut self.exports[slot];
+        let Some(fade) = fade else {
+            return self.renderer.render_to(target, export, source, self.uv);
+        };
+        let Fade { source: from, progress, sand, effect } = fade;
+        match (progress, sand, effect) {
+            (progress, _, _) if progress <= 0.0 => {
+                self.renderer.render_to(target, export, from, self.old_uv)
+            }
+            (progress, _, _) if progress >= 1.0 => {
+                self.renderer.render_to(target, export, source, self.uv)
+            }
+            (_, Some(style), _) => self.renderer.render_sand_to(
+                target,
+                export,
+                from,
+                self.old_uv,
+                source,
+                self.uv,
+                progress,
+                style,
+            ),
+            (_, None, Some(effect)) => self.renderer.render_effect_to(
+                target,
+                export,
+                from,
+                self.old_uv,
+                source,
+                self.uv,
+                progress,
+                effect,
+            ),
+            (_, None, None) => self.renderer.render_fade_to(
+                target,
+                export,
+                from,
+                self.old_uv,
+                source,
+                self.uv,
+                progress * progress * (FADE_EASE[0] + FADE_EASE[1] * progress),
+            ),
+        }
+    }
+
+    fn redraw(&mut self, software: bool, sand: Option<i32>, effect: Option<usize>) -> Result<()> {
+        let Some(slot) = self.free.iter().position(|free| *free) else { return Ok(()) };
+        let Some(frame) = self.held.take() else { return Ok(()) };
+        let source = if software {
+            if self.paused_upload.is_none() {
+                self.paused_upload =
+                    Some(self.renderer.create_upload_path(frame.width(), frame.height())?);
+            }
+            let upload = self.paused_upload.as_ref().unwrap();
+            self.renderer.upload_video(upload, &frame)?;
+            Src::Views(upload.luma_view, upload.chroma_view)
+        } else {
+            Src::Avvk(&frame)
+        };
+        let transition = self.held_transition.take();
+        let from = if let Some((old, _)) = &transition {
+            if self.paused_from.is_none() {
+                self.paused_from =
+                    Some(self.renderer.create_upload_path(old.width(), old.height())?);
+            }
+            let upload = self.paused_from.as_ref().unwrap();
+            self.renderer.upload_video(upload, old)?;
+            Some(Src::Views(upload.luma_view, upload.chroma_view))
+        } else {
+            None
+        };
+        let fade = from.as_ref().zip(transition.as_ref()).map(|(source, (_, progress))| Fade {
+            source,
+            progress: *progress,
+            sand,
+            effect,
+        });
+        self.draw(slot, &source, fade)?;
+        self.publish(slot)?;
+        self.held = Some(frame);
+        self.held_transition = transition;
+        self.widgets.pending = false;
+        Ok(())
+    }
+
     fn drain_acks(&mut self) -> Result<()> {
         Ok(drain_acks(self.target.socket, &mut self.free)?)
     }
@@ -570,6 +697,7 @@ impl Sink {
     fn publish(&mut self, slot: usize) -> Result<()> {
         self.renderer.wait_render()?;
         self.renderer.complete_external_signal(&self.semaphores[slot])?;
+        self.widgets.publish(&self.target, slot)?;
         send_packet(self.target.socket, &packet(2, slot as u8, 0, 0, 0, 0, 0), None)
             .context("send dmabuf frame")?;
         self.free[slot] = false;
@@ -614,6 +742,7 @@ fn build_sink(
         .map(|(width, height)| crate::fill::mode_uv(width, height, target.width, target.height))
         .unwrap_or(uv);
     let step = 1.0 / f64::from(target.fps.clamp(1, 240));
+    let widgets = widgets::Widgets::stream(target.socket);
     Ok(Sink {
         target,
         renderer,
@@ -626,10 +755,16 @@ fn build_sink(
         step,
         next_emit: 0.0,
         emitted: false,
+        widgets,
+        held: None,
+        paused_upload: None,
+        held_transition: None,
+        paused_from: None,
     })
 }
 
 struct Transition {
+    frame: ffmpeg_the_third::frame::Video,
     upload: crate::vk::UploadPath,
     started: Option<Instant>,
     frames: u64,
@@ -656,6 +791,9 @@ impl VideoStreamer {
         route_pauses(&mut self.ctl, &mut targets);
         for (sink, target) in self.sinks.iter_mut().zip(targets) {
             sink.target.paused = target.paused;
+            if !target.paused && !self.ctl.paused {
+                sink.clear_paused();
+            }
         }
     }
 
@@ -670,21 +808,39 @@ impl VideoStreamer {
         loop {
             let _ = self.ctl.poll();
             self.route_pauses();
+            let scene = self.ctl.take_widgets();
             for sink in &mut self.sinks {
                 sink.drain_acks()?;
+                sink.widgets.sync(scene.as_ref(), &sink.target, &mut sink.renderer)?;
+                if sink.widgets.pending && sink.emitted && (self.ctl.paused || sink.target.paused) {
+                    sink.redraw(self.upload.is_some(), self.sand, self.effect)?;
+                }
             }
             let sockets: Vec<RawFd> = self.sinks.iter().map(|sink| sink.target.socket).collect();
             let active: Vec<bool> = self
                 .sinks
                 .iter()
-                .map(|sink| sink.target.active(sink.emitted) && (!self.ctl.paused || !sink.emitted))
+                .map(|sink| {
+                    sink.widgets.pending
+                        || (sink.target.active(sink.emitted) && (!self.ctl.paused || !sink.emitted))
+                })
                 .collect();
             let mut free: Vec<[bool; 3]> = self.sinks.iter().map(|sink| sink.free).collect();
-            let ready = wait_any_free(&sockets, &mut free, &active, self.ctl.wake_fd(), None)?;
+            let wake: Vec<_> = self
+                .ctl
+                .wake_fd()
+                .into_iter()
+                .chain(self.sinks.iter().filter_map(|sink| sink.widgets.wake_fd()))
+                .collect();
+            let ready = wait_any_free(&sockets, &mut free, &active, &wake, None)?;
             for (sink, slots) in self.sinks.iter_mut().zip(free) {
                 sink.free = slots;
             }
-            if ready {
+            if ready
+                && self.sinks.iter().any(|sink| {
+                    sink.target.active(sink.emitted) && (!self.ctl.paused || !sink.emitted)
+                })
+            {
                 return Ok(());
             }
         }
@@ -730,13 +886,7 @@ impl VideoStreamer {
         }
         let source = if let Some(upload) = &self.upload {
             if upload_frame {
-                self.sinks[0].renderer.upload_nv12(
-                    upload,
-                    frame.data(0),
-                    frame.stride(0),
-                    frame.data(1),
-                    frame.stride(1),
-                )?;
+                self.sinks[0].renderer.upload_video(upload, frame)?;
             }
             Src::Views(upload.luma_view, upload.chroma_view)
         } else {
@@ -767,57 +917,26 @@ impl VideoStreamer {
             let Some(slot) = sink.free.iter().position(|value| *value) else {
                 continue;
             };
-            match (progress, old_source.as_ref()) {
-                (Some(progress), Some(old_source)) => {
-                    finish_transition = progress >= 1.0;
-                    let target = &sink.targets[slot];
-                    let export = &mut sink.exports[slot];
-                    match (progress, self.sand, self.effect) {
-                        (progress, _, _) if progress <= 0.0 => {
-                            sink.renderer.render_to(target, export, old_source, sink.old_uv)?
-                        }
-                        (progress, _, _) if progress >= 1.0 => {
-                            sink.renderer.render_to(target, export, &source, sink.uv)?
-                        }
-                        (_, Some(style), _) => sink.renderer.render_sand_to(
-                            target,
-                            export,
-                            old_source,
-                            sink.old_uv,
-                            &source,
-                            sink.uv,
-                            progress,
-                            style,
-                        )?,
-                        (_, None, Some(effect)) => sink.renderer.render_effect_to(
-                            target,
-                            export,
-                            old_source,
-                            sink.old_uv,
-                            &source,
-                            sink.uv,
-                            progress,
-                            effect,
-                        )?,
-                        (_, None, None) => sink.renderer.render_fade_to(
-                            target,
-                            export,
-                            old_source,
-                            sink.old_uv,
-                            &source,
-                            sink.uv,
-                            progress * progress * (3.0 - 2.0 * progress),
-                        )?,
-                    }
-                }
-                _ => sink.renderer.render_to(
-                    &sink.targets[slot],
-                    &mut sink.exports[slot],
-                    &source,
-                    sink.uv,
-                )?,
-            }
+            let fade = progress.zip(old_source.as_ref()).map(|(progress, source)| Fade {
+                source,
+                progress,
+                sand: self.sand,
+                effect: self.effect,
+            });
+            finish_transition |= progress.is_some_and(|progress| progress >= 1.0);
+            sink.draw(slot, &source, fade)?;
+            sink.held_transition = self
+                .transition
+                .as_ref()
+                .zip(progress)
+                .filter(|(_, progress)| *progress < 1.0)
+                .map(|(transition, progress)| {
+                    crate::decode::retain_frame(&transition.frame).map(|frame| (frame, progress))
+                })
+                .transpose()?;
             sink.publish(slot)?;
+            sink.widgets.pending = false;
+            sink.held = Some(crate::decode::retain_frame(frame)?);
             self.emitted = true;
         }
         if finish_transition {
@@ -896,7 +1015,12 @@ pub(crate) fn dmabuf_video_stream(
                 old_frame.data(1),
                 old_frame.stride(1),
             )?;
-            Some(Transition { upload: old_upload, started: None, frames: 0 })
+            Some(Transition {
+                frame: crate::decode::retain_frame(&old_frame)?,
+                upload: old_upload,
+                started: None,
+                frames: 0,
+            })
         }
         None => None,
     };

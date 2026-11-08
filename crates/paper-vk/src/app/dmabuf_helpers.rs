@@ -77,9 +77,31 @@ pub(super) struct PendingSwap {
     timeout: std::time::Duration,
 }
 
+pub(super) struct ShmMapping {
+    pub(super) pointer: *mut u8,
+    pub(super) bytes: usize,
+}
+
+impl Drop for ShmMapping {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.pointer.cast(), self.bytes) };
+    }
+}
+
 pub(super) struct RgbaStillSource {
     pub(super) texture: vk::SceneTexture,
     pub(super) uvs: Vec<[f32; 4]>,
+}
+
+pub(super) struct RgbaOrigins<'a> {
+    pub(super) shared: Option<&'a RgbaStillSource>,
+    pub(super) outputs: &'a std::collections::BTreeMap<usize, RgbaStillSource>,
+}
+
+impl<'a> RgbaOrigins<'a> {
+    pub(super) fn get(&self, index: usize) -> Option<&'a RgbaStillSource> {
+        self.outputs.get(&index).or(self.shared)
+    }
 }
 
 pub(super) fn upload_rgba_still(
@@ -90,12 +112,23 @@ pub(super) fn upload_rgba_still(
     let Some(pixels) = frame.still_pixels() else {
         return Ok(None);
     };
-    renderer.ensure_scene_pool(16)?;
-    let image = &pixels.image;
-    let texture = renderer.create_scene_texture(image.width(), image.height(), image.as_raw())?;
-    let (width, height) = pixels.source;
-    let uvs = dims.iter().map(|&(w, h)| mode_uv(width, height, w, h)).collect();
-    Ok(Some(RgbaStillSource { texture, uvs }))
+    RgbaStillSource::upload(renderer, pixels, dims).map(Some)
+}
+
+impl RgbaStillSource {
+    pub(super) fn upload(
+        renderer: &mut vk::Renderer,
+        pixels: &decode::still::StillPixels,
+        dims: &[(u32, u32)],
+    ) -> Result<Self> {
+        renderer.ensure_scene_pool(16)?;
+        let image = &pixels.image;
+        let texture =
+            renderer.create_scene_texture(image.width(), image.height(), image.as_raw())?;
+        let (width, height) = pixels.source;
+        let uvs = dims.iter().map(|&(w, h)| mode_uv(width, height, w, h)).collect();
+        Ok(Self { texture, uvs })
+    }
 }
 
 impl PendingSwap {
@@ -241,7 +274,7 @@ pub(super) fn render_surfaces(
     frames: u64,
     sw_a: Option<&FrameSlot>,
     sw_b: Option<&FrameSlot>,
-    rgba_a: Option<&RgbaStillSource>,
+    rgba_a: &RgbaOrigins<'_>,
     rgba_b: Option<&RgbaStillSource>,
 ) -> Result<()> {
     for ri in 0..renderers.len() {
@@ -262,11 +295,11 @@ pub(super) fn render_surfaces(
                 ri,
                 sw_a,
                 sw_b,
-                rgba_a,
+                rgba_a.get(ri),
                 rgba_b,
             )?,
             Some(mode) => {
-                render_pattern(&mut renderers[ri], rt, &mut exports[ri][bi], mode, w, h, frames)?
+                render_pattern(&mut renderers[ri], rt, &mut exports[ri][bi], mode, w, h, frames)?;
             }
         }
     }
@@ -385,22 +418,6 @@ pub(super) fn complete_swap(
     *prev_commit_ns = 0;
     *prev_step_ns = 0;
     tracing::info!("skwd-wall-vk: swap complete");
-}
-
-pub(super) fn dedup_dims(dims: &[(u32, u32)]) -> (Vec<(u32, u32)>, Vec<usize>) {
-    let mut distinct: Vec<(u32, u32)> = Vec::new();
-    let ridx: Vec<usize> = dims
-        .iter()
-        .map(|dim| {
-            if let Some(idx) = distinct.iter().position(|known| known == dim) {
-                idx
-            } else {
-                distinct.push(*dim);
-                distinct.len() - 1
-            }
-        })
-        .collect();
-    (distinct, ridx)
 }
 
 pub(super) fn shared_render_dims(

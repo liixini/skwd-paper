@@ -89,6 +89,7 @@ pub struct Ctl {
     pointer_revision: u64,
     surface_changed: bool,
     system_audio: Option<bool>,
+    widgets: Option<paper_control::WidgetScene>,
 }
 
 pub fn parse_audio_opts(args: &[String]) -> (bool, u32) {
@@ -172,6 +173,7 @@ impl Ctl {
             pointer_revision: 0,
             surface_changed: false,
             system_audio: None,
+            widgets: None,
             drawing_photo: None,
             reveal: false,
         }
@@ -210,6 +212,7 @@ impl Ctl {
             pointer_revision: 0,
             surface_changed: false,
             system_audio: None,
+            widgets: None,
             drawing_photo: None,
             reveal: false,
         }
@@ -217,6 +220,10 @@ impl Ctl {
 
     pub fn take_surface_change(&mut self) -> bool {
         std::mem::take(&mut self.surface_changed)
+    }
+
+    pub fn take_widgets(&mut self) -> Option<paper_control::WidgetScene> {
+        self.widgets.take()
     }
 
     pub fn pointer(&self) -> Option<(u64, [f32; 2], [bool; 3])> {
@@ -408,6 +415,10 @@ impl Ctl {
                     crate::surface::set(&surface);
                     self.surface_changed = true;
                 }
+                None
+            }
+            paper_control::CommandClass::Widgets(scene) => {
+                self.widgets = Some(*scene);
                 None
             }
             paper_control::CommandClass::Pointer(state) => {

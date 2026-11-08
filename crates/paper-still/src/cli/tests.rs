@@ -61,3 +61,21 @@ fn frame_stream_contract() {
     assert_eq!(shared.frame_stream, vec!["1920x1080".to_string(), "1309x2327".to_string()]);
     assert_eq!(shared.frame_fd, vec![4, 6]);
 }
+
+#[test]
+fn widget_output_geometry() {
+    let cli = Cli::try_parse_from([
+        "skwd-wall-still",
+        "*",
+        "/wall/a.png",
+        "--frame-stream",
+        "1920x1080",
+        "--stream-output",
+        "DP-1",
+        "--stream-logical",
+        "2560x1440",
+    ])
+    .unwrap();
+    assert_eq!(cli.stream_output, ["DP-1"]);
+    assert_eq!(cli.stream_logical, ["2560x1440"]);
+}

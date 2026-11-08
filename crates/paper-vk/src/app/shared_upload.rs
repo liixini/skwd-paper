@@ -62,6 +62,7 @@ pub(super) fn run_shared(
             return Ok(());
         }
         poll_ignoring_swap(&mut ctl);
+        target.sync_widgets(&mut ctl);
         crate::freeze::write_last_requested(&mut ctl, last_presented.as_ref())?;
         if frames > 0 && ctl.paused && !ctl.freeze_pending() {
             std::thread::sleep(Duration::from_millis(100));

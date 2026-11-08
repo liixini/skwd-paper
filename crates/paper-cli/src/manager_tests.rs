@@ -220,6 +220,206 @@ fn span_groups_compatible_assignments() {
     assert_eq!(expand(&[first, second], None).len(), 2);
 }
 
+fn shared_source(fixture: &Fixture, family: &str) -> Source {
+    match family {
+        "static" => Source::static_file("/wall/one.png"),
+        "video" => Source::video("/wall/one.mp4"),
+        _ => {
+            let project = fixture.directory.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let (kind, file) =
+                if family == "scene" { ("scene", "scene.pkg") } else { ("video", "clip.mp4") };
+            std::fs::write(
+                project.join("project.json"),
+                serde_json::json!({"type":kind,"file":file}).to_string(),
+            )
+            .unwrap();
+            std::fs::write(project.join(file), []).unwrap();
+            Source::wallpaper_engine(project.display().to_string())
+        }
+    }
+}
+
+#[test]
+fn shared_destinations() {
+    block_on(async {
+        for mode in [FillMode::Fill, FillMode::Fit] {
+            for family in ["static", "video", "scene", "wevideo"] {
+                let mut fixture = Fixture::new();
+                let source = shared_source(&fixture, family);
+                let assignments = ["DP-1", "DP-2", "DP-3"].map(|output| {
+                    let mut item = assignment(output, source.clone());
+                    item.fill_mode = mode;
+                    item
+                });
+                let mut request = apply(assignments.to_vec(), true);
+                request.policy =
+                    Some(RendererPolicy { shared_outputs: Some(true), ..Default::default() });
+                let status = fixture.commit(&request).await;
+                assert_eq!(status.len(), assignments.len());
+                assert_eq!(
+                    status.iter().map(|worker| worker.pid).collect::<BTreeSet<_>>().len(),
+                    1
+                );
+                for (actual, expected) in status.iter().zip(&assignments) {
+                    assert_eq!(&actual.assignment, expected);
+                }
+                wait_log(fixture.directory.path(), "args", status[0].pid, "DP-1,DP-2,DP-3");
+                fixture.manager.stop(&StopRequest { outputs: Vec::new() }).await.unwrap();
+            }
+        }
+    });
+}
+
+#[test]
+fn shared_transition_origins() {
+    block_on(async {
+        for family in ["video", "wevideo", "scene"] {
+            let mut fixture = Fixture::new();
+            let source = shared_source(&fixture, family);
+            let assignments =
+                [("DP-1", "/wall/old-a.png"), ("DP-2", "/wall/old-b.png")].map(|(output, from)| {
+                    let mut item = assignment(output, source.clone());
+                    item.transition =
+                        Some(TransitionPolicy { from: Some(from.into()), ..Default::default() });
+                    item
+                });
+            let mut request = apply(assignments.to_vec(), true);
+            request.policy =
+                Some(RendererPolicy { shared_outputs: Some(true), ..Default::default() });
+            let status = fixture.commit(&request).await;
+            assert_eq!(status[0].pid, status[1].pid);
+            assert!(fixture.manager.overlays.is_empty());
+            assert!(fixture.manager.workers[0].drawing_hold.is_none());
+            assert_eq!(
+                transition_origins(&fixture, status[0].pid),
+                [
+                    ("DP-1".into(), "/wall/old-a.png".into()),
+                    ("DP-2".into(), "/wall/old-b.png".into())
+                ]
+                .into()
+            );
+            let args = wait_log(fixture.directory.path(), "args", status[0].pid, "DP-1,DP-2");
+            assert_eq!(args.lines().next(), Some("DP-1,DP-2"));
+            fixture.manager.stop(&StopRequest::default()).await.unwrap();
+        }
+    });
+}
+
+fn transition_origins(fixture: &Fixture, pid: u32) -> BTreeMap<String, String> {
+    let env = wait_log(fixture.directory.path(), "env", pid, paper_control::TRANSITION_SOURCES_ENV);
+    let prefix = format!("{}=", paper_control::TRANSITION_SOURCES_ENV);
+    let value = env.lines().find_map(|line| line.strip_prefix(&prefix)).unwrap();
+    serde_json::from_str(value).unwrap()
+}
+
+#[test]
+fn shared_members_rollback() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let mut first = assignment("DP-1", Source::video("/wall/one.mp4"));
+        first.mute = false;
+        first.volume = 45;
+        let mut second = first.clone();
+        second.outputs = vec!["DP-2".into()];
+        second.mute = true;
+        let locked = assignment("DP-3", Source::static_file("/wall/locked.png"));
+        let mut request = apply(vec![first, second.clone(), locked], true);
+        request.policy = Some(RendererPolicy { shared_outputs: Some(true), ..Default::default() });
+        let initial = fixture.commit(&request).await;
+        for worker in &initial {
+            wait_log(fixture.directory.path(), "args", worker.pid, &worker.assignment.outputs[0]);
+        }
+        let patch = apply(vec![assignment("DP-1", Source::video("/wall/two.mp4"))], false);
+        let mut pending = fixture.manager.begin_apply(&patch, &fixture.socket).await.unwrap();
+        ready(&mut pending).await;
+        pending.rollback().await;
+        assert_eq!(
+            fixture.manager.status().iter().map(|worker| worker.pid).collect::<Vec<_>>(),
+            initial.iter().map(|worker| worker.pid).collect::<Vec<_>>()
+        );
+        let changed = fixture.commit(&patch).await;
+        let retained = changed.iter().find(|worker| worker.assignment.outputs == ["DP-2"]).unwrap();
+        assert_eq!(retained.assignment, second);
+        assert_eq!(
+            changed.iter().find(|worker| worker.assignment.outputs == ["DP-3"]).unwrap().pid,
+            initial[2].pid
+        );
+        fixture.manager.stop(&StopRequest::default()).await.unwrap();
+    });
+}
+
+#[test]
+fn shared_global_unmute() {
+    block_on(async {
+        for volume in [45, 100] {
+            let mut fixture = Fixture::new();
+            let mut first = assignment("DP-1", Source::video("/wall/one.mp4"));
+            first.mute = true;
+            first.volume = 45;
+            let mut second = first.clone();
+            second.outputs = vec!["DP-2".into()];
+            second.volume = volume;
+            let mut request = apply(vec![first, second], true);
+            request.policy =
+                Some(RendererPolicy { shared_outputs: Some(true), ..Default::default() });
+            let initial = fixture.commit(&request).await;
+            assert_eq!(initial[0].pid == initial[1].pid, volume == 45);
+            for mute in [false, true] {
+                let (updated, status) = fixture
+                    .manager
+                    .audio(&AudioSetRequest { mute: Some(mute), ..Default::default() })
+                    .await
+                    .unwrap();
+                assert_eq!(updated, initial.len());
+                for (worker, before) in status.iter().zip(&initial) {
+                    assert_eq!(worker.pid, before.pid);
+                    assert_eq!(worker.assignment.volume, before.assignment.volume);
+                    assert_eq!(worker.assignment.mute, mute);
+                    wait_log(
+                        fixture.directory.path(),
+                        "args",
+                        worker.pid,
+                        &worker.assignment.outputs[0],
+                    );
+                }
+            }
+            fixture.manager.stop(&StopRequest::default()).await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn shared_pause_and_stop() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let assignments = ["DP-1", "DP-2", "DP-3"]
+            .map(|output| assignment(output, Source::video("/wall/one.mp4")));
+        let mut request = apply(assignments.to_vec(), true);
+        request.policy = Some(RendererPolicy { shared_outputs: Some(true), ..Default::default() });
+        let status = fixture.commit(&request).await;
+        let pid = status[0].pid;
+        assert!(fixture.manager.begin_pause(&fixture.socket).await.unwrap().is_none());
+        assert!(fixture.manager.paused());
+        assert!(fixture.manager.status().iter().all(|worker| worker.pid == pid));
+        assert!(fixture.manager.begin_resume(&fixture.socket).await.unwrap().is_none());
+        let commands = wait_log(fixture.directory.path(), "stdin", pid, "\"pause\":true");
+        assert!(!commands.contains("freeze"));
+        let stop = StopRequest { outputs: vec!["DP-2".into()] };
+        let (mut transaction, count) =
+            fixture.manager.begin_stop(&stop, &fixture.socket).await.unwrap().unwrap();
+        assert_eq!(count, 1);
+        ready(&mut transaction).await;
+        let status = fixture.manager.commit(transaction).await.unwrap();
+        assert_eq!(
+            status.iter().map(|worker| worker.assignment.outputs[0].as_str()).collect::<Vec<_>>(),
+            ["DP-1", "DP-3"]
+        );
+        assert_eq!(status[0].pid, status[1].pid);
+        fixture.manager.stop(&StopRequest::default()).await.unwrap();
+    });
+}
+
 #[test]
 fn span_mixed_hints_cut() {
     let mut first = assignment("DP-1", Source::video("/wall/new.mp4"));
@@ -625,6 +825,7 @@ fn policy_inheritance() {
     block_on(async {
         let mut fixture = Fixture::new();
         let policy = RendererPolicy {
+            shared_outputs: None,
             transition_fps: Some(120),
             load_timeout_ms: Some(30_000),
             surface: None,

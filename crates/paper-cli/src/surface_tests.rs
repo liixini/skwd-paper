@@ -286,6 +286,50 @@ fn drawing_rejects_ambiguous_views() {
 }
 
 #[test]
+fn shared_photo_retry() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let executable = fixture.directory.path().join("worker");
+        let source = std::fs::read_to_string(&executable).unwrap().replace(
+            "printf 'P6",
+            "if [ -e \"$base/reject-photo-$$\" ]; then case \"$path\" in */applied.ppm) printf 'rejected' > \"$path.error\"; continue;; esac; fi; printf 'P6",
+        );
+        std::fs::write(executable, source).unwrap();
+        fixture.manager.set_surface_overrides(surfaces()).await.unwrap();
+        let first = super::handoff::media_drawing(fixture.directory.path());
+        let mut second = first.clone();
+        second.outputs = vec!["DP-2".into()];
+        let mut request = mixed(&fixture);
+        request.assignments = vec![first, second];
+        request.policy.as_mut().unwrap().shared_outputs = Some(true);
+        fixture.commit(&request).await;
+        let pid = fixture.manager.workers[0].pid();
+        let overlay = fixture.manager.overlays[1].pid();
+        let rejection = fixture.directory.path().join(format!("reject-photo-{overlay}"));
+        std::fs::write(&rejection, b"").unwrap();
+        assert!(
+            fixture
+                .manager
+                .set_surface_overrides(SurfaceOverridesRequest::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.manager.surface_overrides, surfaces());
+        let pending = &fixture.manager.workers[0].pending_photos;
+        assert!(pending.len() >= fixture.manager.overlays.len() * 2);
+        assert!(pending.iter().all(|directory| directory.path().exists()));
+        assert!(fixture.manager.surface_retry.contains(&pid));
+        std::fs::remove_file(rejection).unwrap();
+        fixture.manager.set_surface_overrides(surfaces()).await.unwrap();
+        assert!(fixture.manager.surface_retry.is_empty());
+        assert!(fixture.manager.workers[0].pending_photos.is_empty());
+        assert_eq!(fixture.manager.workers[0].pid(), pid);
+        assert_eq!(fixture.manager.overlays[1].pid(), overlay);
+        fixture.manager.stop(&StopRequest::default()).await.unwrap();
+    });
+}
+
+#[test]
 fn drawing_captures_static_owner() {
     block_on(async {
         let mut fixture = Fixture::new();
@@ -348,6 +392,22 @@ fn widgets_reach_still_workers() {
         let lines = wait_log(fixture.directory.path(), "stdin", still.pid, "widgets");
         assert!(lines.contains("\"widgets\""));
         assert_eq!(fixture.manager.widgets, None);
+    });
+}
+
+#[test]
+fn widgets_reach_dynamic_workers() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let request = mixed(&fixture);
+        let initial = fixture.commit(&request).await;
+        fixture.manager.set_widgets(scene()).await.unwrap();
+        for worker in
+            initial.iter().filter(|worker| worker.assignment.source.kind != SourceKind::Static)
+        {
+            let lines = wait_log(fixture.directory.path(), "stdin", worker.pid, "widgets");
+            assert!(lines.contains("\"widgets\""));
+        }
     });
 }
 

@@ -58,6 +58,7 @@ fn ctl_reduce() {
         snapshot: None,
         drawing: None,
         surface: None,
+        widgets: None,
         system_audio: None,
         to: String::new(),
         mute: Some(false),
@@ -84,6 +85,7 @@ fn ctl_reduce() {
         snapshot: None,
         drawing: None,
         surface: None,
+        widgets: None,
         system_audio: None,
         to: String::new(),
         mute: None,
@@ -463,4 +465,44 @@ fn initial_pause_freezes_transition() {
     assert!(!ctl.render_paused(true));
     assert!(!ctl.mute);
     assert_eq!(ctl.volume, 42);
+}
+
+#[test]
+fn widget_updates_keep_pause() {
+    let (send, receive) = std::sync::mpsc::channel();
+    let mut ctl = Ctl::with_receiver(receive);
+    ctl.set_paused(true);
+    let mut scene = paper_control::WidgetScene {
+        widgets: vec![paper_control::Widget {
+            face: paper_control::Face::Clock(paper_control::ClockStyle::Aperture),
+            depth: paper_control::Depth::Front,
+            pin: paper_control::Pin { anchor: [0.5, 0.5], offset: [0.0, 0.0] },
+            height: None,
+            output: None,
+        }],
+        outlines: Vec::new(),
+        palette: paper_control::Palette { text: [1, 2, 3], accent: [4, 5, 6], shade: [7, 8, 9] },
+        font: None,
+        labels: paper_control::Labels {
+            days: std::array::from_fn(|_| String::new()),
+            day_names: std::array::from_fn(|_| String::new()),
+            months: std::array::from_fn(|_| String::new()),
+            month_names: std::array::from_fn(|_| String::new()),
+        },
+    };
+    let mut command = PaperCommand::audio(None, None);
+    command.widgets = Some(Box::new(scene.clone()));
+    send.send(command).unwrap();
+    assert!(ctl.poll().is_none());
+    assert_eq!(ctl.take_widgets(), Some(scene.clone()));
+    assert_eq!(ctl.take_widgets(), None);
+    assert!(ctl.paused);
+
+    scene.widgets.clear();
+    let mut command = PaperCommand::audio(None, None);
+    command.widgets = Some(Box::new(scene.clone()));
+    send.send(command).unwrap();
+    assert!(ctl.poll().is_none());
+    assert_eq!(ctl.take_widgets(), Some(scene));
+    assert!(ctl.paused);
 }

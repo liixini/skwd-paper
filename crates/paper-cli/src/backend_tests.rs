@@ -42,7 +42,18 @@ fn plasma_presentation_uses_paper_backend_routing() {
     assert_eq!(program, still.to_string_lossy());
     assert_eq!(
         arguments,
-        ["*", "/wall/a.png", "--frame-stream", "1920x1080", "--fill-mode", "fit"]
+        [
+            "*",
+            "/wall/a.png",
+            "--frame-stream",
+            "1920x1080",
+            "--stream-output",
+            "*",
+            "--stream-logical",
+            "1920x1080",
+            "--fill-mode",
+            "fit"
+        ]
     );
 
     let video_assignment = Assignment::new(vec!["DP-1".into()], Source::video("/wall/loop.mp4"));
@@ -61,7 +72,16 @@ fn plasma_presentation_uses_paper_backend_routing() {
 }
 
 fn stream(fd: i32, size: &str, fps: u32, paused: bool) -> PlasmaStream {
-    PlasmaStream { fd, frame_fd: -1, size: size.into(), fps, output: String::new(), paused }
+    PlasmaStream {
+        fd,
+        frame_fd: -1,
+        size: size.into(),
+        fps,
+        output: String::new(),
+        connector: None,
+        logical: None,
+        paused,
+    }
 }
 
 fn shared(
@@ -72,7 +92,16 @@ fn shared(
     output: &str,
     paused: bool,
 ) -> PlasmaStream {
-    PlasmaStream { fd, frame_fd, size: size.into(), fps, output: output.into(), paused }
+    PlasmaStream {
+        fd,
+        frame_fd,
+        size: size.into(),
+        fps,
+        output: output.into(),
+        connector: None,
+        logical: None,
+        paused,
+    }
 }
 
 #[test]
@@ -98,9 +127,17 @@ fn shared_still_presenter_pairs_each_size_with_its_pipe() {
             "/wall/a.png",
             "--frame-stream",
             "1920x1080",
+            "--stream-output",
+            "DP-3",
+            "--stream-logical",
+            "1920x1080",
             "--frame-fd",
             "4",
             "--frame-stream",
+            "1309x2327",
+            "--stream-output",
+            "DP-2",
+            "--stream-logical",
             "1309x2327",
             "--frame-fd",
             "6",
@@ -133,7 +170,7 @@ fn shared_plasma_presenter_lists_every_stream_in_order() {
     let (_, arguments) = command_parts(&command);
     let joined = arguments.join(" ");
     assert!(joined.contains(
-        "--stream-size 1920x1080 --stream-fps 144 --stream-fd 3 --stream-output DP-3 --stream-size 1309x2327 --stream-fps 60 --stream-fd 4 --stream-output DP-2 --stream-paused DP-2"
+        "--stream-size 1920x1080 --stream-fps 144 --stream-connector DP-3 --stream-logical 1920x1080 --stream-fd 3 --stream-output DP-3 --stream-size 1309x2327 --stream-fps 60 --stream-connector DP-2 --stream-logical 1309x2327 --stream-fd 4 --stream-output DP-2 --stream-paused DP-2"
     ));
     assert!(!arguments.contains(&"--paused".to_string()));
     let both_paused: Vec<PlasmaStream> =
@@ -160,6 +197,8 @@ fn plasma_stream_specs_parse_key_value_fields() {
         stream_size: Some("1280x720".into()),
         stream_fps: Some(30),
         stream_fd: Some(3),
+        stream_output: None,
+        stream_logical: None,
         streams: vec!["fd=4,size=640x480,fps=60,output=DP-2".into()],
         paused: true,
     };
@@ -172,6 +211,8 @@ fn plasma_stream_specs_parse_key_value_fields() {
         stream_size: None,
         stream_fps: None,
         stream_fd: None,
+        stream_output: None,
+        stream_logical: None,
         streams: Vec::new(),
         paused: false,
     };
@@ -784,4 +825,113 @@ fn drawing_source_fallback() {
     assert_eq!(drawing_source(&transition, &assignment), Path::new("/wall/a.png"));
     transition.drawing_source = Some("/cache/reference.png".into());
     assert_eq!(drawing_source(&transition, &assignment), Path::new("/cache/reference.png"));
+}
+
+#[test]
+fn widget_stream_geometry() {
+    let stream = parse_plasma_stream(
+        "fd=3,frame_fd=4,size=1920x1080,output=stream-7,connector=DP-1,logical=2560x1440",
+        false,
+    )
+    .unwrap();
+    assert_eq!(stream.output, "stream-7");
+    assert_eq!(stream.connector.as_deref(), Some("DP-1"));
+    assert_eq!(stream.logical.as_deref(), Some("2560x1440"));
+    for spec in [
+        "fd=3,size=16x16,logical=0x100",
+        "fd=3,size=16x16,logical=bad",
+        "fd=3,size=16x16,connector=",
+    ] {
+        assert!(parse_plasma_stream(spec, false).is_err());
+    }
+}
+
+#[test]
+fn dynamic_stream_geometry() {
+    let temp = tempfile::tempdir().unwrap();
+    let vk = temp.path().join("skwd-wall-vk");
+    executable(&vk, "#!/bin/sh\nexit 0\n");
+    let backends = BackendPaths::from_executables(vk.clone(), vk);
+    let assignment = Assignment::new(vec!["DP-1".into()], Source::video("/wall/loop.mp4"));
+    for fd in [-1, 3] {
+        let mut stream = shared(fd, -1, "1920x1080", 30, "stream-7", true);
+        stream.connector = Some("DP-1".into());
+        stream.logical = Some("2560x1440".into());
+        let command = plasma_command(&backends, &assignment, &[stream], true).unwrap();
+        let (_, args) = command_parts(&command);
+        for pair in [
+            ["--stream-output", "stream-7"],
+            ["--stream-connector", "DP-1"],
+            ["--stream-logical", "2560x1440"],
+        ] {
+            assert!(args.windows(2).any(|args| args == pair));
+        }
+    }
+}
+
+const PRELUDE_DIR_ENV: &str = "SKWD_PAPER_TEST_PRELUDE_DIR";
+const PRELUDE_WAIT: Duration = Duration::from_secs(10);
+const PRELUDE_POLL: Duration = Duration::from_millis(20);
+
+fn process_gone(pid: i32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => status.lines().any(|line| line.starts_with("State:") && line.contains('Z')),
+        Err(_) => true,
+    }
+}
+
+fn present_with_prelude() -> ! {
+    let mut assignment = Assignment::new(vec!["DP-1".into()], Source::static_file("/wall/b.png"));
+    assignment.transition = Some(paper_control::TransitionPolicy {
+        from: Some("/wall/a.png".into()),
+        duration_ms: Some(100),
+        ..Default::default()
+    });
+    super::present_plasma(&assignment, &[stream(-1, "16x16", 30, false)]).unwrap();
+    unreachable!()
+}
+
+#[test]
+fn prelude_dies_with_parent() {
+    if std::env::var_os(PRELUDE_DIR_ENV).is_some() {
+        present_with_prelude();
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let vk = temp.path().join("vk");
+    executable(&vk, "#!/bin/sh\necho $$ > \"$SKWD_PAPER_TEST_PRELUDE_DIR/pid\"\nexec sleep 60\n");
+    let mut parent = StdCommand::new(std::env::current_exe().unwrap());
+    parent
+        .args(["--exact", "backend::tests::prelude_dies_with_parent", "--nocapture"])
+        .env(PRELUDE_DIR_ENV, temp.path())
+        .env("SKWD_PAPER_VK_BIN", &vk)
+        .env("SKWD_PAPER_STILL_BIN", &vk)
+        .env("SKWD_PAPER_PLASMA_GPU_STREAM", "0")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("NIRI_SOCKET")
+        .env_remove("XDG_CURRENT_DESKTOP")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut parent = parent.spawn().unwrap();
+    let pid_file = temp.path().join("pid");
+    let started = Instant::now();
+    let pid: i32 = loop {
+        if let Some(pid) =
+            fs::read_to_string(&pid_file).ok().and_then(|text| text.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(started.elapsed() < PRELUDE_WAIT, "prelude never started");
+        std::thread::sleep(PRELUDE_POLL);
+    };
+    parent.kill().unwrap();
+    parent.wait().unwrap();
+    let started = Instant::now();
+    while !process_gone(pid) {
+        if started.elapsed() > PRELUDE_WAIT {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("prelude outlived its parent");
+        }
+        std::thread::sleep(PRELUDE_POLL);
+    }
 }

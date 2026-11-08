@@ -60,14 +60,6 @@ fn rotated_atlas_decodes() {
 }
 
 #[test]
-fn budget_requires_renderer() {
-    let report = evaluate_scene(&fixture("effect-budget")).unwrap();
-    assert_eq!(report["effect_budget"]["status"], "runtime-check-required");
-    assert_eq!(report["effect_budget"]["outcome"], "unmeasured");
-    assert_eq!(report["effect_budget"]["reason"], "effect-chain-budget");
-}
-
-#[test]
 fn decode_failure_precedes_atlas() {
     let mut bytes = std::fs::read(fixture("invalid-atlas-page").join("scene.pkg")).unwrap();
     let tag = b"TEXI0001\0";

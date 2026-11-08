@@ -18,8 +18,8 @@
     },
     {
       "id": "paper.tests",
-      "expectedSkips": 395,
-      "coverage": "Release workspace tests. The 394 explicit opt-in tests cover Vulkan rendering and resource lifetime; native Wallpaper Engine model, puppet, texture, shader, lighting, prelighting, scene zoom, effect space, descriptor pool, shadow, volume and dynamic-layer fixtures; Drawing GPU and artifact-frame checks; installed fonts, isolated audio and media; CPU reference profiles; and a manual freeze-frame benchmark. These require separate fixture, device or live-runtime qualification and are not counted as CI passes."
+      "expectedSkips": 416,
+      "coverage": "Release workspace tests. The 416 explicit opt-in tests cover Vulkan rendering and resource lifetime, widget overlays, CPU-painted stream widget overlay avoidance, held-media transitions, per-output image/video fade origins and shared video decoding; native Wallpaper Engine model, puppet, texture, shader, lighting, prelighting, scene zoom, effect space, descriptor pool, shadow, volume and dynamic-layer fixtures; Drawing GPU and artifact-frame checks; installed fonts, isolated audio and media; CPU reference profiles; and a manual freeze-frame benchmark. These require separate fixture, device or live-runtime qualification and are not counted as CI passes."
     },
     {
       "id": "paper.clippy",

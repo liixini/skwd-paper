@@ -7,7 +7,7 @@ pub mod seccomp;
 pub mod wake;
 pub mod watchdog;
 
-pub use process::init_process;
+pub use process::{die_with_parent, init_process};
 
 pub mod plasma;
 pub mod scratch;

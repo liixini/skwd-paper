@@ -1472,7 +1472,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "paper-audio"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "anyhow",
  "cpal",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "paper-control"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "gif",
  "libc",
@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "paper-geom"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "image",
  "serde",
@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "paper-log"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "tracing-appender",
  "tracing-subscriber",
@@ -1517,7 +1517,7 @@ dependencies = [
 
 [[package]]
 name = "paper-runtime"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "libc",
  "paper-log",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "paper-scene"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "anyhow",
  "bcdec_rs",
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "paper-shaders"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "insta",
  "paper-control",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "paper-text"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "freetype-sys",
  "read-fonts",
@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "paper-widgets"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "image",
  "paper-control",
@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "skwd-paper"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "anyhow",
  "clap",
@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "skwd-wall-still"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "anyhow",
  "clap",
@@ -2146,6 +2146,7 @@ dependencies = [
  "paper-widgets",
  "serde_json",
  "smithay-client-toolkit",
+ "tempfile",
  "tracing",
  "wayland-client",
  "wayland-protocols",
@@ -2154,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "skwd-wall-vk"
-version = "1.0.0-beta.27"
+version = "1.0.0-beta.28"
 dependencies = [
  "anyhow",
  "ash",
@@ -2170,6 +2171,7 @@ dependencies = [
  "paper-runtime",
  "paper-scene",
  "paper-shaders",
+ "paper-widgets",
  "pkg-config",
  "serde",
  "serde_json",

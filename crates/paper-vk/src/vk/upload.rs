@@ -268,6 +268,14 @@ impl Renderer {
         }
     }
 
+    pub fn upload_video(
+        &self,
+        upload: &UploadPath,
+        frame: &ffmpeg_the_third::frame::Video,
+    ) -> Result<()> {
+        self.upload_nv12(upload, frame.data(0), frame.stride(0), frame.data(1), frame.stride(1))
+    }
+
     pub fn upload_nv12(
         &self,
         up: &UploadPath,

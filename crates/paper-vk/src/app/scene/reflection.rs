@@ -103,6 +103,21 @@ impl Staging {
         self.orders.extend(self.keys.iter().map(|(order, _, _)| *order));
     }
 
+    fn starve_chain(&mut self, slot: usize, base: Option<usize>) {
+        let mut index = 0;
+        while index < self.ordered.len() {
+            if self.ordered[index].texture != slot {
+                index += 1;
+            } else if let Some(base) = base {
+                self.ordered[index].texture = base;
+                index += 1;
+            } else {
+                self.ordered.remove(index);
+                self.orders.remove(index);
+            }
+        }
+    }
+
     fn stale(&self, ready: bool, animated: bool) -> bool {
         !ready || animated || self.particled || self.ordered != self.drawn
     }
@@ -204,7 +219,7 @@ impl Group {
     pub(super) fn drop_twin(&mut self, quad: usize) {
         let Some(index) = self.mirror_fx.iter().position(|fx| fx.quad == quad) else { return };
         let fx = self.mirror_fx.remove(index);
-        self.destroy_layer_fx(fx);
+        self.discard_layer_fx(fx);
         self.reflection_excluded.insert(quad);
         if let Some(reflection) = &mut self.reflection {
             reflection.staging = Staging::default();
@@ -232,7 +247,7 @@ impl Group {
 
     fn record_chains(
         &mut self,
-        staging: &Staging,
+        staging: &mut Staging,
         draws: &[OrderedParticleDraw],
         frame: ReflectionFrame,
     ) -> Result<()> {
@@ -281,6 +296,11 @@ impl Group {
                 debug_fx: frame.debug_fx,
                 scene_targets: None,
             })?;
+            let fx = &self.mirror_fx[index];
+            if fx.output.is_none() {
+                let base = fx.base_quad.texture;
+                staging.starve_chain(fx.slot, (fx.snapshot_slot != Some(base)).then_some(base));
+            }
         }
         Ok(())
     }
@@ -318,7 +338,7 @@ impl Group {
             self.renderer.begin_scene_batch()?;
         }
         if !self.mirror_fx.is_empty() {
-            self.record_chains(&staging, draws, frame)?;
+            self.record_chains(&mut staging, draws, frame)?;
         }
         let reflection = self.reflection.as_ref().expect("reflection sampled");
         let batches =

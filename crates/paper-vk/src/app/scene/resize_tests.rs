@@ -8,8 +8,6 @@ const NATIVE_HALF_ENV: &str = "SKWD_WE_FROZEN_NATIVE_HALF";
 const ORTHO_PROJECT_ENV: &str = "SKWD_WE_FROZEN_ORTHO_PROJECT";
 const ORTHO_FULL_ENV: &str = "SKWD_WE_FROZEN_ORTHO_FULL";
 const ORTHO_HALF_ENV: &str = "SKWD_WE_FROZEN_ORTHO_HALF";
-const BUDGET_PROJECT_ENV: &str = "SKWD_WE_FROZEN_BUDGET_PROJECT";
-const BUDGET_HALF_ENV: &str = "SKWD_WE_FROZEN_BUDGET_HALF";
 const EFFECT_PROJECT_ENV: &str = "SKWD_WE_FROZEN_EFFECT_PROJECT";
 
 fn pixels(group: &mut Group) -> Result<image::RgbImage> {
@@ -200,45 +198,6 @@ fn identity(
     let _ =
         paper_scene::model::load_from_dir_with(&package, std::path::Path::new(dir), properties)?;
     capture.finish()
-}
-
-#[test]
-#[ignore = "requires Vulkan, pinned resize inputs, and SKWD_VK_SCENE_FX_BYTES=4"]
-fn budget_failure_keeps_frame() -> Result<()> {
-    let shared = crate::shared::test_device();
-    let dir = std::env::var(BUDGET_PROJECT_ENV)?;
-    let properties = paper_scene::model::Properties::new();
-    let identity = identity(&dir, &properties)?;
-    let native = image::open(std::env::var(BUDGET_HALF_ENV)?)?.to_rgb8();
-    let mut source = SceneSource {
-        shared: &shared,
-        dir: &dir,
-        identity: &identity,
-        properties: &properties,
-        outputs: &[(640, 360)],
-        mode: FillMode::Fill,
-        strict: true,
-        particles_disabled: false,
-    };
-    let mut active = source.build()?;
-    assert_eq!(pixels(&mut active)?, native);
-    let live = vk::Renderer::scene_target_live_allocations();
-    source.outputs = &[(1280, 720)];
-    for _ in 0..3 {
-        let allocations = active.renderer.scene_image_allocations();
-        let error = source.build().err().expect("budget rejection");
-        assert!(error.to_string().contains("scene input targets exceed effect budget"));
-        assert!(active.renderer.scene_image_allocations() > allocations);
-        assert_eq!(vk::Renderer::scene_target_live_allocations(), live);
-        assert_eq!(pixels(&mut active)?, native);
-    }
-    source.outputs = &[(640, 360)];
-    let mut recovered = source.build()?;
-    assert_eq!(pixels(&mut recovered)?, native);
-    recovered.destroy();
-    assert_eq!(vk::Renderer::scene_target_live_allocations(), live);
-    active.destroy();
-    Ok(())
 }
 
 #[test]
@@ -528,18 +487,18 @@ fn history_rejects_scripts() {
 }
 
 #[test]
-#[ignore = "requires exact native C05 package, image, isolated Vulkan and DXC"]
+#[ignore = "requires exact native C05 package, native capture, isolated Vulkan and DXC"]
 fn weighted_matches_native() -> Result<()> {
     use sha2::{Digest, Sha256};
     const PROJECT: &str = "SKWD_WEIGHTED_PUPPET_PROJECT";
     const NATIVE: &str = "SKWD_WEIGHTED_PUPPET_NATIVE";
     const PACKAGE_SHA: &str = "f12706b717a6fc801408592d3b41afa0208c3b12dedf1e0e1adc2bc5ac646c3d";
-    const FRAME_SHA: &str = "77cc860f67004e9bbbe711c1d9d945c8099e3a1699687b9d7275520b4fdc1364";
+    const NATIVE_SHA: &str = "ec3a9b1fa2c970086ee32e8df71a3e993604b8fb47a7d857d9cea259b963fa8f";
     let dir = std::env::var(PROJECT)?;
     let package = std::fs::read(std::path::Path::new(&dir).join("scene.pkg"))?;
     assert_eq!(format!("{:x}", Sha256::digest(package)), PACKAGE_SHA);
     let image = std::fs::read(std::env::var(NATIVE)?)?;
-    assert_eq!(format!("{:x}", Sha256::digest(&image)), FRAME_SHA);
+    assert_eq!(format!("{:x}", Sha256::digest(&image)), NATIVE_SHA);
     let native = image::load_from_memory(&image)?.to_rgba8();
     let shared = crate::shared::test_device();
     let package = paper_scene::pkg::Package::open(&locate_pkg(&dir)?)?;

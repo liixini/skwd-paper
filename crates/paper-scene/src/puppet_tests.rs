@@ -239,6 +239,7 @@ fn degenerate_bind_pose() {
         skipped_constraints: 0,
         skipped_morphs: false,
         springs: Vec::new(),
+        spatial: false,
         native_bind_inverse: vec![None],
         bind_inverse,
     };

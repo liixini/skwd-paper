@@ -2,6 +2,8 @@
 mod handoff;
 #[path = "playback.rs"]
 pub(crate) mod playback;
+#[path = "sharing.rs"]
+mod sharing;
 #[path = "surface.rs"]
 mod surface;
 
@@ -110,7 +112,12 @@ impl ApplyTransaction {
                     let index = self
                         .overlays
                         .iter()
-                        .position(|worker| worker.output == output)
+                        .position(|worker| {
+                            assignment
+                                .outputs
+                                .iter()
+                                .all(|name| worker.assignment.outputs.contains(name))
+                        })
                         .ok_or_else(|| anyhow!("drawing candidate missing"))?;
                     let directory =
                         Arc::new(tempfile::Builder::new().prefix(DRAWING_DIRECTORY).tempdir_in(
@@ -379,7 +386,12 @@ impl Manager {
             if worker.exited()?.is_none()
                 && worker.drawing_hold.is_some()
                 && !self.overlays.iter().any(|overlay| {
-                    overlay.generation == worker.generation && overlay.output == worker.output
+                    overlay.generation == worker.generation
+                        && overlay
+                            .assignment
+                            .outputs
+                            .iter()
+                            .any(|output| worker.assignment.outputs.contains(output))
                 })
             {
                 if worker.dynamic() {
@@ -492,10 +504,7 @@ impl Manager {
                 if keep.is_empty() || keep.len() == worker.assignment.outputs.len() {
                     continue;
                 }
-                let mut assignment = worker.assignment.clone();
-                assignment.outputs = keep;
-                assignment.transition = None;
-                assignments.push(assignment);
+                assignments.extend(sharing::remaining(worker, &keep));
                 touched.extend(worker.assignment.outputs.iter().cloned());
             }
         }
@@ -550,10 +559,20 @@ impl Manager {
             self.playback_pause.validate(&assignment.outputs)?;
             self.duck.validate(&assignment.outputs)?;
         }
-        for (assignment, output) in expanded {
-            let spawned = backends.spawn(assignment, output, socket, generation, policy.as_ref());
+        let groups = sharing::groups(expanded, policy.as_ref(), &self.playback_pause, &self.duck);
+        for (assignment, output, members) in groups {
+            let spawned = backends.for_members(&members).spawn(
+                assignment,
+                output,
+                socket,
+                generation,
+                policy.as_ref(),
+            );
             match spawned {
-                Ok(worker) => candidates.push(worker),
+                Ok(mut worker) => {
+                    worker.members = members;
+                    candidates.push(worker);
+                }
                 Err(error) => {
                     for worker in candidates {
                         worker.stop().await;
@@ -603,6 +622,9 @@ impl Manager {
         }
         for candidate in &mut transaction.candidates {
             candidate.assignment.transition = None;
+            for member in &mut candidate.members {
+                member.transition = None;
+            }
         }
         if let Some(handoff) = &mut transaction.handoff {
             handoff.disarm();
@@ -731,7 +753,10 @@ impl Manager {
                 self.policy.as_ref(),
                 Arc::clone(&directory),
             ) {
-                Ok(candidate) => candidates.push(candidate),
+                Ok(mut candidate) => {
+                    candidate.members.clone_from(&worker.members);
+                    candidates.push(candidate);
+                }
                 Err(error) => {
                     for candidate in candidates {
                         candidate.stop().await;
@@ -794,7 +819,9 @@ impl Manager {
                 !worker.dynamic()
                     && worker.assignment.source.kind != paper_control::SourceKind::Static
             })
-            .map(|worker| (worker.assignment.clone(), worker.output.clone()))
+            .map(|worker| {
+                (worker.assignment.clone(), worker.output.clone(), worker.members.clone())
+            })
             .collect::<Vec<_>>();
         if frozen.is_empty() {
             self.set_dynamic_pause(false).await?;
@@ -805,10 +832,13 @@ impl Manager {
         self.next_generation = self.next_generation.saturating_add(1);
         let backends = self.backend_paths();
         let mut candidates = Vec::with_capacity(frozen.len());
-        for (mut assignment, output) in frozen {
+        for (mut assignment, output, members) in frozen {
             assignment.transition = None;
             match backends.spawn(assignment, output, socket, generation, self.policy.as_ref()) {
-                Ok(candidate) => candidates.push(candidate),
+                Ok(mut candidate) => {
+                    candidate.members = members;
+                    candidates.push(candidate);
+                }
                 Err(error) => {
                     for candidate in candidates {
                         candidate.stop().await;
@@ -921,6 +951,17 @@ impl Manager {
             }
         }
         for index in &targets {
+            for member in &mut self.workers[*index].members {
+                if let Some(mute) = request.mute {
+                    member.mute = mute;
+                }
+                if let Some(source) = request.system_audio {
+                    member.system_audio = Some(source);
+                }
+                if let Some(volume) = request.volume {
+                    member.volume = volume;
+                }
+            }
             if let Some(mute) = request.mute {
                 self.workers[*index].assignment.mute = mute;
             }
@@ -932,8 +973,9 @@ impl Manager {
             }
         }
         self.duck = duck;
-        let statuses = targets.iter().map(|index| worker_status(&self.workers[*index])).collect();
-        Ok((targets.len(), statuses))
+        let statuses: Vec<_> =
+            targets.iter().flat_map(|index| worker_statuses(&self.workers[*index])).collect();
+        Ok((statuses.len(), statuses))
     }
 
     pub(crate) async fn stop(&mut self, request: &StopRequest) -> Result<usize> {
@@ -1006,11 +1048,10 @@ impl Manager {
             if keep.is_empty() || keep.len() == worker.assignment.outputs.len() {
                 continue;
             }
-            let mut assignment = worker.assignment.clone();
-            let output = keep.join(OUTPUT_SEPARATOR);
-            assignment.outputs = keep;
-            assignment.transition = None;
-            expanded.push((assignment, output));
+            expanded.extend(sharing::remaining(worker, &keep).into_iter().map(|assignment| {
+                let output = assignment.outputs.join(OUTPUT_SEPARATOR);
+                (assignment, output)
+            }));
             touched.extend(worker.assignment.outputs.iter().cloned());
         }
         if expanded.is_empty() {
@@ -1021,7 +1062,7 @@ impl Manager {
     }
 
     pub(crate) fn status(&self) -> Vec<WorkerStatus> {
-        self.workers.iter().map(worker_status).collect()
+        self.workers.iter().flat_map(worker_statuses).collect()
     }
 
     pub(crate) fn renderer_capabilities(&self) -> Vec<paper_control::RendererCapability> {
@@ -1040,12 +1081,12 @@ impl Manager {
     }
 }
 
-fn worker_status(worker: &Worker) -> WorkerStatus {
-    WorkerStatus {
-        assignment: worker.assignment.clone(),
+fn worker_statuses(worker: &Worker) -> impl Iterator<Item = WorkerStatus> + '_ {
+    worker.assignments().iter().map(|assignment| WorkerStatus {
+        assignment: assignment.clone(),
         pid: worker.pid(),
         generation: worker.generation,
-    }
+    })
 }
 
 fn worker_outputs(workers: &[Worker]) -> BTreeSet<String> {

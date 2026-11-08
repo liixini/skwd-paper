@@ -11,6 +11,8 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 
 const MULTI_JSON_ARG: &str = "--multi-json";
 const SCENE_ARG: &str = "--scene";
+const WIDGETS_SCENE_ARG: &str = "--widgets-scene";
+const WIDGET_TIMER_POLL_INDEX: usize = 3;
 const OUTPUT_SEPARATOR: &str = ",";
 static RETAINED_OUTPUTS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
@@ -104,6 +106,8 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
         xdg_output_manager: None,
         content_type_manager: None,
         shm: None,
+        subcompositor: None,
+        widgets: None,
         outputs: Vec::new(),
         surfaces: Vec::new(),
         closed: false,
@@ -204,14 +208,20 @@ pub fn setup(target_output: &str, layer_arg: Option<&str>) -> Result<Target> {
     if app.closed || app.surfaces.iter().all(|surf| surf.closed || surf.width == 0) {
         return Err(anyhow!("layer surface closed or zero size"));
     }
-    Ok(Target {
+    let mut target = Target {
         conn,
         queue,
         app,
         layer: vk_layer,
         ctl_fd: None,
         hidden: std::env::var_os(paper_control::PREPARE_HIDDEN_ENV).is_some(),
-    })
+    };
+    let args: Vec<String> = std::env::args().collect();
+    if let Some([_, scene]) = args.windows(2).find(|pair| pair[0] == WIDGETS_SCENE_ARG) {
+        let widgets: paper_control::WidgetScene = serde_json::from_str(scene)?;
+        target.set_widgets(widgets);
+    }
+    Ok(target)
 }
 
 fn parse_layer(value: Option<&str>) -> Result<zwlr_layer_shell_v1::Layer> {
@@ -467,10 +477,11 @@ impl Target {
         buffer.destroy();
     }
 
-    pub fn reexec(source: &ReexecSource) -> Result<()> {
+    pub fn reexec(&self, source: &ReexecSource) -> Result<()> {
         tracing::info!("skwd-wall-vk: output resized, restarting renderer");
         let argv: Vec<String> = std::env::args().collect();
         let mut rebuilt = rebuild_argv(&argv, source);
+        retain_widgets_arg(&mut rebuilt, self.app.widgets.as_ref().map(|widgets| &widgets.scene))?;
         let retained = RETAINED_OUTPUTS.lock().expect("retained outputs lock");
         if let Some(outputs) = retained.as_ref() {
             retain_output_args(&mut rebuilt, outputs)?;
@@ -908,6 +919,7 @@ impl Target {
     }
 
     pub fn retain_outputs(&mut self, outputs: &[String]) -> Result<()> {
+        self.retire_widget_outputs(outputs);
         for surface in &mut self.app.surfaces {
             if surface.closed || outputs.contains(&surface.name) {
                 continue;
@@ -1081,6 +1093,8 @@ impl Target {
     ) -> Result<()> {
         loop {
             let dispatched = self.queue.dispatch_pending(&mut self.app)?;
+            self.widget_tick();
+            self.follow_widgets(false);
             self.settle_mirrors();
             self.conn.flush()?;
             if dispatched > 0 || self.app.closed {
@@ -1105,6 +1119,11 @@ impl Target {
                         revents: 0,
                     },
                     libc::pollfd { fd: wake_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+                    libc::pollfd {
+                        fd: self.app.widgets.as_ref().map_or(-1, super::widgets::Widgets::timer_fd),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
                 ];
                 let mut mirrors = self.mirror_pollfds();
                 let nready = poll_with(&mut pfds, &mut mirrors, timeout_ms.max(1));
@@ -1117,6 +1136,10 @@ impl Target {
                     && (pfds[2].revents != 0 || mirrors.iter().any(|pfd| pfd.revents != 0))
                 {
                     self.settle_mirrors();
+                    return Ok(());
+                }
+                if nready > 0 && pfds[WIDGET_TIMER_POLL_INDEX].revents & libc::POLLIN != 0 {
+                    self.widget_tick();
                     return Ok(());
                 }
                 if nready > 0 && pfds[1].revents & libc::POLLIN != 0 {
@@ -1134,6 +1157,8 @@ impl Target {
     pub fn dispatch_until(&mut self, deadline: std::time::Instant) -> Result<()> {
         loop {
             self.queue.dispatch_pending(&mut self.app)?;
+            self.widget_tick();
+            self.follow_widgets(false);
             self.settle_mirrors();
             self.conn.flush()?;
             let now = std::time::Instant::now();
@@ -1173,6 +1198,8 @@ impl Target {
 
     pub fn pump(&mut self) -> Result<()> {
         self.queue.dispatch_pending(&mut self.app)?;
+        self.widget_tick();
+        self.follow_widgets(false);
         self.settle_mirrors();
         self.conn.flush()?;
         let Some(guard) = self.conn.prepare_read() else {
@@ -1251,6 +1278,21 @@ fn retain_output_args(args: &mut [String], outputs: &[String]) -> Result<()> {
         && let Some(target) = args.get_mut(1)
     {
         *target = outputs.join(OUTPUT_SEPARATOR);
+    }
+    Ok(())
+}
+
+fn retain_widgets_arg(
+    args: &mut Vec<String>,
+    scene: Option<&paper_control::WidgetScene>,
+) -> Result<()> {
+    if let Some(pos) = args.iter().position(|arg| arg == WIDGETS_SCENE_ARG) {
+        let end = (pos + 2).min(args.len());
+        args.drain(pos..end);
+    }
+    if let Some(scene) = scene {
+        args.push(WIDGETS_SCENE_ARG.to_owned());
+        args.push(serde_json::to_string(scene)?);
     }
     Ok(())
 }

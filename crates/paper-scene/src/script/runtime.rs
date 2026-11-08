@@ -43,7 +43,6 @@ const MAX_SHORTCUT_NAME_BYTES: usize = 256;
 const SORT_COMMAND: &str = "sort";
 const PARTICLE_COMMAND: &str = "particle";
 const EFFECT_COMMAND: &str = "effect";
-const MATERIAL_COMMAND: &str = "material";
 const EFFECT_MATERIAL_COMMAND: &str = "effectMaterial";
 const MAX_MATERIAL_VALUES: usize = 16;
 const MAX_MATERIAL_VALUES_JS: &str = "__maxMaterialValues";
@@ -165,7 +164,7 @@ pub enum ScriptCommand {
     Sprite { object: usize, op: SpriteOp },
     Particle { id: String, op: ParticleOp },
     EffectFunction { id: String, effect: usize, name: String },
-    Material { id: String, effect: Option<(usize, usize)>, name: String, values: Vec<f32> },
+    Material { id: String, effect: (usize, usize), name: String, values: Vec<f32> },
 }
 
 #[expect(clippy::too_many_lines, reason = "SceneScript command protocol validation")]
@@ -230,22 +229,16 @@ fn parse_command(
                 name: op.to_owned(),
             })
         }
-        MATERIAL_COMMAND | EFFECT_MATERIAL_COMMAND => {
+        EFFECT_MATERIAL_COMMAND => {
             if target.is_empty() || op.is_empty() || op.len() > MAX_MATERIAL_NAME_BYTES {
                 return None;
             }
-            let (effect, values) = if kind == EFFECT_MATERIAL_COMMAND {
-                let pair = value.as_array()?;
-                if pair.len() != EFFECT_MATERIAL_PARTS {
-                    return None;
-                }
-                (
-                    Some((pair[0].as_u64()?.try_into().ok()?, pair[1].as_u64()?.try_into().ok()?)),
-                    pair[2].as_array()?,
-                )
-            } else {
-                (None, value.as_array()?)
-            };
+            let parts = value.as_array()?;
+            if parts.len() != EFFECT_MATERIAL_PARTS {
+                return None;
+            }
+            let effect = (parts[0].as_u64()?.try_into().ok()?, parts[1].as_u64()?.try_into().ok()?);
+            let values = parts[2].as_array()?;
             if values.is_empty() || values.len() > MAX_MATERIAL_VALUES {
                 return None;
             }

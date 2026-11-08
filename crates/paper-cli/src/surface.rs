@@ -140,34 +140,49 @@ impl Manager {
                 continue;
             };
             let worker = &self.workers[index];
-            let Some(overlay) = self.overlays.iter().position(|overlay| {
-                overlay.generation == worker.generation
-                    && overlay.output == worker.output
-                    && overlay.drawing_overlay()
-            }) else {
-                continue;
-            };
-            if self.overlays[overlay].exited()?.is_some() {
-                continue;
+            let overlays: Vec<_> = self
+                .overlays
+                .iter()
+                .enumerate()
+                .filter_map(|(index, overlay)| {
+                    (overlay.generation == worker.generation
+                        && overlay
+                            .assignment
+                            .outputs
+                            .iter()
+                            .any(|output| worker.assignment.outputs.contains(output))
+                        && overlay.drawing_overlay())
+                    .then_some(index)
+                })
+                .collect();
+            for overlay in overlays {
+                self.refresh_photo(index, overlay).await?;
             }
-            let output = worker.output.clone();
-            let directory = Arc::new(
-                tempfile::Builder::new()
-                    .prefix(DRAWING_DIRECTORY)
-                    .tempdir_in(self.freeze_parent.clone().map_or_else(freeze_parent, Ok)?)?,
-            );
-            let photo = directory.path().join(DRAWING_SNAPSHOT);
-            self.workers[index].snapshot(&photo, &output, true).await?;
-            wait_snapshots(&mut self.workers, &[index], std::slice::from_ref(&photo)).await?;
-            self.workers[index].pending_photos.push(Arc::clone(&directory));
-            let ack = directory.path().join(DRAWING_ACK);
-            let mut command = PaperCommand::snapshot(&ack.display().to_string(), &output);
-            command.drawing_photo = Some(photo.display().to_string());
-            self.overlays[overlay].send(&command).await?;
-            wait_snapshots(&mut self.overlays, &[overlay], &[ack]).await?;
             self.workers[index].pending_photos.clear();
-            self.workers[index].drawing_hold = Some(directory);
         }
+        Ok(())
+    }
+
+    async fn refresh_photo(&mut self, index: usize, overlay: usize) -> Result<()> {
+        if self.overlays[overlay].exited()?.is_some() {
+            return Ok(());
+        }
+        let output = self.overlays[overlay].output.clone();
+        let directory = Arc::new(
+            tempfile::Builder::new()
+                .prefix(DRAWING_DIRECTORY)
+                .tempdir_in(self.freeze_parent.clone().map_or_else(freeze_parent, Ok)?)?,
+        );
+        let photo = directory.path().join(DRAWING_SNAPSHOT);
+        self.workers[index].snapshot(&photo, &output, true).await?;
+        wait_snapshots(&mut self.workers, &[index], std::slice::from_ref(&photo)).await?;
+        self.workers[index].pending_photos.push(Arc::clone(&directory));
+        let ack = directory.path().join(DRAWING_ACK);
+        let mut command = PaperCommand::snapshot(&ack.display().to_string(), &output);
+        command.drawing_photo = Some(photo.display().to_string());
+        self.overlays[overlay].send(&command).await?;
+        wait_snapshots(&mut self.overlays, &[overlay], &[ack]).await?;
+        self.workers[index].drawing_hold = Some(directory);
         Ok(())
     }
 }

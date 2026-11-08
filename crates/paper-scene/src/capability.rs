@@ -1,6 +1,6 @@
 use crate::scene::SceneFeatures;
 
-pub const EFFECT_CHAIN_BUDGET_GAP: &str = "effect-chain-budget";
+pub const EFFECT_CHAIN_LIMIT_GAP: &str = "effect-chain-limit";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeGap {

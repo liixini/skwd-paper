@@ -1,10 +1,10 @@
 use super::{
-    FxTargetStorage, LayerFx, MeshBlend, SceneDimensions, TextureInterner, TextureKey,
-    active_effect_counts, base_scene_blend, chainless_blend, effect_uv_inset, fallback_tint,
-    layer_effect_dimensions, layer_tint, layer_uniforms, lifetime, pass_blend, record_effect_skip,
-    vk_format,
+    FxTargetClass, FxTargetId, FxTargetStorage, LayerFx, MeshBlend, PooledTarget, SceneDimensions,
+    TextureInterner, TextureKey, active_effect_counts, base_scene_blend, chainless_blend,
+    effect_uv_inset, fallback_tint, layer_effect_dimensions, layer_tint, layer_uniforms, lifetime,
+    pass_blend, record_effect_skip, vk_format,
 };
-use super::{RGBA_CHANNELS, material};
+use super::{RGBA_CHANNELS, fx_pool, material};
 use crate::vk;
 use anyhow::Result;
 use paper_scene::effects::EffectBind;
@@ -40,12 +40,23 @@ pub(super) struct FxBuilder<'ctx, 'device> {
     pub world: bool,
     pub pass_cap: usize,
     pub fx_limit: usize,
-    pub byte_limit: u64,
-    pub admitted_bytes: &'ctx mut u64,
     pub dynamic_chains: &'ctx mut usize,
 }
 
 impl FxBuilder<'_, '_> {
+    fn chain_target(
+        &mut self,
+        class: FxTargetClass,
+        clear: [f32; RGBA_CHANNELS],
+        pooled: bool,
+    ) -> Result<FxTargetStorage> {
+        if pooled {
+            return Ok(FxTargetStorage::Pooled(PooledTarget { class, lease: None }));
+        }
+        let target = fx_pool::cleared_target(self.renderer, class, clear)?;
+        Ok(FxTargetStorage::Owned(target))
+    }
+
     fn rollback_uploads(&mut self, first_texture: usize) {
         self.interner.slots.retain(|_, slot| *slot < first_texture);
         self.interner.media_slots.retain(|_, slot| *slot < first_texture);
@@ -90,7 +101,8 @@ impl FxBuilder<'_, '_> {
         let mut pass_targets = Vec::new();
         let mut pass_binds = Vec::new();
         let mut pass_owner: Vec<usize> = Vec::new();
-        let mut fbos: Vec<(String, vk::SceneTarget)> = Vec::new();
+        let mut pass_overwrites = Vec::new();
+        let mut fbos: Vec<(String, FxTargetClass)> = Vec::new();
         let mut fbo_owners: Vec<Option<usize>> = Vec::new();
         let mut fbo_clears = Vec::new();
         let mut fbo_specs = Vec::new();
@@ -142,155 +154,148 @@ impl FxBuilder<'_, '_> {
             let pass_offset = pipelines.len();
             let fbo_offset = fbos.len();
             let swap_offset = swaps.len();
-            'compile_effect: {
-                for fbo in &effect.fbos {
-                    let owner = fbo.unique.then_some(effect_index);
-                    if fbos
-                        .iter()
-                        .zip(&fbo_owners)
-                        .any(|((existing, _), known)| existing == &fbo.name && *known == owner)
-                    {
-                        continue;
-                    }
-                    let base = if layer.composition_size.is_some()
-                        || is_text
-                        || layer.passthrough
-                        || layer.copy_background
-                    {
-                        (fx_w, fx_h)
-                    } else {
-                        (layer.texture.width, layer.texture.height)
+            for fbo in &effect.fbos {
+                let owner = fbo.unique.then_some(effect_index);
+                if fbos
+                    .iter()
+                    .zip(&fbo_owners)
+                    .any(|((existing, _), known)| existing == &fbo.name && *known == owner)
+                {
+                    continue;
+                }
+                let base = if layer.composition_size.is_some()
+                    || is_text
+                    || layer.passthrough
+                    || layer.copy_background
+                {
+                    (fx_w, fx_h)
+                } else {
+                    (layer.texture.width, layer.texture.height)
+                };
+                let (sw, sh) = fbo.extent(base);
+                let format = self.renderer.color_target_format(
+                    vk_format(fbo.format),
+                    ash::vk::Format::R16G16B16A16_SFLOAT,
+                );
+                let class = FxTargetClass {
+                    width: sw,
+                    height: sh,
+                    repeat: fbo.repeat.unwrap_or(false),
+                    format: format.as_raw(),
+                };
+                fbos.push((fbo.name.clone(), class));
+                fbo_owners.push(owner);
+                fbo_specs.push(fbo.clone());
+                fbo_clears.push(fbo.clear_on_setup.then_some(fbo.clear));
+            }
+            for swap in &effect.swaps {
+                let resolve = |name: &str| {
+                    lifetime::resolve_fbo_scoped(
+                        fbos.iter().map(|(fbo, _)| fbo.as_str()),
+                        &fbo_owners,
+                        effect_index,
+                        name,
+                    )
+                };
+                if let (Some(a), Some(b)) = (resolve(&swap.source), resolve(&swap.target)) {
+                    let after = match swap.after_pass {
+                        Some(local) => Some(pass_offset + local),
+                        None => pass_offset.checked_sub(1),
                     };
-                    let (sw, sh) = fbo.extent(base);
-                    let repeat = fbo.repeat.unwrap_or(false);
-                    let format = self.renderer.color_target_format(
-                        vk_format(fbo.format),
-                        ash::vk::Format::R16G16B16A16_SFLOAT,
-                    );
-                    match self.renderer.create_scene_target_fmt(sw, sh, repeat, format) {
-                        Ok(rt) => {
-                            if let Err(err) = self.renderer.render_scene(&rt, fbo.clear, &[], &[]) {
-                                failed = Some(format!("{}: {err:#}", fbo.name));
-                                self.renderer.destroy_scene_target(rt);
-                                break;
-                            }
-                            fbos.push((fbo.name.clone(), rt));
-                            fbo_owners.push(owner);
-                            fbo_specs.push(fbo.clone());
-                            fbo_clears.push(fbo.clear_on_setup.then_some(fbo.clear));
-                        }
-                        Err(err) => {
-                            failed = Some(format!("{}: {err:#}", fbo.name));
-                            break;
-                        }
-                    }
+                    swaps.push((after, a, b));
+                    swap_owners.push(effect_index);
                 }
-                if failed.is_some() {
-                    break 'compile_effect;
+            }
+            for (pass, presented) in effect.passes.iter_mut().zip(&presents[effect_index]) {
+                if pipelines.len() >= self.pass_cap {
+                    break;
                 }
-                for swap in &effect.swaps {
-                    let resolve = |name: &str| {
+                let mut meta = paper_scene::effects::PassMeta::of(pass);
+                if layer.base_scene_input && effect_index == 0 && pipelines.is_empty() {
+                    meta.set_source_tint([
+                        layer.color[0],
+                        layer.color[1],
+                        layer.color[2],
+                        layer.alpha,
+                    ]);
+                }
+                let write_format = pass
+                    .target
+                    .as_deref()
+                    .and_then(|name| {
                         lifetime::resolve_fbo_scoped(
                             fbos.iter().map(|(fbo, _)| fbo.as_str()),
                             &fbo_owners,
                             effect_index,
                             name,
                         )
-                    };
-                    if let (Some(a), Some(b)) = (resolve(&swap.source), resolve(&swap.target)) {
-                        let after = match swap.after_pass {
-                            Some(local) => Some(pass_offset + local),
-                            None => pass_offset.checked_sub(1),
-                        };
-                        swaps.push((after, a, b));
-                        swap_owners.push(effect_index);
-                    }
-                }
-                for (pass, presented) in effect.passes.iter_mut().zip(&presents[effect_index]) {
-                    if pipelines.len() >= self.pass_cap {
-                        break;
-                    }
-                    let mut meta = paper_scene::effects::PassMeta::of(pass);
-                    if layer.base_scene_input && effect_index == 0 && pipelines.is_empty() {
-                        meta.set_source_tint([
-                            layer.color[0],
-                            layer.color[1],
-                            layer.color[2],
-                            layer.alpha,
-                        ]);
-                    }
-                    let write_format = pass
-                        .target
-                        .as_deref()
-                        .and_then(|name| {
-                            lifetime::resolve_fbo_scoped(
-                                fbos.iter().map(|(fbo, _)| fbo.as_str()),
-                                &fbo_owners,
-                                effect_index,
-                                name,
-                            )
-                        })
-                        .map_or(self.renderer.scene_format(), |index| fbos[index].1.format);
-                    let created = if let Some(mesh) = input.mesh.filter(|_| mesh_blend) {
-                        blend_pass = Some(pipelines.len());
-                        self.renderer.create_effect_pipeline_for(
-                            &pass.vertex,
-                            &pass.fragment,
-                            None,
-                            &pass.name,
-                            vk::EffectPipelineSpec {
-                                depth_attachment: true,
-                                format: write_format,
-                                samples: self.renderer.scene_sample_count(),
-                                blend: vk::SceneBlend::Copy,
-                                scene: None,
-                                geometry: vk::EffectGeometry::SceneMesh,
-                                depth: vk::EffectDepth { cull: mesh.cull, ..Default::default() },
-                                coordinates: vk::EffectCoordinates::Canvas,
-                            },
-                        )
+                    })
+                    .map_or(self.renderer.scene_format(), |index| {
+                        ash::vk::Format::from_raw(fbos[index].1.format)
+                    });
+                let mesh = input.mesh.filter(|_| mesh_blend);
+                let write_blend =
+                    if mesh.is_some() || base_blend.is_some() || is_text && pass.target.is_none() {
+                        vk::SceneBlend::Copy
                     } else {
-                        self.renderer.create_effect_pipeline_for(
-                            &pass.vertex,
-                            &pass.fragment,
-                            pass.hlsl.as_ref(),
-                            &pass.name,
-                            vk::EffectPipelineSpec {
-                                depth_attachment: true,
-                                format: write_format,
-                                samples: ash::vk::SampleCountFlags::TYPE_1,
-                                blend: if base_blend.is_some() || is_text && pass.target.is_none() {
-                                    vk::SceneBlend::Copy
-                                } else {
-                                    pass_blend(pass.blend)
-                                },
-                                geometry: vk::EffectGeometry::Quad,
-                                depth: vk::EffectDepth::default(),
-                                coordinates: vk::EffectCoordinates::Canvas,
-                                scene: (*presented && !self.mirror).then_some(vk::ScenePresent {
-                                    blend: if bare_blend.is_some() {
-                                        vk::SceneBlend::Alpha
-                                    } else {
-                                        self.quads[index].blend
-                                    },
-                                    depth_test: composite_depth_test,
-                                }),
-                            },
-                        )
+                        pass_blend(pass.blend)
                     };
-                    match created {
-                        Ok(pipe) => {
-                            metas.push(meta);
-                            inputs.push(Vec::new());
-                            pass_targets.push(pass.target.clone());
-                            pass_binds.push(pass.binds.clone());
-                            pass_owner.push(effect_index);
-                            pipelines.push(pipe);
-                        }
-                        Err(err) => {
-                            failed = Some(format!("{}: {err:#}", pass.name));
-                            break;
-                        }
+                let created = if let Some(mesh) = mesh {
+                    blend_pass = Some(pipelines.len());
+                    self.renderer.create_effect_pipeline_for(
+                        &pass.vertex,
+                        &pass.fragment,
+                        None,
+                        &pass.name,
+                        vk::EffectPipelineSpec {
+                            depth_attachment: true,
+                            format: write_format,
+                            samples: self.renderer.scene_sample_count(),
+                            blend: vk::SceneBlend::Copy,
+                            scene: None,
+                            geometry: vk::EffectGeometry::SceneMesh,
+                            depth: vk::EffectDepth { cull: mesh.cull, ..Default::default() },
+                            coordinates: vk::EffectCoordinates::Canvas,
+                        },
+                    )
+                } else {
+                    self.renderer.create_effect_pipeline_for(
+                        &pass.vertex,
+                        &pass.fragment,
+                        pass.hlsl.as_ref(),
+                        &pass.name,
+                        vk::EffectPipelineSpec {
+                            depth_attachment: true,
+                            format: write_format,
+                            samples: ash::vk::SampleCountFlags::TYPE_1,
+                            blend: write_blend,
+                            geometry: vk::EffectGeometry::Quad,
+                            depth: vk::EffectDepth::default(),
+                            coordinates: vk::EffectCoordinates::Canvas,
+                            scene: (*presented && !self.mirror).then_some(vk::ScenePresent {
+                                blend: if bare_blend.is_some() {
+                                    vk::SceneBlend::Alpha
+                                } else {
+                                    self.quads[index].blend
+                                },
+                                depth_test: composite_depth_test,
+                            }),
+                        },
+                    )
+                };
+                match created {
+                    Ok(pipe) => {
+                        metas.push(meta);
+                        inputs.push(Vec::new());
+                        pass_targets.push(pass.target.clone());
+                        pass_binds.push(pass.binds.clone());
+                        pass_owner.push(effect_index);
+                        pass_overwrites.push(fx_pool::overwrites(pass, write_blend));
+                        pipelines.push(pipe);
+                    }
+                    Err(err) => {
+                        failed = Some(format!("{}: {err:#}", pass.name));
+                        break;
                     }
                 }
             }
@@ -345,9 +350,7 @@ impl FxBuilder<'_, '_> {
                 for pipe in pipelines.drain(pass_offset..) {
                     self.renderer.destroy_effect_pipeline(pipe);
                 }
-                for (_, target) in fbos.drain(fbo_offset..) {
-                    self.renderer.destroy_scene_target(target);
-                }
+                fbos.truncate(fbo_offset);
                 fbo_owners.truncate(fbo_offset);
                 fbo_clears.truncate(fbo_offset);
                 fbo_specs.truncate(fbo_offset);
@@ -356,6 +359,7 @@ impl FxBuilder<'_, '_> {
                 pass_targets.truncate(pass_offset);
                 pass_binds.truncate(pass_offset);
                 pass_owner.truncate(pass_offset);
+                pass_overwrites.truncate(pass_offset);
                 swaps.truncate(swap_offset);
                 swap_owners.truncate(swap_offset);
                 self.skip(&layer.name, &reason)?;
@@ -364,13 +368,26 @@ impl FxBuilder<'_, '_> {
                 break;
             }
         }
+        let planned = blend_pass.unwrap_or(pass_owner.len());
+        let scratch = lifetime::plan_targets_with(
+            &fbos.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
+            &fbo_owners,
+            &swaps,
+            &pass_targets[..planned],
+            &pass_binds[..planned],
+            &pass_owner[..planned],
+        )
+        .ok()
+        .filter(|_| !is_text)
+        .map(|plan| fx_pool::scratch_targets(&plan, &pass_owner, &pass_overwrites));
+        let pooled = |id: FxTargetId| {
+            scratch.as_ref().is_some_and(|scratch| scratch[id.index()])
+                && (!mirror || !matches!(id, FxTargetId::Fbo(_)))
+        };
         if let Some(reason) = failed {
             tracing::info!("skwd-wall-vk: effect skipped on {} ({reason})", layer.name);
             for pipe in pipelines {
                 self.renderer.destroy_effect_pipeline(pipe);
-            }
-            for (_, rt) in fbos {
-                self.renderer.destroy_scene_target(rt);
             }
             self.rollback_uploads(first_texture);
             self.quads[index].tint = fallback_tint(layer);
@@ -381,9 +398,6 @@ impl FxBuilder<'_, '_> {
             return Ok(None);
         }
         if pipelines.is_empty() {
-            for (_, target) in fbos {
-                self.renderer.destroy_scene_target(target);
-            }
             self.rollback_uploads(first_texture);
             self.quads[index].tint =
                 if !layer.passthrough && layer.effects.iter().all(|effect| !effect.state.visible) {
@@ -416,56 +430,21 @@ impl FxBuilder<'_, '_> {
             )
             .map(|plan| plan.lifetimes.iter().any(|lifetime| lifetime.loop_carried))
             .unwrap_or(true);
-        let material = self.materials.iter_mut().find(|material| !mirror && material.quad == index);
-        let source_size = super::image_effect_dimensions(layer);
-        let material_minimum = material.as_ref().filter(|_| skin.is_none()).map_or(0, |material| {
-            let size = source_size.unwrap_or(material.size);
-            u64::from(size.0)
-                .saturating_mul(u64::from(size.1))
-                .saturating_mul(self.renderer.scene_pixel_bytes())
-        });
-        let mut chain_bytes =
-            u64::from(fx_w)
-                .saturating_mul(u64::from(fx_h))
-                .saturating_mul(self.renderer.scene_pixel_bytes())
-                .saturating_mul(2)
-                .saturating_add(fbos.iter().fold(0_u64, |bytes, (_, target)| {
-                    bytes.saturating_add(target.allocation_bytes)
-                }))
-                .saturating_add(material_minimum);
         let over_dynamic_cap =
             intrinsic_dynamic && layer.visible && (*self.dynamic_chains) >= self.fx_limit;
-        if !over_dynamic_cap
-            && (*self.admitted_bytes).saturating_add(chain_bytes) <= self.byte_limit
-            && let Some(material) = material.filter(|_| skin.is_none())
-        {
-            let size = source_size.unwrap_or(material.size);
-            let target = self.renderer.create_scene_target(size.0, size.1)?;
-            material.effect_target(self.renderer, self.textures, Some(target), self.canvas);
-            chain_bytes = chain_bytes
-                .saturating_sub(material_minimum)
-                .saturating_add(material.target_bytes());
-        }
-        let over_bytes = (*self.admitted_bytes).saturating_add(chain_bytes) > self.byte_limit;
-        if over_dynamic_cap || over_bytes {
+        if over_dynamic_cap {
             if let Some(material) =
                 self.materials.iter_mut().find(|material| !mirror && material.quad == index)
             {
                 material.effect_target(self.renderer, self.textures, None, self.canvas);
             }
             tracing::info!(
-                "skwd-wall-vk: effect chain dropped on {} (dynamic={} chains={} bytes={} budget={})",
+                "skwd-wall-vk: effect chain dropped on {} (chains={})",
                 layer.name,
-                intrinsic_dynamic,
-                (*self.dynamic_chains),
-                (*self.admitted_bytes).saturating_add(chain_bytes),
-                self.byte_limit
+                (*self.dynamic_chains)
             );
             for pipe in pipelines {
                 self.renderer.destroy_effect_pipeline(pipe);
-            }
-            for (_, rt) in fbos {
-                self.renderer.destroy_scene_target(rt);
             }
             self.rollback_uploads(first_texture);
             self.quads[index].tint = fallback_tint(layer);
@@ -473,12 +452,10 @@ impl FxBuilder<'_, '_> {
                 self.quads[index].blend = blend;
             }
             let reason = format!(
-                "[native-scene-gap:{}] effect chain budget exceeded: dynamic {intrinsic_dynamic}, chains {}/{} bytes {}/{}",
-                paper_scene::capability::EFFECT_CHAIN_BUDGET_GAP,
+                "[native-scene-gap:{}] dynamic effect chains {}/{}",
+                paper_scene::capability::EFFECT_CHAIN_LIMIT_GAP,
                 self.dynamic_chains,
-                self.fx_limit,
-                (*self.admitted_bytes).saturating_add(chain_bytes),
-                self.byte_limit
+                self.fx_limit
             );
             self.skip(&layer.name, &reason)?;
             return Ok(None);
@@ -486,12 +463,18 @@ impl FxBuilder<'_, '_> {
         if intrinsic_dynamic && layer.visible {
             (*self.dynamic_chains) += 1;
         }
-        (*self.admitted_bytes) = (*self.admitted_bytes).saturating_add(chain_bytes);
         let mut staged_vertices = None;
-        let mut staged_ping = None;
-        let mut staged_pong = None;
-        let mut staged_crop = None;
+        let mut staged_fbos = Vec::new();
+        let mut staged_chain = Vec::new();
         let built = (|| -> Result<LayerFx> {
+            if skin.is_none()
+                && let Some(material) =
+                    self.materials.iter_mut().find(|material| !mirror && material.quad == index)
+            {
+                let size = super::image_effect_dimensions(layer).unwrap_or(material.size);
+                let target = self.renderer.create_scene_target(size.0, size.1)?;
+                material.effect_target(self.renderer, self.textures, Some(target), self.canvas);
+            }
             let [u, v] = effect_uv_inset(layer);
             let uv = [u, v, 1.0 - u, 1.0 - v];
             let (scene, properties) = (self.scene, self.properties);
@@ -504,19 +487,20 @@ impl FxBuilder<'_, '_> {
                 paper_scene::model::script::Layout::new(layer, scene, canvas, properties).size;
             staged_vertices =
                 Some(self.renderer.create_quad_buffer((fx_w, fx_h), uv, (image[0], image[1]))?);
-            if layer.texture.clamp {
-                staged_ping = Some(self.renderer.create_scene_target(fx_w, fx_h)?);
-                staged_pong = Some(self.renderer.create_scene_target(fx_w, fx_h)?);
-            } else {
-                staged_ping = Some(self.renderer.create_scene_target_repeat(fx_w, fx_h)?);
-                staged_pong = Some(self.renderer.create_scene_target_repeat(fx_w, fx_h)?);
+            for (index, ((_, class), spec)) in fbos.iter().zip(&fbo_specs).enumerate() {
+                let storage =
+                    self.chain_target(*class, spec.clear, pooled(FxTargetId::Fbo(index)))?;
+                staged_fbos.push(storage);
             }
-            self.renderer.render_scene(
-                staged_ping.as_ref().expect("ping target"),
-                [0.0; RGBA_CHANNELS],
-                &[],
-                &[],
-            )?;
+            let class = FxTargetClass {
+                width: fx_w,
+                height: fx_h,
+                repeat: !layer.texture.clamp,
+                format: self.renderer.scene_format().as_raw(),
+            };
+            for id in [FxTargetId::Ping, FxTargetId::Pong] {
+                staged_chain.push(self.chain_target(class, [0.0; RGBA_CHANNELS], pooled(id))?);
+            }
             let (uvw, uvh) = skin.map_or_else(
                 || if layer.material.is_some() { (1.0, 1.0) } else { layer.texture.uv_scale() },
                 |(_, [u, v])| (u, v),
@@ -525,6 +509,13 @@ impl FxBuilder<'_, '_> {
                 .iter()
                 .flatten()
                 .any(|(_, bind)| matches!(bind, EffectBind::SceneUnderLayer));
+            if needs_crop {
+                staged_chain.push(self.chain_target(
+                    class,
+                    [0.0; RGBA_CHANNELS],
+                    scratch.is_some(),
+                )?);
+            }
             let snapshot_slot = if layer.copy_background || needs_crop || is_text {
                 let slot_texture = self.renderer.create_view_slot()?;
                 self.textures.push(slot_texture);
@@ -565,20 +556,6 @@ impl FxBuilder<'_, '_> {
                 texture: base_texture,
                 blend: vk::SceneBlend::Copy,
             };
-            if needs_crop {
-                let target = if layer.texture.clamp {
-                    self.renderer.create_scene_target(fx_w, fx_h)?
-                } else {
-                    self.renderer.create_scene_target_repeat(fx_w, fx_h)?
-                };
-                staged_crop = Some(target);
-                self.renderer.render_scene(
-                    staged_crop.as_ref().expect("crop target"),
-                    [0.0; RGBA_CHANNELS],
-                    &[],
-                    &[],
-                )?;
-            }
             let snapshot_quad = snapshot_slot.map(|slot| vk::SceneQuad {
                 uv_axes: None,
                 uv_padding: false,
@@ -619,14 +596,15 @@ impl FxBuilder<'_, '_> {
                 || atlas.is_some();
             let effects: Vec<_> = layer.effects.iter().map(|effect| effect.state).collect();
             let active_counts = active_effect_counts(&pass_owner, &swap_owners, &effects);
+            let mut chain = std::mem::take(&mut staged_chain).into_iter();
             Ok(LayerFx {
                 layer_id: layer.id.clone(),
                 quad: index,
                 scene_order: layer.scene_order,
                 slot,
                 pipelines: std::mem::take(&mut pipelines),
-                ping: FxTargetStorage::Owned(staged_ping.take().expect("ping target")),
-                pong: FxTargetStorage::Owned(staged_pong.take().expect("pong target")),
+                ping: chain.next().expect("ping target"),
+                pong: chain.next().expect("pong target"),
                 base_quad,
                 text_backdrop,
                 verts: staged_vertices.take(),
@@ -634,9 +612,10 @@ impl FxBuilder<'_, '_> {
                 presentation_inputs: Vec::new(),
                 inputs,
                 remap: (0..fbos.len()).map(std::cell::Cell::new).collect(),
-                fbos: std::mem::take(&mut fbos)
-                    .into_iter()
-                    .map(|(name, target)| (name, FxTargetStorage::Owned(target)))
+                fbos: fbos
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .zip(std::mem::take(&mut staged_fbos))
                     .collect(),
                 fbo_owners,
                 swaps,
@@ -654,7 +633,6 @@ impl FxBuilder<'_, '_> {
                     .map(|effect| effect.clear_functions.clone())
                     .collect(),
                 pending_clears: Vec::new(),
-                visibility_dynamic: self.scripted || source_keyframes,
                 swap_owners,
                 material_values: vec![BTreeMap::new(); metas.len()],
                 passes: metas,
@@ -671,6 +649,8 @@ impl FxBuilder<'_, '_> {
                     || (needs_crop || layer.passthrough || is_text) && self.pointer_scene,
                 dependency_dynamic: false,
                 retain_targets: false,
+                starved: None,
+                parked: None,
                 snapshot: false,
                 passthrough: layer.passthrough,
                 copy_background: layer.copy_background,
@@ -679,7 +659,7 @@ impl FxBuilder<'_, '_> {
                 bare_blend,
                 mesh_blend: blend_pass.map(|pass| MeshBlend { pass, image: [image[0], image[1]] }),
                 snapshot_slot,
-                crop: staged_crop.take().map(FxTargetStorage::Owned),
+                crop: chain.next(),
                 crop_quad,
                 fallback_tint: fallback_tint(layer),
                 sampled_targets: BTreeSet::new(),
@@ -697,7 +677,6 @@ impl FxBuilder<'_, '_> {
                 Ok(Some(fx))
             }
             Err(error) => {
-                (*self.admitted_bytes) = (*self.admitted_bytes).saturating_sub(chain_bytes);
                 if intrinsic_dynamic && layer.visible {
                     (*self.dynamic_chains) = (*self.dynamic_chains).saturating_sub(1);
                 }
@@ -709,17 +688,25 @@ impl FxBuilder<'_, '_> {
                 for pipeline in pipelines {
                     self.renderer.destroy_effect_pipeline(pipeline);
                 }
-                for (_, target) in fbos {
+                for target in staged_fbos
+                    .iter_mut()
+                    .chain(&mut staged_chain)
+                    .filter_map(FxTargetStorage::take_owned)
+                {
                     self.renderer.destroy_scene_target(target);
                 }
                 if let Some(vertices) = staged_vertices {
                     self.renderer.destroy_quad_buffer(vertices);
                 }
-                for target in [staged_ping, staged_pong, staged_crop].into_iter().flatten() {
-                    self.renderer.destroy_scene_target(target);
-                }
                 self.rollback_uploads(first_texture);
-                Err(error)
+                let reason = format!("{error:#}");
+                tracing::info!("skwd-wall-vk: effect skipped on {} ({reason})", layer.name);
+                self.quads[index].tint = fallback_tint(layer);
+                if let Some(blend) = chainless_blend(base_scene_blend(layer), bare_blend) {
+                    self.quads[index].blend = blend;
+                }
+                self.skip(&layer.name, &reason)?;
+                Ok(None)
             }
         }
     }

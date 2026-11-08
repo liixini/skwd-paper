@@ -1,11 +1,10 @@
 use super::{mesh, vk};
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use ash::vk as raw;
 use paper_scene::matrix::Mat4;
 use paper_scene::model::lighting::{Light, ShadowLayout, ShadowView, SunView};
 
 const ALPHA: usize = 3;
-const BUDGET_ERROR: &str = "shadow atlas exceeds effect budget";
 
 pub(super) struct Shadows {
     atlas: vk::ShadowAtlas,
@@ -118,11 +117,6 @@ impl super::Group {
         }
         self.renderer.wait_render()?;
         let candidate = Shadows::new(&self.renderer, &self.lights, true)?.unwrap();
-        let bytes = self
-            .effect_target_allocation_bytes()
-            .saturating_sub(self.shadows.as_ref().map_or(0, Shadows::allocation_bytes))
-            .saturating_add(candidate.allocation_bytes());
-        ensure!(bytes <= self.effect_budget, BUDGET_ERROR);
         for actor in self
             .meshes
             .iter()

@@ -182,6 +182,15 @@ fn rotated_sampler() -> Sampler {
 }
 
 #[test]
+fn spatial_zero_rest() {
+    let mut sampler = rotated_sampler();
+    Rc::get_mut(&mut sampler.mesh).unwrap().spatial = true;
+    let rest = sampler.sample(&[], 0.0).unwrap().matrices.to_vec();
+    let layer = AnimationLayer { visible: true, id: 1, rate: 0.0, blend: 0.0, additive: false };
+    assert_eq!(sampler.sample(&[(layer, 0.0)], 0.0).unwrap().matrices, rest);
+}
+
+#[test]
 fn visible_zero_samples() {
     let mut sampler = rotated_sampler();
     let rest = sampler.sample(&[], 0.0).unwrap().matrices.to_vec();

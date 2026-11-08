@@ -278,6 +278,16 @@ impl Renderer {
     }
 
     #[cfg(feature = "shared-device")]
+    fn finish_target(&mut self, target: &RenderTarget, export: &mut ExportImage) {
+        self.record_overlay(target);
+        if export.direct_render {
+            self.release_direct_export(export);
+        } else {
+            self.copy_rt_to_export(target, export);
+        }
+    }
+
+    #[cfg(feature = "shared-device")]
     pub fn render_to(
         &mut self,
         rt: &RenderTarget,
@@ -306,11 +316,7 @@ impl Renderer {
         self.draw_fullscreen(self.present_pipeline(src), self.desc_set, &uv);
         unsafe { self.device.cmd_end_render_pass(self.cmd) };
         self.release_imports(&[src]);
-        if export.direct_render {
-            self.release_direct_export(export);
-        } else {
-            self.copy_rt_to_export(rt, export);
-        }
+        self.finish_target(rt, export);
         self.end_and_submit(&waits)?;
         Self::note_imports(&[src]);
         export.ready = true;
@@ -370,11 +376,7 @@ impl Renderer {
         self.draw_fullscreen(self.fade_pipeline(src_b), self.desc_set_b, &uv_b);
         unsafe { self.device.cmd_end_render_pass(self.cmd) };
         self.release_imports(&[src_a, src_b]);
-        if export.direct_render {
-            self.release_direct_export(export);
-        } else {
-            self.copy_rt_to_export(rt, export);
-        }
+        self.finish_target(rt, export);
         self.end_and_submit(&waits)?;
         Self::note_imports(&[src_a, src_b]);
         export.ready = true;
@@ -475,11 +477,7 @@ impl Renderer {
             self.device.cmd_end_render_pass(self.cmd);
         }
         self.release_imports(&[src_a, src_b]);
-        if export.direct_render {
-            self.release_direct_export(export);
-        } else {
-            self.copy_rt_to_export(rt, export);
-        }
+        self.finish_target(rt, export);
         self.end_and_submit(&waits)?;
         if let (Some(t), Src::Drawing { strokes, .. }) = (drawn, src_b) {
             strokes.drawn.set(Some(t));
@@ -566,11 +564,7 @@ impl Renderer {
             self.device.cmd_end_render_pass(self.cmd);
         }
         self.release_imports(&[src_a, src_b]);
-        if export.direct_render {
-            self.release_direct_export(export);
-        } else {
-            self.copy_rt_to_export(rt, export);
-        }
+        self.finish_target(rt, export);
         self.end_and_submit(&waits)?;
         Self::note_imports(&[src_a, src_b]);
         export.ready = true;

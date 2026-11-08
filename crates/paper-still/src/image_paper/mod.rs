@@ -16,7 +16,7 @@ mod widgets;
 
 pub use lifecycle::run;
 pub use paper_control::OutputTarget;
-pub use stream::stream;
+pub use stream::{StreamOutput, StreamSpec, stream};
 
 #[cfg(test)]
 use decode::decode_image;

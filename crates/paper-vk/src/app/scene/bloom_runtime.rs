@@ -51,7 +51,7 @@ impl Group {
         }
         self.effects_animated = animation.dynamic.iter().any(|dynamic| *dynamic);
         self.quads[fx.quad].tint[ALPHA_COMPONENT] = 0.0;
-        self.destroy_layer_fx(fx);
+        self.discard_layer_fx(fx);
         for slot in self.bloom.active_slots.drain(..) {
             let texture = std::mem::replace(&mut self.textures[slot], vk::SceneTexture::vacant());
             self.renderer.destroy_scene_texture(texture);
@@ -117,7 +117,6 @@ impl Group {
         }
         let mut interner = TextureInterner::new(None);
         let mut skipped = Vec::new();
-        let mut admitted_bytes = self.effect_target_allocation_bytes();
         let mut dynamic_chains = self.fx.iter().filter(|fx| fx.intrinsic_dynamic(true)).count();
         let pass_cap = std::env::var(SCENE_FX_PASSES)
             .ok()
@@ -143,8 +142,6 @@ impl Group {
             world: false,
             pass_cap,
             fx_limit,
-            byte_limit: self.effect_budget,
-            admitted_bytes: &mut admitted_bytes,
             dynamic_chains: &mut dynamic_chains,
         }
         .layer(
@@ -235,7 +232,7 @@ impl Group {
         let position = self.fx.iter().position(|fx| fx.layer_id == paper_scene::model::bloom::ID);
         if let Some(position) = position {
             let fx = self.fx.remove(position);
-            self.destroy_layer_fx(fx);
+            self.discard_layer_fx(fx);
         }
         self.rollback_bloom(quad, old_quad, first_texture);
         let plan = self.scene_target_plan(true)?;

@@ -5,6 +5,31 @@ use super::{
 use paper_geom::FillMode;
 
 #[test]
+fn reexec_widget_scene_replaced() {
+    let mut args = argv(&["skwd-wall-vk", "DP-1", "/video.mp4", "--widgets-scene", "old"]);
+    let scene = paper_control::WidgetScene {
+        widgets: Vec::new(),
+        outlines: Vec::new(),
+        palette: paper_control::Palette { text: [1, 2, 3], accent: [4, 5, 6], shade: [7, 8, 9] },
+        font: None,
+        labels: paper_control::Labels {
+            days: std::array::from_fn(|_| String::new()),
+            day_names: std::array::from_fn(|_| String::new()),
+            months: std::array::from_fn(|_| String::new()),
+            month_names: std::array::from_fn(|_| String::new()),
+        },
+    };
+    super::retain_widgets_arg(&mut args, Some(&scene)).unwrap();
+    assert_eq!(args.iter().filter(|arg| arg.as_str() == "--widgets-scene").count(), 1);
+    assert_eq!(
+        serde_json::from_str::<paper_control::WidgetScene>(args.last().unwrap()).unwrap(),
+        scene
+    );
+    super::retain_widgets_arg(&mut args, None).unwrap();
+    assert_eq!(args, argv(&["skwd-wall-vk", "DP-1", "/video.mp4"]));
+}
+
+#[test]
 fn span_crops_offset_outputs() {
     let bounds = paper_geom::desktop_bounds(&[(-800, 100, 800, 600), (0, -200, 800, 600)]);
     assert_eq!(bounds, Some((-800, -200, 1600, 900)));

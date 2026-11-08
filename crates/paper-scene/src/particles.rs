@@ -458,6 +458,12 @@ fn recolor_endpoint(color: [f32; 3], original: [f32; 3], replacement: [f32; 3]) 
     ])
 }
 
+fn recenter_range((min, max): (f32, f32), center: f32) -> (f32, f32) {
+    let span = max - min;
+    let low = (center - span * 0.5).clamp(0.0, 1.0);
+    (low, (low + span).min(1.0))
+}
+
 fn num_bound(value: Option<&Value>, props: &BTreeMap<String, Vec<f32>>, fallback: f32) -> f32 {
     value
         .and_then(|raw| crate::effects::bound_value(raw, props))
@@ -685,15 +691,25 @@ pub enum Initializer {
 
 pub struct HsvColor {
     hue_min: f32,
+    hue_span: f32,
     hue_step: f32,
     hue_steps: u32,
     saturation: (f32, f32),
     value: (f32, f32),
 }
 
+impl HsvColor {
+    fn recenter(&mut self, [hue, saturation, value]: [f32; 3]) {
+        self.hue_min = hue - self.hue_span * 0.5;
+        self.saturation = recenter_range(self.saturation, saturation);
+        self.value = recenter_range(self.value, value);
+    }
+}
+
 pub struct ColorList {
     colors: Vec<[f32; 3]>,
     noise: [f32; 3],
+    shift: [f32; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -2002,15 +2018,16 @@ fn parse_initializer(entry: &Value, defaults: ParticleDefaults) -> Option<Initia
             let hue_min = num_of(entry.get(HUE_MIN), 0.0);
             let raw_span = num_of(entry.get(HUE_MAX), 1.0) - hue_min;
             let hue_steps = (num_of(entry.get(HUE_STEPS), HSV_DEFAULT_STEPS) as i32).max(0) as u32;
-            let hue_step = if hue_steps > 1 {
+            let (hue_span, hue_step) = if hue_steps > 1 {
                 let span = if raw_span == 0.0 { 1.0 } else { raw_span };
                 let seam = u32::from((raw_span % 1.0).abs() < HUE_SEAM);
-                span / (hue_steps - 1 + seam) as f32
+                (span, span / (hue_steps - 1 + seam) as f32)
             } else {
-                0.0
+                (0.0, 0.0)
             };
             Some(Initializer::HsvColor(HsvColor {
                 hue_min,
+                hue_span,
                 hue_step,
                 hue_steps,
                 saturation: (
@@ -2038,6 +2055,7 @@ fn parse_initializer(entry: &Value, defaults: ParticleDefaults) -> Option<Initia
                     num_of(entry.get(SATURATION_NOISE), 0.0),
                     num_of(entry.get(VALUE_NOISE), 0.0),
                 ],
+                shift: [0.0; COLOR_CHANNELS],
             }))
         }
         INHERIT_CONTROL_VELOCITY => InheritVelocity::parse(entry).map(Initializer::InheritVelocity),
@@ -2620,14 +2638,29 @@ fn load_inner(
         let original = rgb_to_hsv(color);
         let replacement = rgb_to_hsv(tint);
         for initializer in &mut initializers {
-            if let Initializer::Color { min, max, .. } = initializer {
-                for endpoint in [min, max] {
-                    let rgb = recolor_endpoint(
-                        endpoint.map(|value| value / f32::from(u8::MAX)),
-                        original,
-                        replacement,
-                    );
-                    *endpoint = rgb.map(|value| value * f32::from(u8::MAX));
+            match initializer {
+                Initializer::Color { min, max, .. } => {
+                    for endpoint in [min, max] {
+                        let rgb = recolor_endpoint(
+                            endpoint.map(|value| value / f32::from(u8::MAX)),
+                            original,
+                            replacement,
+                        );
+                        *endpoint = rgb.map(|value| value * f32::from(u8::MAX));
+                    }
+                }
+                Initializer::HsvColor(hsv) => hsv.recenter(replacement),
+                Initializer::ColorList(list) => {
+                    list.shift =
+                        std::array::from_fn(|axis| replacement[axis] - list.colors[0][axis]);
+                }
+                _ => {}
+            }
+        }
+        for operator in &mut operators {
+            if let Operator::ColorChange { start, end, .. } = operator {
+                for endpoint in [start, end] {
+                    *endpoint = recolor_endpoint(*endpoint, original, replacement);
                 }
             }
         }
@@ -3500,7 +3533,7 @@ impl Sim {
                     let mut sampled = std::array::from_fn(|axis| {
                         let min = (hsv[axis] - list.noise[axis]).max(0.0);
                         let max = (hsv[axis] + list.noise[axis]).min(1.0);
-                        self.rng.range(min, max)
+                        self.rng.range(min, max) + list.shift[axis]
                     });
                     sampled[0] -= sampled[0].floor();
                     sampled[1] = sampled[1].clamp(0.0, 1.0);

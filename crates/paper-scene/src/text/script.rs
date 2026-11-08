@@ -186,9 +186,15 @@ impl ScriptText {
         self.rejected.is_some()
     }
 
-    pub fn rejected(&self, wanted: &str, object: &Value, props: &Properties, budget: u64) -> bool {
+    pub fn rejected(
+        &self,
+        wanted: &str,
+        object: &Value,
+        props: &Properties,
+        revision: u64,
+    ) -> bool {
         self.rejected.as_ref().is_some_and(|(text, style, previous)| {
-            previous.is_none_or(|previous| previous == budget)
+            previous.is_none_or(|previous| previous == revision)
                 && style.raster == super::Raster::of(self.raster.mode, object)
                 && text.chars().eq(wanted.chars().take(super::MAX_TEXT_CHARS))
                 && style.font_name == object.get(FONT_FIELD).and_then(Value::as_str).unwrap_or("")
@@ -199,7 +205,7 @@ impl ScriptText {
         })
     }
 
-    pub fn reject(&mut self, wanted: &str, budget: Option<u64>) {
+    pub fn reject(&mut self, wanted: &str, revision: Option<u64>) {
         self.rejected = Some((
             wanted.chars().take(super::MAX_TEXT_CHARS).collect(),
             Style {
@@ -213,7 +219,7 @@ impl ScriptText {
                 limits: self.limits,
                 needs_render: self.needs_render,
             },
-            budget,
+            revision,
         ));
     }
 

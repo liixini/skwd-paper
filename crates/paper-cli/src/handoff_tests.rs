@@ -209,6 +209,98 @@ fn media_stage_holds_playback() {
 }
 
 #[test]
+fn shared_drawing_holds() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let first = media_drawing(fixture.directory.path());
+        let mut second = first.clone();
+        second.outputs = vec!["DP-2".into()];
+        second.mute = true;
+        second.transition.as_mut().unwrap().from = Some("/wall/other.png".into());
+        let mut request = apply(vec![first.clone(), second.clone()], true);
+        request.policy = Some(RendererPolicy {
+            shared_outputs: Some(true),
+            surface: Some(Box::new(paper_control::SurfacePolicy {
+                namespace: "stationary".into(),
+                blur: 0,
+                dim: 0,
+            })),
+            ..Default::default()
+        });
+        let status = fixture.commit(&request).await;
+        assert_eq!(fixture.manager.workers.len(), 1);
+        assert_eq!(fixture.manager.overlays.len(), 2);
+        assert_eq!(status[0].pid, status[1].pid);
+        assert_eq!((status[0].assignment.mute, status[1].assignment.mute), (false, true));
+        let worker = &fixture.manager.workers[0];
+        assert!(worker.drawing_hold.is_some());
+        let snapshots = wait_log(fixture.directory.path(), "stdin", worker.pid(), "DP-2");
+        assert!(snapshots.contains("DP-1"));
+        assert!(snapshots.contains("DP-2"));
+        for (overlay, expected) in fixture.manager.overlays.iter().zip([first, second]) {
+            let args =
+                wait_log(fixture.directory.path(), "args", overlay.pid(), "--transition-from");
+            assert!(args.contains(expected.transition.unwrap().from.as_ref().unwrap()));
+        }
+        fixture
+            .manager
+            .set_surface_overrides(paper_control::SurfaceOverridesRequest {
+                surfaces: [(
+                    SourceKind::Video,
+                    paper_control::SurfacePolicy {
+                        namespace: "stationary".into(),
+                        blur: 12,
+                        dim: 20,
+                    },
+                )]
+                .into(),
+            })
+            .await
+            .unwrap();
+        for overlay in &fixture.manager.overlays {
+            let commands =
+                wait_log(fixture.directory.path(), "stdin", overlay.pid(), "drawing_photo");
+            assert!(commands.contains(&overlay.output));
+        }
+        fixture.manager.overlays.remove(0).stop().await;
+        fixture.manager.refresh().unwrap();
+        assert!(fixture.manager.workers[0].drawing_hold.is_some());
+        fixture.manager.overlays.remove(0).stop().await;
+        fixture.manager.refresh().unwrap();
+        assert!(fixture.manager.workers[0].drawing_hold.is_none());
+        assert_eq!(fixture.manager.workers[0].pid(), status[0].pid);
+        fixture.manager.stop(&StopRequest::default()).await.unwrap();
+    });
+}
+
+#[test]
+fn drawing_to_shared_video() {
+    block_on(async {
+        let mut fixture = Fixture::new();
+        let first = media_drawing(fixture.directory.path());
+        let mut second = first.clone();
+        second.outputs = vec!["DP-2".into()];
+        let mut drawing = apply(vec![first, second], true);
+        drawing.policy = Some(RendererPolicy { shared_outputs: Some(true), ..Default::default() });
+        fixture.commit(&drawing).await;
+        let next = ["DP-1", "DP-2"].map(|output| {
+            let mut item = assignment(output, Source::video("/wall/next.mp4"));
+            item.transition = Some(TransitionPolicy::default());
+            item
+        });
+        let status = fixture.commit(&apply(next.to_vec(), true)).await;
+        assert_eq!(status[0].pid, status[1].pid);
+        assert!(fixture.manager.overlays.is_empty());
+        let origins = transition_origins(&fixture, status[0].pid);
+        assert_eq!(origins.len(), 2);
+        assert_ne!(origins["DP-1"], origins["DP-2"]);
+        let args = wait_log(fixture.directory.path(), "args", status[0].pid, "DP-1,DP-2");
+        assert_eq!(args.lines().next(), Some("DP-1,DP-2"));
+        fixture.manager.stop(&StopRequest::default()).await.unwrap();
+    });
+}
+
+#[test]
 fn live_handoff_rollback() {
     block_on(async {
         let mut fixture = Fixture::new();

@@ -15,6 +15,8 @@ fn sampler_anisotropy(limit: Option<f32>, filter: vk::Filter, mips: bool, reques
 }
 
 pub struct Renderer {
+    #[cfg(feature = "shared-device")]
+    pub(super) overlay: Option<super::scene::overlay::Overlay>,
     pub(super) owns_device: bool,
     pub(super) plane_views: std::collections::HashMap<u64, (vk::ImageView, vk::ImageView)>,
     pub(super) _entry: ash::Entry,
@@ -522,6 +524,8 @@ impl Renderer {
                 format_passes_load: Vec::new(),
                 format_passes_append: Vec::new(),
                 scene_pools: Vec::new(),
+                #[cfg(feature = "shared-device")]
+                overlay: None,
                 fx_pools: Vec::new(),
                 pipeline_layout_layer: vk::PipelineLayout::null(),
                 raster_pipelines: [None, None],
@@ -576,6 +580,10 @@ mod tests;
 
 impl Drop for Renderer {
     fn drop(&mut self) {
+        #[cfg(feature = "shared-device")]
+        {
+            self.overlay = None;
+        }
         let _ = crate::shared::wait_idle(&self.device);
         unsafe {
             #[cfg(feature = "shared-device")]

@@ -287,22 +287,6 @@ impl Material {
         result.effect = original.effect;
         result.effect_tail.clone_from(&original.effect_tail);
     }
-    pub fn set_value(&mut self, name: &str, values: &[f32]) {
-        if let Some(pass) = self.passes.first_mut() {
-            let resolved = pass
-                .meta
-                .apply_script_values(&serde_json::json!({(name): values}), &BTreeMap::new());
-            pass.script_values.extend(resolved);
-        }
-        if let Some(prelit) = &mut self.prelit {
-            let resolved = prelit
-                .pass
-                .meta
-                .apply_script_values(&serde_json::json!({(name): values}), &BTreeMap::new());
-            prelit.pass.script_values.extend(resolved);
-        }
-    }
-
     pub fn uses_history(&self) -> bool {
         self.prelit.as_ref().is_some_and(prelit::Prelit::uses_history)
             || self
@@ -974,102 +958,6 @@ impl Group {
             }
         }
         Ok(())
-    }
-
-    pub(super) fn material_value(
-        &mut self,
-        quad: usize,
-        name: &str,
-        values: &[f32],
-        scene: &serde_json::Value,
-        properties: &paper_scene::model::Properties,
-        resources: &paper_scene::model::ImageResources,
-    ) -> Result<bool> {
-        if let Some(material) = self.materials.iter_mut().find(|material| material.quad == quad) {
-            material.set_value(name, values);
-            return Ok(true);
-        }
-        let Some(mut layer) = resources.base_material_layer(scene, properties, quad)? else {
-            return Ok(false);
-        };
-        self.renderer.wait_render()?;
-        let old_quad = self.quads[quad].clone();
-        let first_texture = self.textures.len();
-        let mut slots: Vec<_> = self.quads.iter().map(|quad| quad.texture).collect();
-        let mut interner = TextureInterner::new(None);
-        let light = |name| {
-            self.scene_uniforms
-                .get(name)
-                .and_then(|values| <[f32; AXES]>::try_from(values.as_slice()).ok())
-                .unwrap_or([0.0; AXES])
-        };
-        let lights = (light(AMBIENT), light(SKYLIGHT));
-        let source_size = super::image_effect_dimensions(&layer);
-        let result = Build {
-            mirrored: self.reflection.as_ref().is_some_and(|reflection| reflection.sampled),
-            unreflected: self.unreflected.clone(),
-            renderer: &mut self.renderer,
-            interner: &mut interner,
-            textures: &mut self.textures,
-            slots: &mut slots,
-            quads: &mut self.quads,
-            screen: self.target.extent,
-            world: self.camera.is_some(),
-        }
-        .load_one(quad, &mut layer, self.canvas, lights, None);
-        let mut material = match result {
-            Ok(Some(material)) => material,
-            Ok(None) => {
-                self.quads[quad] = old_quad;
-                return Ok(false);
-            }
-            Err(error) => {
-                self.quads[quad] = old_quad;
-                for texture in self.textures.drain(first_texture..) {
-                    self.renderer.destroy_scene_texture(texture);
-                }
-                return Err(error);
-            }
-        };
-        let fx_index = self.fx.iter().position(|fx| fx.quad == quad);
-        let linked = (|| -> Result<()> {
-            let allocated =
-                self.effect_target_allocation_bytes().saturating_add(material.target_bytes());
-            anyhow::ensure!(
-                allocated <= self.effect_budget,
-                "base material targets exceed effect budget"
-            );
-            if let Some(index) = fx_index {
-                let size = source_size.unwrap_or(material.size);
-                let target = self.renderer.create_scene_target(size.0, size.1)?;
-                if allocated.saturating_add(target.allocation_bytes) > self.effect_budget {
-                    self.renderer.destroy_scene_target(target);
-                    return Err(anyhow!("base material effect target exceeds effect budget"));
-                }
-                material.effect_target(
-                    &self.renderer,
-                    &mut self.textures,
-                    Some(target),
-                    self.canvas,
-                );
-                let base = &mut self.fx[index].base_quad;
-                base.texture = material.slot;
-                base.tint = [1.0; CHANNELS];
-                base.uv = [0.0, 0.0, 1.0, 1.0];
-                base.uv_axes = None;
-            }
-            Ok(())
-        })();
-        if let Err(error) = linked {
-            self.quads[quad] = old_quad;
-            for texture in self.textures.drain(first_texture..) {
-                self.renderer.destroy_scene_texture(texture);
-            }
-            return Err(error);
-        }
-        material.set_value(name, values);
-        self.materials.push(material);
-        Ok(true)
     }
 
     pub(super) fn material_frame(&mut self, clock: FrameClock) -> Result<()> {

@@ -187,6 +187,8 @@ impl SurfaceOverridesRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendererPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_outputs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<Box<SurfacePolicy>>,
@@ -744,6 +746,8 @@ pub struct TransitionCapabilities {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendererPolicyCapabilities {
     #[serde(default)]
+    pub shared_outputs: bool,
+    #[serde(default)]
     pub surface: bool,
     pub idle: bool,
     pub sand: bool,
@@ -875,6 +879,7 @@ impl CapabilitiesResult {
                 max_duration_ms: crate::transitions::MAX_DURATION_MS,
             },
             renderer_policy: RendererPolicyCapabilities {
+                shared_outputs: true,
                 surface: true,
                 idle: true,
                 sand: true,

@@ -3,6 +3,7 @@ use paper_control::{
     Assignment, Layer, PaperCommand, RendererCapability, RendererDiscovery, RendererPolicy,
     RuntimeDependencyStatus, SandQuality, SandScope, Source, SourceKind, StillCommand,
 };
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -51,6 +52,7 @@ pub(crate) struct OverlaySpec {
 }
 
 pub(crate) struct Worker {
+    pub(crate) members: Vec<Assignment>,
     pub(crate) assignment: Assignment,
     pub(crate) output: String,
     pub(crate) generation: u64,
@@ -66,6 +68,10 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+    pub(crate) fn assignments(&self) -> &[Assignment] {
+        if self.members.is_empty() { std::slice::from_ref(&self.assignment) } else { &self.members }
+    }
+
     pub(crate) fn control_file(&self) -> Result<std::fs::File> {
         use std::os::fd::AsFd;
         let stdin = self.stdin.as_ref().ok_or_else(|| anyhow!("Paper worker stdin unavailable"))?;
@@ -111,7 +117,7 @@ impl Worker {
     }
 
     pub(crate) fn pause_freeze_capable(&self) -> bool {
-        self.freeze_capable && !self.surface_policy
+        self.freeze_capable && !self.surface_policy && self.members.len() < 2
     }
 
     pub(crate) async fn send_audio(
@@ -161,7 +167,9 @@ impl Worker {
 
     pub(crate) async fn set_widgets(&mut self, scene: &paper_control::WidgetScene) -> Result<()> {
         if self.dynamic() {
-            return Ok(());
+            let mut command = PaperCommand::audio(None, None);
+            command.widgets = Some(Box::new(scene.clone()));
+            return self.send(&command).await;
         }
         let mut command = StillCommand::new("");
         command.widgets = Some(scene.clone());
@@ -247,6 +255,7 @@ struct BackendExecutable {
 
 #[derive(Clone)]
 pub(crate) struct BackendPaths {
+    transition_sources: BTreeMap<String, String>,
     pub(crate) pause: crate::manager::playback::Control,
     pub(crate) duck: crate::manager::playback::Control,
     pub(crate) surface_overrides: paper_control::SurfaceOverridesRequest,
@@ -258,6 +267,7 @@ impl BackendPaths {
     pub(crate) fn discover() -> Self {
         let wayland = wayland_dependencies();
         Self {
+            transition_sources: BTreeMap::new(),
             pause: crate::manager::playback::Control::default(),
             duck: crate::manager::playback::Control::default(),
             surface_overrides: paper_control::SurfaceOverridesRequest::default(),
@@ -279,6 +289,7 @@ impl BackendPaths {
     #[cfg(test)]
     pub(crate) fn from_executables(vk: PathBuf, still: PathBuf) -> Self {
         Self {
+            transition_sources: BTreeMap::new(),
             pause: crate::manager::playback::Control::default(),
             duck: crate::manager::playback::Control::default(),
             surface_overrides: paper_control::SurfaceOverridesRequest::default(),
@@ -293,6 +304,25 @@ impl BackendPaths {
 
     pub(crate) fn capabilities(&self) -> Vec<RendererCapability> {
         [&self.vk, &self.still].into_iter().map(|backend| backend.capability.clone()).collect()
+    }
+
+    pub(crate) fn for_members(&self, members: &[Assignment]) -> Self {
+        let mut backends = self.clone();
+        backends.transition_sources = members
+            .iter()
+            .filter(|member| !static_transition(member))
+            .flat_map(|member| {
+                member
+                    .transition
+                    .as_ref()
+                    .and_then(|transition| transition.from.as_ref())
+                    .into_iter()
+                    .flat_map(|from| {
+                        member.outputs.iter().map(move |output| (output.clone(), from.clone()))
+                    })
+            })
+            .collect();
+        backends
     }
 
     pub(crate) fn spawn(
@@ -466,6 +496,13 @@ impl BackendPaths {
             command.env(paper_control::DRAWING_ENV, serde_json::to_string(drawing)?);
         }
         command.env("SKWD_PAPER_BACKGROUND", serde_json::to_string(&assignment.background)?);
+        command.env_remove(paper_control::TRANSITION_SOURCES_ENV);
+        if self.transition_sources.len() > 1 {
+            command.env(
+                paper_control::TRANSITION_SOURCES_ENV,
+                serde_json::to_string(&self.transition_sources)?,
+            );
+        }
         command.env_remove(paper_control::PREPARE_HIDDEN_ENV);
         if !overlay && static_transition(&logical) {
             command.env(paper_control::PREPARE_HIDDEN_ENV, "1");
@@ -506,6 +543,7 @@ impl BackendPaths {
         let pid = child.id().ok_or_else(|| anyhow!("Paper worker PID unavailable"))?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("Paper worker stdin unavailable"))?;
         Ok(Worker {
+            members: Vec::new(),
             drawing_hold: None,
             pending_photos: Vec::new(),
             assignment: logical,
@@ -522,6 +560,13 @@ impl BackendPaths {
     }
 }
 
+const STREAM_CONNECTOR: &str = "connector";
+const STREAM_LOGICAL: &str = "logical";
+const STILL_STREAM_OUTPUT: &str = "--stream-output";
+const ALL_STREAM_OUTPUTS: &str = "*";
+const EMPTY_CONNECTOR: &str = "empty stream connector";
+const EMPTY_LOGICAL_SIZE: &str = "empty stream logical size";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlasmaStream {
     pub(crate) fd: i32,
@@ -529,6 +574,8 @@ pub(crate) struct PlasmaStream {
     pub(crate) size: String,
     pub(crate) fps: u32,
     pub(crate) output: String,
+    pub(crate) connector: Option<String>,
+    pub(crate) logical: Option<String>,
     pub(crate) paused: bool,
 }
 
@@ -539,6 +586,8 @@ pub(crate) fn parse_plasma_stream(spec: &str, paused: bool) -> Result<PlasmaStre
         size: String::new(),
         fps: 30,
         output: String::new(),
+        connector: None,
+        logical: None,
         paused,
     };
     for item in spec.split(',').filter(|item| !item.is_empty()) {
@@ -553,6 +602,15 @@ pub(crate) fn parse_plasma_stream(spec: &str, paused: bool) -> Result<PlasmaStre
             "size" => stream.size = value.to_string(),
             "fps" => stream.fps = value.parse().with_context(|| format!("stream fps {value}"))?,
             "output" => stream.output = value.to_string(),
+            STREAM_CONNECTOR => {
+                anyhow::ensure!(!value.is_empty(), EMPTY_CONNECTOR);
+                stream.connector = Some(value.to_owned());
+            }
+            STREAM_LOGICAL => {
+                let (width, height) = parse_stream_size(value)?;
+                anyhow::ensure!(width > 0 && height > 0, EMPTY_LOGICAL_SIZE);
+                stream.logical = Some(value.to_owned());
+            }
             "paused" => stream.paused = paused || matches!(value, "1" | "true"),
             other => anyhow::bail!("unknown stream field {other}"),
         }
@@ -571,6 +629,8 @@ pub(crate) fn plasma_streams(args: &crate::cli::PresentPlasmaArgs) -> Result<Vec
             size: size.clone(),
             fps,
             output: String::new(),
+            connector: args.stream_output.clone(),
+            logical: args.stream_logical.clone(),
             paused: args.paused,
         });
     }
@@ -649,6 +709,7 @@ pub(crate) fn present_plasma(assignment: &Assignment, streams: &[PlasmaStream]) 
             .ok()
             .flatten();
         let Some(mut transition) = transition else { continue };
+        paper_runtime::die_with_parent(&mut transition);
         if route.prelude_gpu {
             paper_runtime::plasma::begin_stream(stream.fd, 1)?;
             transition.arg("--stream-fd").arg(stream.fd.to_string());
@@ -725,6 +786,15 @@ fn plasma_command(
             command.arg("*").arg(&source.path);
             for stream in streams {
                 command.arg("--frame-stream").arg(&stream.size);
+                let connector = stream.connector.as_deref().unwrap_or(&stream.output);
+                command.arg(STILL_STREAM_OUTPUT).arg(if connector.is_empty() {
+                    ALL_STREAM_OUTPUTS
+                } else {
+                    connector
+                });
+                command
+                    .arg(paper_control::stream::LOGICAL)
+                    .arg(stream.logical.as_ref().unwrap_or(&stream.size));
                 if stream.frame_fd >= 0 {
                     command.arg("--frame-fd").arg(stream.frame_fd.to_string());
                 }
@@ -759,7 +829,11 @@ fn plasma_command(
                 .arg("--stream-size")
                 .arg(&stream.size)
                 .arg("--stream-fps")
-                .arg(stream.fps.clamp(1, 240).to_string());
+                .arg(stream.fps.clamp(1, 240).to_string())
+                .arg(paper_control::stream::CONNECTOR)
+                .arg(stream.connector.as_ref().unwrap_or(&stream.output))
+                .arg(paper_control::stream::LOGICAL)
+                .arg(stream.logical.as_ref().unwrap_or(&stream.size));
             if gpu_stream {
                 command.arg("--stream-fd").arg(stream.fd.to_string());
             }
@@ -845,11 +919,16 @@ fn write_stream_header(size: &str) -> Result<()> {
     write_stream_header_to(&mut std::io::stdout().lock(), size)
 }
 
-fn write_stream_header_to(output: &mut dyn Write, size: &str) -> Result<()> {
+fn parse_stream_size(size: &str) -> Result<(u32, u32)> {
     let (width, height) = size
         .split_once('x')
         .and_then(|(width, height)| Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?)))
         .ok_or_else(|| anyhow!("Plasma stream size must be WIDTHxHEIGHT"))?;
+    Ok((width, height))
+}
+
+fn write_stream_header_to(output: &mut dyn Write, size: &str) -> Result<()> {
+    let (width, height) = parse_stream_size(size)?;
     output.write_all(b"SKWP")?;
     output.write_all(&width.to_le_bytes())?;
     output.write_all(&height.to_le_bytes())?;

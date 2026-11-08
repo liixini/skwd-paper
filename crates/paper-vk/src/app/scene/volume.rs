@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 
 const SHADOW_SOURCE_ERROR: &str = "shadow light activation requires scene reload";
 const COOKIE_SOURCE_ERROR: &str = "light cookie activation requires scene reload";
-const BUDGET_ERROR: &str = "volumetric targets exceed effect budget";
 const CAPACITY_ERROR: &str = "volumetric light capacity exceeded";
 
 const LABEL: &str = "volumetric lights";
@@ -273,13 +272,7 @@ impl super::Group {
             COOKIE_SOURCE_ERROR
         );
         self.renderer.wait_render()?;
-        let candidate = Volumes::new(&mut self.renderer, &self.target, &self.lights)?;
-        let bytes = self
-            .effect_target_allocation_bytes()
-            .saturating_sub(self.volumes.as_ref().map_or(0, Volumes::allocation_bytes))
-            .saturating_add(candidate.as_ref().map_or(0, Volumes::allocation_bytes));
-        ensure!(bytes <= self.effect_budget, BUDGET_ERROR);
-        self.volumes = candidate;
+        self.volumes = Volumes::new(&mut self.renderer, &self.target, &self.lights)?;
         Ok(())
     }
 

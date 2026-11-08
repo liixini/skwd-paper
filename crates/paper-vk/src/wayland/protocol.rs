@@ -1,7 +1,7 @@
 use super::model::{App, OutputInfo};
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-    wl_surface,
+    wl_subcompositor, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::ext::idle_notify::v1::client::{
@@ -36,6 +36,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 const XDG_OUTPUT_MANAGER: &str = "zxdg_output_manager_v1";
 const XDG_OUTPUT_VERSION: u32 = 3;
+const SUBCOMPOSITOR: &str = "wl_subcompositor";
 
 impl Dispatch<wl_registry::WlRegistry, ()> for App {
     fn event(
@@ -80,6 +81,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
                 }
                 "wl_shm" => {
                     state.shm = Some(registry.bind::<wl_shm::WlShm, _, _>(name, 1, qh, ()));
+                }
+                SUBCOMPOSITOR => {
+                    state.subcompositor = Some(
+                        registry.bind::<wl_subcompositor::WlSubcompositor, _, _>(name, 1, qh, ()),
+                    );
                 }
                 "wp_presentation" => {
                     state.presentation =
